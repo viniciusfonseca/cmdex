@@ -2,19 +2,38 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
+    sync::LazyLock,
 };
 
 use anyhow::{Context, Result};
 use ignore::WalkBuilder;
+use ratatui::{
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+};
+use syntect::{
+    easy::HighlightLines,
+    highlighting::{FontStyle, Theme, ThemeSet},
+    parsing::{SyntaxReference, SyntaxSet},
+};
 
 const PREVIEW_LIMIT: usize = 200_000;
+static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
+static THEME: LazyLock<Theme> = LazyLock::new(|| {
+    let themes = ThemeSet::load_defaults();
+    themes
+        .themes
+        .get("base16-ocean.dark")
+        .cloned()
+        .unwrap_or_default()
+});
 
 #[derive(Debug, Clone, Default)]
 pub struct FileBrowserState {
     pub entries: Vec<FileEntry>,
     pub selected: usize,
     pub preview_title: String,
-    pub preview: String,
+    pub preview: Vec<Line<'static>>,
     pub content_scroll: u16,
     pub error: Option<String>,
 }
@@ -31,7 +50,7 @@ pub struct DiffBrowserState {
     pub entries: Vec<DiffEntry>,
     pub selected: usize,
     pub preview_title: String,
-    pub preview: String,
+    pub preview: Vec<Line<'static>>,
     pub content_scroll: u16,
     pub error: Option<String>,
 }
@@ -57,7 +76,7 @@ impl FileBrowserState {
                 self.entries.clear();
                 self.selected = 0;
                 self.preview_title = "Workspace".to_string();
-                self.preview = "Unable to load workspace.".to_string();
+                self.preview = plain_preview_lines("Unable to load workspace.");
                 self.error = Some(error.to_string());
             }
         }
@@ -101,14 +120,14 @@ impl FileBrowserState {
     fn update_preview(&mut self) -> Result<()> {
         if self.entries.is_empty() {
             self.preview_title = "Workspace".to_string();
-            self.preview = "No files found for this workspace.".to_string();
+            self.preview = plain_preview_lines("No files found for this workspace.");
             return Ok(());
         }
 
         let entry = &self.entries[self.selected];
         self.preview_title = entry.path.display().to_string();
         self.preview = if entry.is_dir {
-            format!("Directory: {}", entry.path.display())
+            plain_preview_lines(&format!("Directory: {}", entry.path.display()))
         } else {
             read_text_preview(&entry.path)?
         };
@@ -130,7 +149,7 @@ impl DiffBrowserState {
                 self.entries.clear();
                 self.selected = 0;
                 self.preview_title = "Git Diff".to_string();
-                self.preview = "Unable to load git diff.".to_string();
+                self.preview = plain_preview_lines("Unable to load git diff.");
                 self.error = Some(error.to_string());
             }
         }
@@ -174,7 +193,7 @@ impl DiffBrowserState {
     fn update_preview(&mut self, root: &Path) -> Result<()> {
         if self.entries.is_empty() {
             self.preview_title = "Git Diff".to_string();
-            self.preview = "No modified files found.".to_string();
+            self.preview = plain_preview_lines("No modified files found.");
             return Ok(());
         }
 
@@ -200,11 +219,7 @@ fn build_file_entries(root: &Path) -> Result<Vec<FileEntry>> {
         if path == root {
             continue;
         }
-        if path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name == ".git")
-        {
+        if contains_git_component(path) {
             continue;
         }
 
@@ -274,28 +289,38 @@ fn build_diff_entries(root: &Path) -> Result<Vec<DiffEntry>> {
     Ok(entries)
 }
 
-fn read_text_preview(path: &Path) -> Result<String> {
+fn read_text_preview(path: &Path) -> Result<Vec<Line<'static>>> {
     let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
     if bytes.contains(&0) {
-        return Ok("Binary file preview is not available.".to_string());
+        return Ok(plain_preview_lines("Binary file preview is not available."));
     }
 
     let truncated = bytes.len() > PREVIEW_LIMIT;
     let preview = String::from_utf8_lossy(&bytes[..bytes.len().min(PREVIEW_LIMIT)]).into_owned();
-    if truncated {
-        Ok(format!("{preview}\n\n[truncated]"))
-    } else {
-        Ok(preview)
+    let preview = normalize_newlines(&preview);
+    let mut lines = highlighted_preview_lines(&preview, syntax_for_path(path, &preview));
+    if !truncated {
+        maybe_trim_trailing_empty_line(&mut lines);
     }
+    let mut lines = add_line_numbers(lines);
+    if truncated {
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            "[truncated]".to_string(),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        )));
+    }
+    Ok(lines)
 }
 
-fn read_diff_preview(root: &Path, entry: &DiffEntry) -> Result<String> {
+fn read_diff_preview(root: &Path, entry: &DiffEntry) -> Result<Vec<Line<'static>>> {
     if entry.status.contains('?') {
-        return Ok(format!(
-            "Untracked file: {}\n\n{}",
-            entry.path.display(),
-            read_text_preview(&entry.path)?
-        ));
+        let mut lines = plain_preview_lines(&format!("Untracked file: {}", entry.path.display()));
+        lines.push(Line::default());
+        lines.extend(read_text_preview(&entry.path)?);
+        return Ok(lines);
     }
 
     let relative = entry
@@ -320,9 +345,13 @@ fn read_diff_preview(root: &Path, entry: &DiffEntry) -> Result<String> {
     }
 
     if sections.is_empty() {
-        Ok("No diff available for this file.".to_string())
+        Ok(plain_preview_lines("No diff available for this file."))
     } else {
-        Ok(sections.join("\n\n"))
+        let combined = normalize_newlines(&sections.join("\n\n"));
+        Ok(add_line_numbers(highlighted_preview_lines(
+            &combined,
+            SYNTAX_SET.find_syntax_by_extension("diff"),
+        )))
     }
 }
 
@@ -343,5 +372,158 @@ fn git_output(root: &Path, args: &[&str]) -> Result<String> {
         Ok(format!("{}\n\n[truncated]", &stdout[..PREVIEW_LIMIT]))
     } else {
         Ok(stdout)
+    }
+}
+
+fn contains_git_component(path: &Path) -> bool {
+    path.components()
+        .any(|component| component.as_os_str() == ".git")
+}
+
+fn syntax_for_path<'a>(path: &Path, source: &'a str) -> Option<&'static SyntaxReference> {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .and_then(|extension| SYNTAX_SET.find_syntax_by_extension(extension))
+        .or_else(|| {
+            source
+                .lines()
+                .next()
+                .and_then(|line| SYNTAX_SET.find_syntax_by_first_line(line))
+        })
+}
+
+fn highlighted_preview_lines(
+    source: &str,
+    syntax: Option<&'static SyntaxReference>,
+) -> Vec<Line<'static>> {
+    match syntax {
+        Some(syntax) => {
+            let mut highlighter = HighlightLines::new(syntax, &THEME);
+            split_preserving_lines(source)
+                .into_iter()
+                .map(|line| {
+                    if line.is_empty() {
+                        return Line::default();
+                    }
+
+                    match highlighter.highlight_line(&line, &SYNTAX_SET) {
+                        Ok(ranges) => Line::from(
+                            ranges
+                                .into_iter()
+                                .map(|(style, text)| {
+                                    Span::styled(text.to_string(), to_ratatui_style(style))
+                                })
+                                .collect::<Vec<_>>(),
+                        ),
+                        Err(_) => Line::from(line),
+                    }
+                })
+                .collect()
+        }
+        None => plain_preview_lines(source),
+    }
+}
+
+fn plain_preview_lines(source: &str) -> Vec<Line<'static>> {
+    split_preserving_lines(source)
+        .into_iter()
+        .map(Line::from)
+        .collect()
+}
+
+fn add_line_numbers(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    let gutter_width = lines.len().max(1).to_string().len();
+
+    lines
+        .into_iter()
+        .enumerate()
+        .map(|(index, mut line)| {
+            let mut spans = Vec::with_capacity(line.spans.len() + 1);
+            spans.push(Span::styled(
+                format!("{:>width$} | ", index + 1, width = gutter_width),
+                Style::default().fg(Color::DarkGray),
+            ));
+            spans.append(&mut line.spans);
+            line.spans = spans;
+            line
+        })
+        .collect()
+}
+
+fn split_preserving_lines(source: &str) -> Vec<String> {
+    if source.is_empty() {
+        return vec![String::new()];
+    }
+
+    source.split('\n').map(ToString::to_string).collect()
+}
+
+fn normalize_newlines(source: &str) -> String {
+    source.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+fn maybe_trim_trailing_empty_line(lines: &mut Vec<Line<'static>>) {
+    if lines.len() > 1
+        && lines
+            .last()
+            .is_some_and(|line| line.spans.iter().all(|span| span.content.is_empty()))
+    {
+        lines.pop();
+    }
+}
+
+fn to_ratatui_style(style: syntect::highlighting::Style) -> Style {
+    let mut modifiers = Modifier::empty();
+    if style.font_style.contains(FontStyle::BOLD) {
+        modifiers |= Modifier::BOLD;
+    }
+    if style.font_style.contains(FontStyle::ITALIC) {
+        modifiers |= Modifier::ITALIC;
+    }
+    if style.font_style.contains(FontStyle::UNDERLINE) {
+        modifiers |= Modifier::UNDERLINED;
+    }
+
+    Style::default()
+        .fg(Color::Rgb(
+            style.foreground.r,
+            style.foreground.g,
+            style.foreground.b,
+        ))
+        .add_modifier(modifiers)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skips_git_subtree_entries() {
+        assert!(contains_git_component(Path::new("/tmp/repo/.git/config")));
+        assert!(contains_git_component(Path::new(
+            "/tmp/repo/.git/objects/aa"
+        )));
+        assert!(!contains_git_component(Path::new("/tmp/repo/src/main.rs")));
+    }
+
+    #[test]
+    fn preserves_blank_lines_in_plain_preview() {
+        let lines = plain_preview_lines("first\n\nthird");
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0].spans[0].content, "first");
+        assert!(lines[1].spans.is_empty() || lines[1].spans[0].content.is_empty());
+        assert_eq!(lines[2].spans[0].content, "third");
+    }
+
+    #[test]
+    fn adds_line_numbers_to_blank_and_non_blank_lines() {
+        let lines = add_line_numbers(plain_preview_lines("first\n\nthird"));
+
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0].spans[0].content, "1 | ");
+        assert_eq!(lines[0].spans[1].content, "first");
+        assert_eq!(lines[1].spans[0].content, "2 | ");
+        assert_eq!(lines[2].spans[0].content, "3 | ");
+        assert_eq!(lines[2].spans[1].content, "third");
     }
 }

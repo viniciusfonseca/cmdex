@@ -23,6 +23,25 @@ pub struct ThreadInfo {
 }
 
 #[derive(Debug, Clone)]
+pub struct WorkspaceSession {
+    pub thread: ThreadInfo,
+    pub entries: Vec<HistoryEntry>,
+}
+
+#[derive(Debug, Clone)]
+pub struct HistoryEntry {
+    pub kind: HistoryEntryKind,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryEntryKind {
+    User,
+    Assistant,
+    Event,
+}
+
+#[derive(Debug, Clone)]
 pub enum ThreadItem {
     AgentMessage { id: String, text: String },
     UserMessage,
@@ -160,7 +179,7 @@ impl CodexAppServer {
                 "thread/start",
                 ThreadStartParams {
                     cwd: Some(cwd.to_string_lossy().to_string()),
-                    ephemeral: Some(true),
+                    ephemeral: Some(false),
                     service_name: Some("cmdex".to_string()),
                 },
             )
@@ -183,6 +202,59 @@ impl CodexAppServer {
             .await?;
 
         Ok(())
+    }
+
+    pub async fn resume_thread(&self, thread_id: &str) -> Result<ThreadInfo> {
+        let response: ThreadResumeResponse = self
+            .request(
+                "thread/resume",
+                ThreadResumeParams {
+                    thread_id: thread_id.to_string(),
+                },
+            )
+            .await?;
+
+        Ok(ThreadInfo {
+            id: response.thread.id,
+        })
+    }
+
+    pub async fn load_latest_workspace_session(
+        &self,
+        cwd: &Path,
+    ) -> Result<Option<WorkspaceSession>> {
+        let response: ThreadListResponse = self
+            .request(
+                "thread/list",
+                ThreadListParams {
+                    limit: Some(1),
+                    sort_key: Some("updated_at".to_string()),
+                    sort_direction: Some("desc".to_string()),
+                    cwd: Some(cwd.to_string_lossy().to_string()),
+                },
+            )
+            .await?;
+
+        let Some(thread) = response.data.into_iter().next() else {
+            return Ok(None);
+        };
+
+        let response: ThreadReadResponse = self
+            .request(
+                "thread/read",
+                ThreadReadParams {
+                    thread_id: thread.id.clone(),
+                    include_turns: Some(true),
+                },
+            )
+            .await?;
+
+        Ok(Some(WorkspaceSession {
+            thread: ThreadInfo {
+                id: response.thread.id,
+            },
+            entries: history_entries_from_turns(&response.thread.turns),
+        }))
     }
 
     async fn request<T>(&self, method: &str, params: impl Serialize) -> Result<T>
@@ -303,10 +375,67 @@ struct TurnStartResponse {
     turn: TurnResponse,
 }
 
+#[derive(Debug, Serialize)]
+struct ThreadResumeParams {
+    #[serde(rename = "threadId")]
+    thread_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ThreadResumeResponse {
+    thread: ThreadResponse,
+}
+
 #[derive(Debug, Deserialize)]
 struct TurnResponse {
     #[allow(dead_code)]
     id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ThreadListParams {
+    limit: Option<u64>,
+    #[serde(rename = "sortKey")]
+    sort_key: Option<String>,
+    #[serde(rename = "sortDirection")]
+    sort_direction: Option<String>,
+    cwd: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ThreadListResponse {
+    data: Vec<ThreadListItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ThreadListItem {
+    id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ThreadReadParams {
+    #[serde(rename = "threadId")]
+    thread_id: String,
+    #[serde(rename = "includeTurns")]
+    include_turns: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ThreadReadResponse {
+    thread: ThreadReadThread,
+}
+
+#[derive(Debug, Deserialize)]
+struct ThreadReadThread {
+    id: String,
+    #[serde(default)]
+    turns: Vec<ThreadTurn>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ThreadTurn {
+    #[serde(default)]
+    items: Vec<Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -445,4 +574,305 @@ fn format_jsonrpc_error(error: &Value) -> String {
         .and_then(Value::as_str)
         .unwrap_or("unknown error");
     format!("{message} (code {code})")
+}
+
+fn history_entries_from_turns(turns: &[ThreadTurn]) -> Vec<HistoryEntry> {
+    let mut entries = Vec::new();
+
+    for turn in turns {
+        for item in &turn.items {
+            if let Some(entry) = history_entry_from_item(item) {
+                entries.push(entry);
+            }
+        }
+    }
+
+    entries
+}
+
+fn history_entry_from_item(item: &Value) -> Option<HistoryEntry> {
+    let item_type = item.get("type")?.as_str()?;
+
+    match item_type {
+        "userMessage" => {
+            let text = user_message_text(item);
+            if text.trim().is_empty() {
+                None
+            } else {
+                Some(HistoryEntry {
+                    kind: HistoryEntryKind::User,
+                    text,
+                })
+            }
+        }
+        "agentMessage" => {
+            let text = item.get("text")?.as_str()?.to_string();
+            if text.trim().is_empty() {
+                None
+            } else {
+                Some(HistoryEntry {
+                    kind: HistoryEntryKind::Assistant,
+                    text,
+                })
+            }
+        }
+        "plan" => {
+            let text = item.get("text")?.as_str()?.trim().to_string();
+            (!text.is_empty()).then(|| HistoryEntry {
+                kind: HistoryEntryKind::Event,
+                text: format!("[Plan]\n{text}"),
+            })
+        }
+        "reasoning" => {
+            let summary = item
+                .get("summary")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            let text = summary.trim();
+            (!text.is_empty()).then(|| HistoryEntry {
+                kind: HistoryEntryKind::Event,
+                text: format!("[Reasoning]\n{text}"),
+            })
+        }
+        "commandExecution" => Some(HistoryEntry {
+            kind: HistoryEntryKind::Event,
+            text: summarize_command_execution(item),
+        }),
+        "fileChange" => Some(HistoryEntry {
+            kind: HistoryEntryKind::Event,
+            text: summarize_file_change(item),
+        }),
+        "mcpToolCall" => Some(HistoryEntry {
+            kind: HistoryEntryKind::Event,
+            text: summarize_mcp_tool_call(item),
+        }),
+        "dynamicToolCall" => Some(HistoryEntry {
+            kind: HistoryEntryKind::Event,
+            text: summarize_dynamic_tool_call(item),
+        }),
+        "webSearch" => item
+            .get("query")
+            .and_then(Value::as_str)
+            .map(|query| HistoryEntry {
+                kind: HistoryEntryKind::Event,
+                text: format!("[Web Search] {query}"),
+            }),
+        "contextCompaction" => Some(HistoryEntry {
+            kind: HistoryEntryKind::Event,
+            text: "[Context] Conversation compacted".to_string(),
+        }),
+        "enteredReviewMode" => {
+            item.get("review")
+                .and_then(Value::as_str)
+                .map(|review| HistoryEntry {
+                    kind: HistoryEntryKind::Event,
+                    text: format!("[Review] Entered review mode: {review}"),
+                })
+        }
+        "exitedReviewMode" => {
+            item.get("review")
+                .and_then(Value::as_str)
+                .map(|review| HistoryEntry {
+                    kind: HistoryEntryKind::Event,
+                    text: format!("[Review] Exited review mode: {review}"),
+                })
+        }
+        "imageView" => item
+            .get("path")
+            .and_then(Value::as_str)
+            .map(|path| HistoryEntry {
+                kind: HistoryEntryKind::Event,
+                text: format!("[Image] Viewed {path}"),
+            }),
+        "imageGeneration" => Some(HistoryEntry {
+            kind: HistoryEntryKind::Event,
+            text: summarize_image_generation(item),
+        }),
+        "subAgentActivity" => Some(HistoryEntry {
+            kind: HistoryEntryKind::Event,
+            text: summarize_subagent_activity(item),
+        }),
+        "collabAgentToolCall" => Some(HistoryEntry {
+            kind: HistoryEntryKind::Event,
+            text: summarize_collab_tool_call(item),
+        }),
+        "sleep" => item
+            .get("durationMs")
+            .and_then(Value::as_u64)
+            .map(|duration| HistoryEntry {
+                kind: HistoryEntryKind::Event,
+                text: format!("[Sleep] Waited {duration}ms"),
+            }),
+        _ => None,
+    }
+}
+
+fn user_message_text(item: &Value) -> String {
+    let parts = item
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|part| {
+            let part_type = part.get("type")?.as_str()?;
+            match part_type {
+                "text" => Some(part.get("text")?.as_str()?.to_string()),
+                "localImage" => Some(format!(
+                    "[local image: {}]",
+                    part.get("path")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                )),
+                "image" => Some(format!(
+                    "[image: {}]",
+                    part.get("url").and_then(Value::as_str).unwrap_or("unknown")
+                )),
+                "skill" | "mention" => Some(
+                    part.get("name")
+                        .and_then(Value::as_str)
+                        .map(|name| format!("@{name}"))
+                        .unwrap_or_default(),
+                ),
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    parts.join("")
+}
+
+fn summarize_command_execution(item: &Value) -> String {
+    let command = item
+        .get("command")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown command");
+    let status = item
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let exit_code = item
+        .get("exitCode")
+        .and_then(Value::as_i64)
+        .map(|code| format!(" • exit {code}"))
+        .unwrap_or_default();
+
+    format!("[Command] {command} • {status}{exit_code}")
+}
+
+fn summarize_file_change(item: &Value) -> String {
+    let count = item
+        .get("changes")
+        .and_then(Value::as_array)
+        .map(|changes| changes.len())
+        .unwrap_or(0);
+    let noun = if count == 1 { "file" } else { "files" };
+    format!("[File Change] {count} {noun} updated")
+}
+
+fn summarize_mcp_tool_call(item: &Value) -> String {
+    let server = item
+        .get("server")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let tool = item.get("tool").and_then(Value::as_str).unwrap_or("tool");
+    let status = item
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    format!("[MCP] {server}/{tool} • {status}")
+}
+
+fn summarize_dynamic_tool_call(item: &Value) -> String {
+    let namespace = item
+        .get("namespace")
+        .and_then(Value::as_str)
+        .map(|value| format!("{value}/"))
+        .unwrap_or_default();
+    let tool = item.get("tool").and_then(Value::as_str).unwrap_or("tool");
+    let status = item
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    format!("[Tool] {namespace}{tool} • {status}")
+}
+
+fn summarize_image_generation(item: &Value) -> String {
+    let status = item
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let saved_path = item
+        .get("savedPath")
+        .and_then(Value::as_str)
+        .map(|path| format!(" • {path}"))
+        .unwrap_or_default();
+    format!("[Image Generation] {status}{saved_path}")
+}
+
+fn summarize_subagent_activity(item: &Value) -> String {
+    let kind = item
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("activity");
+    let path = item
+        .get("agentPath")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    format!("[Sub-agent] {kind} • {path}")
+}
+
+fn summarize_collab_tool_call(item: &Value) -> String {
+    let tool = item.get("tool").and_then(Value::as_str).unwrap_or("tool");
+    let status = item
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let receivers = item
+        .get("receiverThreadIds")
+        .and_then(Value::as_array)
+        .map(|value| value.len())
+        .unwrap_or(0);
+    format!("[Collab] {tool} • {status} • {receivers} agent(s)")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn turns_are_converted_to_history_entries() {
+        let turns = vec![ThreadTurn {
+            items: vec![
+                json!({
+                    "type": "userMessage",
+                    "content": [{"type":"text","text":"hello"}]
+                }),
+                json!({
+                    "type": "commandExecution",
+                    "command": "cargo check",
+                    "status": "completed",
+                    "exitCode": 0
+                }),
+                json!({
+                    "type": "agentMessage",
+                    "text": "done"
+                }),
+            ],
+        }];
+
+        let entries = history_entries_from_turns(&turns);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].kind, HistoryEntryKind::User);
+        assert_eq!(entries[0].text, "hello");
+        assert_eq!(entries[1].kind, HistoryEntryKind::Event);
+        assert!(entries[1].text.contains("cargo check"));
+        assert_eq!(entries[2].kind, HistoryEntryKind::Assistant);
+        assert_eq!(entries[2].text, "done");
+    }
 }

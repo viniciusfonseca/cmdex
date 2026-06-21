@@ -8,7 +8,6 @@ It is built with Rust and Ratatui, reads agents from `~/.cmdex.yml`, and talks t
 
 - ASCII logo and agent sidebar
 - Chat tab with streaming responses
-- Braille spinner with `Thinking...` while an agent is working
 - Workspace tab with a file tree on the left and file preview on the right
 - Git Diff tab with modified files on the left and diff preview on the right
 - Agent creation form inside the UI
@@ -56,7 +55,7 @@ cargo test
 
 ## Controls
 
-- `q`: quit
+- `Ctrl+Q`: quit
 - `Ctrl+C`: quit
 - `←` / `→`: switch tabs
 - `↑` / `↓`: move selection in the sidebar
@@ -75,8 +74,7 @@ Mouse support:
 
 ## Notes
 
-- This version starts Codex chat threads as ephemeral threads.
-  Chat history is kept in the running UI session, but is not restored from disk when you restart Cmdex.
+- Cmdex restores the latest Codex session for each configured workspace, including chat messages and summarized workspace events.
 - Workspace previews are text-oriented. Binary files are not rendered.
 - Git Diff uses the current repository state from the selected workspace.
 
