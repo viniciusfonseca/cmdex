@@ -1250,7 +1250,8 @@ fn draw_chat(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     let inner_height = area.height.saturating_sub(2);
-    let content_height = paragraph_content_height(&lines, area.width.saturating_sub(2));
+    let text = Text::from(lines);
+    let content_height = wrapped_text_height(&text, area.width.saturating_sub(2));
     let max_scroll = content_height.saturating_sub(inner_height as usize) as u16;
     let scroll = if agent.chat_follow_output {
         max_scroll
@@ -1258,7 +1259,7 @@ fn draw_chat(frame: &mut Frame, app: &App, area: Rect) {
         agent.chat_scroll.min(max_scroll)
     };
 
-    let chat = Paragraph::new(Text::from(lines))
+    let chat = Paragraph::new(text)
         .block(Block::default().borders(Borders::ALL).title(title))
         .scroll((scroll, 0))
         .wrap(Wrap { trim: false });
@@ -1460,16 +1461,10 @@ fn preview_content_height(lines: &[Line<'_>], width: u16) -> usize {
         .sum()
 }
 
-fn paragraph_content_height(lines: &[Line<'_>], width: u16) -> usize {
-    let width = usize::from(width.max(1));
-
-    lines
-        .iter()
-        .map(|line| match line.width() {
-            0 => 1,
-            line_width => line_width.saturating_sub(1) / width + 1,
-        })
-        .sum()
+fn wrapped_text_height(text: &Text<'_>, width: u16) -> usize {
+    Paragraph::new(text.clone())
+        .wrap(Wrap { trim: false })
+        .line_count(width.max(1))
 }
 
 fn chat_lines(agent: &AgentState) -> Vec<Line<'static>> {
@@ -1487,7 +1482,7 @@ fn chat_lines(agent: &AgentState) -> Vec<Line<'static>> {
 fn chat_max_scroll(agent: &AgentState, area: Rect) -> u16 {
     let lines = chat_lines(agent);
     let inner_height = area.height.saturating_sub(2) as usize;
-    let content_height = paragraph_content_height(&lines, area.width.saturating_sub(2));
+    let content_height = wrapped_text_height(&Text::from(lines), area.width.saturating_sub(2));
 
     content_height.saturating_sub(inner_height) as u16
 }
@@ -1804,4 +1799,33 @@ fn link_style() -> Style {
     Style::default()
         .fg(Color::Blue)
         .add_modifier(Modifier::UNDERLINED)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wrapped_text_height_matches_paragraph_word_wrapping() {
+        let text = Text::from(vec![Line::from("abc def ghi")]);
+
+        assert_eq!(wrapped_text_height(&text, 6), 3);
+    }
+
+    #[test]
+    fn chat_max_scroll_uses_wrapped_height_for_last_message() {
+        let mut agent = AgentState::new(AgentDefinition {
+            name: "Test".to_string(),
+            workspace: PathBuf::from("/tmp"),
+        });
+        agent.messages.push(ChatMessage {
+            role: MessageRole::Assistant,
+            text: "abc def ghi".to_string(),
+            item_id: None,
+        });
+
+        let area = Rect::new(0, 0, 8, 5);
+
+        assert_eq!(chat_max_scroll(&agent, area), 2);
+    }
 }
