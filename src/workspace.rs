@@ -1,4 +1,5 @@
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -31,19 +32,38 @@ static THEME: LazyLock<Theme> = LazyLock::new(|| {
 #[derive(Debug, Clone, Default)]
 pub struct FileBrowserState {
     pub entries: Vec<FileEntry>,
+    pub tree_rows: Vec<FileTreeRow>,
     pub selected: usize,
+    pub tree_cursor: usize,
     pub preview_title: String,
     pub preview: Vec<Line<'static>>,
     pub content_scroll: u16,
     pub error: Option<String>,
     pub editor: Option<WorkspaceEditorState>,
+    collapsed_dirs: BTreeSet<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
 pub struct FileEntry {
-    pub label: String,
     pub path: PathBuf,
-    pub is_dir: bool,
+    pub relative_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct FileTreeRow {
+    pub label: String,
+    kind: FileTreeRowKind,
+}
+
+#[derive(Debug, Clone)]
+enum FileTreeRowKind {
+    Directory {
+        relative_path: PathBuf,
+        expanded: bool,
+    },
+    File {
+        file_index: usize,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -108,6 +128,7 @@ impl FileBrowserState {
         match build_file_entries(root).and_then(|entries| {
             self.entries = entries;
             self.selected = self.selected.min(self.entries.len().saturating_sub(1));
+            self.rebuild_tree_rows();
             self.content_scroll = 0;
             self.error = None;
             self.update_preview()?;
@@ -116,7 +137,9 @@ impl FileBrowserState {
             Ok(()) => {}
             Err(error) => {
                 self.entries.clear();
+                self.tree_rows.clear();
                 self.selected = 0;
+                self.tree_cursor = 0;
                 self.preview_title = "Workspace".to_string();
                 self.preview = plain_preview_lines("Unable to load workspace.");
                 self.error = Some(error.to_string());
@@ -125,18 +148,18 @@ impl FileBrowserState {
     }
 
     pub fn move_up(&mut self) {
-        if self.entries.is_empty() {
+        if self.tree_rows.is_empty() {
             return;
         }
-        let _ = self.select_index(self.selected.saturating_sub(1), true);
+        let _ = self.select_tree_row(self.tree_cursor.saturating_sub(1), true);
     }
 
     pub fn move_down(&mut self) {
-        if self.entries.is_empty() {
+        if self.tree_rows.is_empty() {
             return;
         }
-        let _ = self.select_index(
-            (self.selected + 1).min(self.entries.len().saturating_sub(1)),
+        let _ = self.select_tree_row(
+            (self.tree_cursor + 1).min(self.tree_rows.len().saturating_sub(1)),
             true,
         );
     }
@@ -161,12 +184,9 @@ impl FileBrowserState {
             return Ok(());
         }
 
-        let entry = &self.entries[self.selected];
-        if entry.is_dir {
-            return Err(anyhow::anyhow!("Directory editing is not available."));
-        }
-
-        self.editor = Some(WorkspaceEditorState::open(&entry.path)?);
+        self.editor = Some(WorkspaceEditorState::open(
+            &self.entries[self.selected].path,
+        )?);
         self.error = None;
         Ok(())
     }
@@ -175,6 +195,48 @@ impl FileBrowserState {
         self.editor = None;
         self.content_scroll = 0;
         self.update_preview()
+    }
+
+    pub fn sidebar_labels(&self) -> Vec<String> {
+        self.tree_rows
+            .iter()
+            .map(|row| row.label.clone())
+            .collect::<Vec<_>>()
+    }
+
+    pub fn sidebar_len(&self) -> usize {
+        self.tree_rows.len()
+    }
+
+    pub fn sidebar_selected_row(&self) -> usize {
+        self.tree_cursor.min(self.tree_rows.len().saturating_sub(1))
+    }
+
+    pub fn select_sidebar_row(&mut self, row: usize) {
+        let Some(row_kind) = self.tree_rows.get(row).map(|entry| entry.kind.clone()) else {
+            return;
+        };
+
+        match row_kind {
+            FileTreeRowKind::Directory { .. } => {
+                self.tree_cursor = row;
+                self.toggle_directory_at_row(row);
+            }
+            FileTreeRowKind::File { .. } => {
+                if let Some(file_index) = self.tree_rows.get(row).and_then(FileTreeRow::file_index)
+                {
+                    self.select(file_index);
+                }
+            }
+        }
+    }
+
+    pub fn toggle_current_directory(&mut self) -> bool {
+        if self.tree_rows.is_empty() {
+            return false;
+        }
+
+        self.toggle_directory_at_row(self.tree_cursor)
     }
 
     fn select_index(&mut self, index: usize, auto_open: bool) -> Result<()> {
@@ -191,8 +253,99 @@ impl FileBrowserState {
         self.selected = index;
         self.content_scroll = 0;
         self.error = None;
+        if let Some(row) = self.row_for_file(index) {
+            self.tree_cursor = row;
+        }
         self.update_preview()?;
         self.sync_editor_to_selection(auto_open)
+    }
+
+    fn select_tree_row(&mut self, row: usize, auto_open: bool) -> Result<()> {
+        if self.tree_rows.is_empty() {
+            return Ok(());
+        }
+
+        let target_row = row.min(self.tree_rows.len().saturating_sub(1));
+        let previous_row = self.tree_cursor;
+        let previous_selected = self.selected;
+        self.tree_cursor = target_row;
+
+        if let Some(file_index) = self
+            .tree_rows
+            .get(target_row)
+            .and_then(FileTreeRow::file_index)
+        {
+            self.select_index(file_index, auto_open)?;
+            if file_index != previous_selected && self.selected != file_index {
+                self.tree_cursor = previous_row;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn toggle_directory_at_row(&mut self, row: usize) -> bool {
+        let Some((relative_path, expanded)) = self
+            .tree_rows
+            .get(row)
+            .and_then(FileTreeRow::directory_state)
+        else {
+            return false;
+        };
+        let relative_path = relative_path.clone();
+
+        if expanded {
+            self.collapsed_dirs.insert(relative_path.clone());
+        } else {
+            self.collapsed_dirs.remove(relative_path.as_path());
+        }
+
+        self.rebuild_tree_rows();
+        if let Some(index) = self.row_for_directory(&relative_path) {
+            self.tree_cursor = index;
+        }
+        true
+    }
+
+    fn rebuild_tree_rows(&mut self) {
+        let (tree_rows, tree_file_rows) = build_file_tree_rows(&self.entries, &self.collapsed_dirs);
+        self.tree_rows = tree_rows;
+
+        if let Some(row) = tree_file_rows
+            .get(self.selected)
+            .and_then(|row| row.or_else(|| self.visible_ancestor_row(self.selected)))
+        {
+            self.tree_cursor = row;
+        } else {
+            self.tree_cursor = self.tree_cursor.min(self.tree_rows.len().saturating_sub(1));
+        }
+    }
+
+    fn row_for_file(&self, file_index: usize) -> Option<usize> {
+        self.tree_rows
+            .iter()
+            .position(|row| row.file_index() == Some(file_index))
+    }
+
+    fn row_for_directory(&self, relative_path: &Path) -> Option<usize> {
+        self.tree_rows.iter().position(|row| {
+            row.directory_path()
+                .is_some_and(|path| path == relative_path)
+        })
+    }
+
+    fn visible_ancestor_row(&self, file_index: usize) -> Option<usize> {
+        let relative = self.entries.get(file_index)?.relative_path.as_path();
+        let mut ancestor = relative.parent();
+
+        while let Some(path) = ancestor {
+            if self.collapsed_dirs.contains(path) {
+                return self.row_for_directory(path);
+            }
+            ancestor = path.parent();
+        }
+
+        None
     }
 
     fn sync_editor_to_selection(&mut self, auto_open: bool) -> Result<()> {
@@ -202,11 +355,6 @@ impl FileBrowserState {
         }
 
         let entry = &self.entries[self.selected];
-        if entry.is_dir {
-            self.editor = None;
-            return Ok(());
-        }
-
         if self
             .editor
             .as_ref()
@@ -240,12 +388,34 @@ impl FileBrowserState {
 
         let entry = &self.entries[self.selected];
         self.preview_title = entry.path.display().to_string();
-        self.preview = if entry.is_dir {
-            plain_preview_lines(&format!("Directory: {}", entry.path.display()))
-        } else {
-            read_text_preview(&entry.path)?
-        };
+        self.preview = read_text_preview(&entry.path)?;
         Ok(())
+    }
+}
+
+impl FileTreeRow {
+    fn file_index(&self) -> Option<usize> {
+        match self.kind {
+            FileTreeRowKind::Directory { .. } => None,
+            FileTreeRowKind::File { file_index } => Some(file_index),
+        }
+    }
+
+    fn directory_state(&self) -> Option<(&PathBuf, bool)> {
+        match &self.kind {
+            FileTreeRowKind::Directory {
+                relative_path,
+                expanded,
+            } => Some((relative_path, *expanded)),
+            FileTreeRowKind::File { .. } => None,
+        }
+    }
+
+    fn directory_path(&self) -> Option<&PathBuf> {
+        match &self.kind {
+            FileTreeRowKind::Directory { relative_path, .. } => Some(relative_path),
+            FileTreeRowKind::File { .. } => None,
+        }
     }
 }
 
@@ -806,28 +976,147 @@ fn build_file_entries(root: &Path) -> Result<Vec<FileEntry>> {
         let relative = path
             .strip_prefix(root)
             .with_context(|| format!("failed to make {} relative", path.display()))?;
-        let depth = relative.components().count().saturating_sub(1);
-        let indent = "  ".repeat(depth);
-        let file_name = relative
-            .file_name()
-            .map(|name| name.to_string_lossy().to_string())
-            .unwrap_or_else(|| relative.display().to_string());
-        let is_dir = entry.file_type().is_some_and(|kind| kind.is_dir());
+        if entry.file_type().is_some_and(|kind| kind.is_dir()) {
+            continue;
+        }
 
         entries.push(FileEntry {
-            label: format!(
-                "{}{} {}",
-                indent,
-                if is_dir { "[D]" } else { "[F]" },
-                file_name
-            ),
             path: path.to_path_buf(),
-            is_dir,
+            relative_path: relative.to_path_buf(),
         });
     }
 
-    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    entries.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
     Ok(entries)
+}
+
+#[derive(Debug, Default)]
+struct FileTreeNode {
+    directories: BTreeMap<String, FileTreeNode>,
+    files: Vec<(String, usize)>,
+}
+
+fn build_file_tree_rows(
+    entries: &[FileEntry],
+    collapsed_dirs: &BTreeSet<PathBuf>,
+) -> (Vec<FileTreeRow>, Vec<Option<usize>>) {
+    let mut root = FileTreeNode::default();
+
+    for (index, entry) in entries.iter().enumerate() {
+        let components = entry
+            .relative_path
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        if components.is_empty() {
+            continue;
+        }
+
+        let mut node = &mut root;
+        for directory in &components[..components.len().saturating_sub(1)] {
+            node = node.directories.entry(directory.clone()).or_default();
+        }
+
+        if let Some(file_name) = components.last() {
+            node.files.push((file_name.clone(), index));
+        }
+    }
+
+    let mut rows = Vec::new();
+    let mut file_rows = vec![None; entries.len()];
+    append_tree_rows(
+        &root,
+        Path::new(""),
+        &[],
+        collapsed_dirs,
+        &mut rows,
+        &mut file_rows,
+    );
+    (rows, file_rows)
+}
+
+fn append_tree_rows(
+    node: &FileTreeNode,
+    base_path: &Path,
+    ancestor_has_more: &[bool],
+    collapsed_dirs: &BTreeSet<PathBuf>,
+    rows: &mut Vec<FileTreeRow>,
+    file_rows: &mut [Option<usize>],
+) {
+    let directories = node
+        .directories
+        .iter()
+        .map(|(name, child)| (TreeChild::Directory(name), child))
+        .collect::<Vec<_>>();
+    let files = node
+        .files
+        .iter()
+        .map(|(name, index)| (TreeChild::File(name, *index), node))
+        .collect::<Vec<_>>();
+
+    let children = directories.into_iter().chain(files).collect::<Vec<_>>();
+
+    for (position, (child, child_node)) in children.iter().enumerate() {
+        let is_last = position + 1 == children.len();
+        let mut label = tree_row_prefix(ancestor_has_more);
+        label.push_str(if is_last { "└── " } else { "├── " });
+
+        match child {
+            TreeChild::Directory(name) => {
+                let relative_path = if base_path.as_os_str().is_empty() {
+                    PathBuf::from(name)
+                } else {
+                    base_path.join(name)
+                };
+                let expanded = !collapsed_dirs.contains(&relative_path);
+                label.push_str(if expanded { "▾ " } else { "▸ " });
+                label.push_str(name);
+                rows.push(FileTreeRow {
+                    label,
+                    kind: FileTreeRowKind::Directory {
+                        relative_path: relative_path.clone(),
+                        expanded,
+                    },
+                });
+
+                if expanded {
+                    let mut next_prefix = ancestor_has_more.to_vec();
+                    next_prefix.push(!is_last);
+                    append_tree_rows(
+                        child_node,
+                        &relative_path,
+                        &next_prefix,
+                        collapsed_dirs,
+                        rows,
+                        file_rows,
+                    );
+                }
+            }
+            TreeChild::File(name, file_index) => {
+                label.push_str(name);
+                file_rows[*file_index] = Some(rows.len());
+                rows.push(FileTreeRow {
+                    label,
+                    kind: FileTreeRowKind::File {
+                        file_index: *file_index,
+                    },
+                });
+            }
+        }
+    }
+}
+
+fn tree_row_prefix(ancestor_has_more: &[bool]) -> String {
+    ancestor_has_more
+        .iter()
+        .map(|has_more| if *has_more { "│   " } else { "    " })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+enum TreeChild<'a> {
+    Directory(&'a str),
+    File(&'a str, usize),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1263,9 +1552,8 @@ mod tests {
 
         let mut browser = FileBrowserState {
             entries: vec![FileEntry {
-                label: "[F] hello.txt".to_string(),
                 path: path.clone(),
-                is_dir: false,
+                relative_path: PathBuf::from("hello.txt"),
             }],
             ..Default::default()
         };
@@ -1291,14 +1579,12 @@ mod tests {
         let mut browser = FileBrowserState {
             entries: vec![
                 FileEntry {
-                    label: "[F] first.txt".to_string(),
                     path: first.clone(),
-                    is_dir: false,
+                    relative_path: PathBuf::from("first.txt"),
                 },
                 FileEntry {
-                    label: "[F] second.txt".to_string(),
                     path: second.clone(),
-                    is_dir: false,
+                    relative_path: PathBuf::from("second.txt"),
                 },
             ],
             ..Default::default()
@@ -1320,6 +1606,67 @@ mod tests {
 
         let _ = fs::remove_file(first);
         let _ = fs::remove_file(second);
+    }
+
+    #[test]
+    fn builds_workspace_sidebar_tree_rows_from_files() {
+        let entries = vec![
+            FileEntry {
+                path: PathBuf::from("/tmp/repo/README.md"),
+                relative_path: PathBuf::from("README.md"),
+            },
+            FileEntry {
+                path: PathBuf::from("/tmp/repo/src/app.rs"),
+                relative_path: PathBuf::from("src/app.rs"),
+            },
+            FileEntry {
+                path: PathBuf::from("/tmp/repo/src/ui/mod.rs"),
+                relative_path: PathBuf::from("src/ui/mod.rs"),
+            },
+        ];
+
+        let (rows, file_rows) = build_file_tree_rows(&entries, &BTreeSet::new());
+
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.label.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "├── ▾ src",
+                "│   ├── ▾ ui",
+                "│   │   └── mod.rs",
+                "│   └── app.rs",
+                "└── README.md",
+            ]
+        );
+        assert_eq!(file_rows, vec![Some(4), Some(3), Some(2)]);
+        assert!(rows[1].directory_path().is_some());
+        assert_eq!(rows[3].file_index(), Some(1));
+    }
+
+    #[test]
+    fn hides_descendants_for_collapsed_directory_rows() {
+        let entries = vec![
+            FileEntry {
+                path: PathBuf::from("/tmp/repo/src/app.rs"),
+                relative_path: PathBuf::from("src/app.rs"),
+            },
+            FileEntry {
+                path: PathBuf::from("/tmp/repo/src/ui/mod.rs"),
+                relative_path: PathBuf::from("src/ui/mod.rs"),
+            },
+        ];
+        let collapsed = BTreeSet::from([PathBuf::from("src")]);
+
+        let (rows, file_rows) = build_file_tree_rows(&entries, &collapsed);
+
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["└── ▸ src"]
+        );
+        assert_eq!(file_rows, vec![None, None]);
     }
 
     #[test]

@@ -266,14 +266,7 @@ impl App {
             }
             AppTab::Workspace => self
                 .active_agent()
-                .map(|agent| {
-                    agent
-                        .workspace
-                        .entries
-                        .iter()
-                        .map(|entry| entry.label.clone())
-                        .collect::<Vec<_>>()
-                })
+                .map(|agent| agent.workspace.sidebar_labels())
                 .unwrap_or_default(),
             AppTab::GitDiff => self
                 .active_agent()
@@ -629,6 +622,9 @@ impl App {
 
             if workspace.editor.is_none() {
                 if key.code == KeyCode::Enter {
+                    if workspace.toggle_current_directory() {
+                        return true;
+                    }
                     match workspace.open_editor() {
                         Ok(()) => {}
                         Err(error) => workspace.error = Some(error.to_string()),
@@ -727,6 +723,9 @@ impl App {
                     },
                     EditorMode::Normal => match key.code {
                         KeyCode::Esc => handled = true,
+                        KeyCode::Enter => {
+                            handled = workspace.toggle_current_directory();
+                        }
                         KeyCode::Up => {
                             selection_delta = -1;
                             handled = true;
@@ -1469,14 +1468,17 @@ impl App {
             }
             AppTab::Workspace => {
                 if let Some(agent) = self.active_agent_mut() {
-                    let total = agent.workspace.entries.len();
+                    let total = agent.workspace.sidebar_len();
                     if total == 0 {
                         return;
                     }
-                    let offset =
-                        list_offset(agent.workspace.selected, total, inner.height as usize);
+                    let offset = list_offset(
+                        agent.workspace.sidebar_selected_row(),
+                        total,
+                        inner.height as usize,
+                    );
                     let index = (offset + visible_row).min(total.saturating_sub(1));
-                    agent.workspace.select(index);
+                    agent.workspace.select_sidebar_row(index);
                 }
             }
             AppTab::GitDiff => {
@@ -1749,10 +1751,12 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
         AppTab::Chat => state.select(Some(
             app.chat_sidebar_index.min(items.len().saturating_sub(1)),
         )),
-        AppTab::Workspace => state.select(
-            app.active_agent()
-                .map(|agent| agent.workspace.selected.min(items.len().saturating_sub(1))),
-        ),
+        AppTab::Workspace => state.select(app.active_agent().map(|agent| {
+            agent
+                .workspace
+                .sidebar_selected_row()
+                .min(items.len().saturating_sub(1))
+        })),
         AppTab::GitDiff => state.select(app.active_agent().map(|agent| {
             agent
                 .git_diff
