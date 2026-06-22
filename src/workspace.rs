@@ -36,6 +36,7 @@ pub struct FileBrowserState {
     pub preview: Vec<Line<'static>>,
     pub content_scroll: u16,
     pub error: Option<String>,
+    pub editor: Option<WorkspaceEditorState>,
 }
 
 #[derive(Debug, Clone)]
@@ -47,12 +48,24 @@ pub struct FileEntry {
 
 #[derive(Debug, Clone, Default)]
 pub struct DiffBrowserState {
-    pub entries: Vec<DiffEntry>,
-    pub selected: usize,
+    pub changes: Vec<DiffEntry>,
+    pub staged: Vec<DiffEntry>,
+    pub active_section: DiffSection,
+    pub selected_changes: usize,
+    pub selected_staged: usize,
     pub preview_title: String,
     pub preview: Vec<Line<'static>>,
     pub content_scroll: u16,
+    pub commit_message: String,
+    pub status: Option<String>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DiffSection {
+    #[default]
+    Changes,
+    Staged,
 }
 
 #[derive(Debug, Clone)]
@@ -62,6 +75,34 @@ pub struct DiffEntry {
     pub status: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditorMode {
+    Normal,
+    Insert,
+    Command,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EditorCommandResult {
+    pub saved: bool,
+    pub close: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkspaceEditorState {
+    pub path: PathBuf,
+    pub lines: Vec<String>,
+    pub cursor_row: usize,
+    pub cursor_col: usize,
+    pub vertical_scroll: u16,
+    pub horizontal_scroll: u16,
+    pub mode: EditorMode,
+    pub command: String,
+    pub dirty: bool,
+    pub status: Option<String>,
+    preferred_col: usize,
+}
+
 impl FileBrowserState {
     pub fn refresh(&mut self, root: &Path) {
         match build_file_entries(root).and_then(|entries| {
@@ -69,7 +110,8 @@ impl FileBrowserState {
             self.selected = self.selected.min(self.entries.len().saturating_sub(1));
             self.content_scroll = 0;
             self.error = None;
-            self.update_preview()
+            self.update_preview()?;
+            self.sync_editor_to_selection(true)
         }) {
             Ok(()) => {}
             Err(error) => {
@@ -86,27 +128,24 @@ impl FileBrowserState {
         if self.entries.is_empty() {
             return;
         }
-        self.selected = self.selected.saturating_sub(1);
-        self.content_scroll = 0;
-        let _ = self.update_preview();
+        let _ = self.select_index(self.selected.saturating_sub(1), true);
     }
 
     pub fn move_down(&mut self) {
         if self.entries.is_empty() {
             return;
         }
-        self.selected = (self.selected + 1).min(self.entries.len().saturating_sub(1));
-        self.content_scroll = 0;
-        let _ = self.update_preview();
+        let _ = self.select_index(
+            (self.selected + 1).min(self.entries.len().saturating_sub(1)),
+            true,
+        );
     }
 
     pub fn select(&mut self, index: usize) {
         if self.entries.is_empty() {
             return;
         }
-        self.selected = index.min(self.entries.len().saturating_sub(1));
-        self.content_scroll = 0;
-        let _ = self.update_preview();
+        let _ = self.select_index(index.min(self.entries.len().saturating_sub(1)), true);
     }
 
     pub fn scroll_up(&mut self, lines: u16) {
@@ -115,6 +154,81 @@ impl FileBrowserState {
 
     pub fn scroll_down(&mut self, lines: u16) {
         self.content_scroll = self.content_scroll.saturating_add(lines);
+    }
+
+    pub fn open_editor(&mut self) -> Result<()> {
+        if self.entries.is_empty() {
+            return Ok(());
+        }
+
+        let entry = &self.entries[self.selected];
+        if entry.is_dir {
+            return Err(anyhow::anyhow!("Directory editing is not available."));
+        }
+
+        self.editor = Some(WorkspaceEditorState::open(&entry.path)?);
+        self.error = None;
+        Ok(())
+    }
+
+    pub fn close_editor(&mut self) -> Result<()> {
+        self.editor = None;
+        self.content_scroll = 0;
+        self.update_preview()
+    }
+
+    fn select_index(&mut self, index: usize, auto_open: bool) -> Result<()> {
+        let index = index.min(self.entries.len().saturating_sub(1));
+        if index != self.selected && self.editor.as_ref().is_some_and(|editor| editor.dirty) {
+            if let Some(editor) = self.editor.as_mut() {
+                editor.mode = EditorMode::Normal;
+                editor.status =
+                    Some("Unsaved changes. Use :w, :q or :q! before switching files.".to_string());
+            }
+            return Ok(());
+        }
+
+        self.selected = index;
+        self.content_scroll = 0;
+        self.error = None;
+        self.update_preview()?;
+        self.sync_editor_to_selection(auto_open)
+    }
+
+    fn sync_editor_to_selection(&mut self, auto_open: bool) -> Result<()> {
+        if self.entries.is_empty() {
+            self.editor = None;
+            return Ok(());
+        }
+
+        let entry = &self.entries[self.selected];
+        if entry.is_dir {
+            self.editor = None;
+            return Ok(());
+        }
+
+        if self
+            .editor
+            .as_ref()
+            .is_some_and(|editor| editor.path == entry.path)
+        {
+            return Ok(());
+        }
+
+        if auto_open {
+            match WorkspaceEditorState::open(&entry.path) {
+                Ok(editor) => {
+                    self.editor = Some(editor);
+                    self.error = None;
+                }
+                Err(error) => {
+                    self.editor = None;
+                    self.error = Some(error.to_string());
+                }
+            }
+        }
+
+        Ok(())
     }
 
     fn update_preview(&mut self) -> Result<()> {
@@ -135,19 +249,340 @@ impl FileBrowserState {
     }
 }
 
+impl WorkspaceEditorState {
+    pub fn open(path: &Path) -> Result<Self> {
+        let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+        if bytes.contains(&0) {
+            return Err(anyhow::anyhow!("Binary files cannot be edited in-app."));
+        }
+        if bytes.len() > PREVIEW_LIMIT {
+            return Err(anyhow::anyhow!(
+                "Files larger than {} bytes cannot be edited in-app.",
+                PREVIEW_LIMIT
+            ));
+        }
+
+        let source = normalize_newlines(&String::from_utf8_lossy(&bytes));
+        let mut lines = split_preserving_lines(&source);
+        if lines.is_empty() {
+            lines.push(String::new());
+        }
+
+        Ok(Self {
+            path: path.to_path_buf(),
+            lines,
+            cursor_row: 0,
+            cursor_col: 0,
+            vertical_scroll: 0,
+            horizontal_scroll: 0,
+            mode: EditorMode::Normal,
+            command: String::new(),
+            dirty: false,
+            status: None,
+            preferred_col: 0,
+        })
+    }
+
+    pub fn rendered_lines(&self) -> Vec<Line<'static>> {
+        let source = self.lines.join("\n");
+        let syntax = syntax_for_path(&self.path, &source);
+        let mut lines = add_line_numbers(highlighted_preview_lines(&source, syntax));
+        if let Some(line) = lines.get_mut(self.cursor_row) {
+            highlight_editor_line(line);
+        }
+        lines
+    }
+
+    pub fn content_height(&self) -> usize {
+        self.lines.len().max(1)
+    }
+
+    pub fn gutter_width(&self) -> usize {
+        self.lines.len().max(1).to_string().len() + 3
+    }
+
+    pub fn ensure_visible(&mut self, viewport_width: u16, viewport_height: u16) {
+        let viewport_height = usize::from(viewport_height.max(1));
+        if self.cursor_row < self.vertical_scroll as usize {
+            self.vertical_scroll = self.cursor_row as u16;
+        } else if self.cursor_row >= self.vertical_scroll as usize + viewport_height {
+            self.vertical_scroll =
+                self.cursor_row
+                    .saturating_sub(viewport_height.saturating_sub(1)) as u16;
+        }
+
+        let content_width = usize::from(
+            viewport_width
+                .saturating_sub(self.gutter_width() as u16)
+                .saturating_sub(1)
+                .max(1),
+        );
+        if self.cursor_col < self.horizontal_scroll as usize {
+            self.horizontal_scroll = self.cursor_col as u16;
+        } else if self.cursor_col >= self.horizontal_scroll as usize + content_width {
+            self.horizontal_scroll =
+                self.cursor_col
+                    .saturating_sub(content_width.saturating_sub(1)) as u16;
+        }
+    }
+
+    pub fn move_left(&mut self) {
+        if self.cursor_col > 0 {
+            self.cursor_col -= 1;
+        } else if self.cursor_row > 0 {
+            self.cursor_row -= 1;
+            self.cursor_col = self.line_len(self.cursor_row);
+        }
+        self.preferred_col = self.cursor_col;
+        self.status = None;
+    }
+
+    pub fn move_right(&mut self) {
+        let line_len = self.line_len(self.cursor_row);
+        if self.cursor_col < line_len {
+            self.cursor_col += 1;
+        } else if self.cursor_row + 1 < self.lines.len() {
+            self.cursor_row += 1;
+            self.cursor_col = 0;
+        }
+        self.preferred_col = self.cursor_col;
+        self.status = None;
+    }
+
+    pub fn move_up(&mut self) {
+        if self.cursor_row > 0 {
+            self.cursor_row -= 1;
+            self.cursor_col = self.preferred_col.min(self.line_len(self.cursor_row));
+        }
+        self.status = None;
+    }
+
+    pub fn move_down(&mut self) {
+        if self.cursor_row + 1 < self.lines.len() {
+            self.cursor_row += 1;
+            self.cursor_col = self.preferred_col.min(self.line_len(self.cursor_row));
+        }
+        self.status = None;
+    }
+
+    pub fn move_page_up(&mut self, lines: usize) {
+        self.cursor_row = self.cursor_row.saturating_sub(lines);
+        self.cursor_col = self.preferred_col.min(self.line_len(self.cursor_row));
+        self.status = None;
+    }
+
+    pub fn move_page_down(&mut self, lines: usize) {
+        self.cursor_row = (self.cursor_row + lines).min(self.lines.len().saturating_sub(1));
+        self.cursor_col = self.preferred_col.min(self.line_len(self.cursor_row));
+        self.status = None;
+    }
+
+    pub fn move_line_start(&mut self) {
+        self.cursor_col = 0;
+        self.preferred_col = 0;
+        self.status = None;
+    }
+
+    pub fn move_line_end(&mut self) {
+        self.cursor_col = self.line_len(self.cursor_row);
+        self.preferred_col = self.cursor_col;
+        self.status = None;
+    }
+
+    pub fn enter_insert_mode(&mut self) {
+        self.mode = EditorMode::Insert;
+        self.command.clear();
+        self.status = None;
+    }
+
+    pub fn enter_insert_after(&mut self) {
+        let line_len = self.line_len(self.cursor_row);
+        if self.cursor_col < line_len {
+            self.cursor_col += 1;
+        }
+        self.preferred_col = self.cursor_col;
+        self.enter_insert_mode();
+    }
+
+    pub fn open_below(&mut self) {
+        let next_row = self.cursor_row + 1;
+        self.lines.insert(next_row, String::new());
+        self.cursor_row = next_row;
+        self.cursor_col = 0;
+        self.preferred_col = 0;
+        self.dirty = true;
+        self.status = None;
+        self.enter_insert_mode();
+    }
+
+    pub fn delete_char(&mut self) {
+        let line_len = self.line_len(self.cursor_row);
+        if self.cursor_col < line_len {
+            let byte_index = byte_index_for_char(&self.lines[self.cursor_row], self.cursor_col);
+            self.lines[self.cursor_row].remove(byte_index);
+            self.dirty = true;
+        } else if self.cursor_row + 1 < self.lines.len() {
+            let next = self.lines.remove(self.cursor_row + 1);
+            self.lines[self.cursor_row].push_str(&next);
+            self.dirty = true;
+        }
+        self.clamp_cursor();
+        self.status = None;
+    }
+
+    pub fn insert_char(&mut self, character: char) {
+        let byte_index = byte_index_for_char(&self.lines[self.cursor_row], self.cursor_col);
+        self.lines[self.cursor_row].insert(byte_index, character);
+        self.cursor_col += 1;
+        self.preferred_col = self.cursor_col;
+        self.dirty = true;
+        self.status = None;
+    }
+
+    pub fn insert_newline(&mut self) {
+        let byte_index = byte_index_for_char(&self.lines[self.cursor_row], self.cursor_col);
+        let tail = self.lines[self.cursor_row].split_off(byte_index);
+        self.cursor_row += 1;
+        self.lines.insert(self.cursor_row, tail);
+        self.cursor_col = 0;
+        self.preferred_col = 0;
+        self.dirty = true;
+        self.status = None;
+    }
+
+    pub fn backspace(&mut self) {
+        if self.cursor_col > 0 {
+            let byte_end = byte_index_for_char(&self.lines[self.cursor_row], self.cursor_col);
+            let byte_start = byte_index_for_char(&self.lines[self.cursor_row], self.cursor_col - 1);
+            self.lines[self.cursor_row].drain(byte_start..byte_end);
+            self.cursor_col -= 1;
+        } else if self.cursor_row > 0 {
+            let current = self.lines.remove(self.cursor_row);
+            self.cursor_row -= 1;
+            self.cursor_col = self.line_len(self.cursor_row);
+            self.lines[self.cursor_row].push_str(&current);
+        } else {
+            return;
+        }
+
+        self.preferred_col = self.cursor_col;
+        self.dirty = true;
+        self.status = None;
+    }
+
+    pub fn save(&mut self) -> Result<()> {
+        fs::write(&self.path, self.lines.join("\n"))
+            .with_context(|| format!("failed to write {}", self.path.display()))?;
+        self.dirty = false;
+        self.status = Some(format!("{} written", self.path.display()));
+        Ok(())
+    }
+
+    pub fn set_cursor(&mut self, row: usize, col: usize) {
+        self.cursor_row = row.min(self.lines.len().saturating_sub(1));
+        self.cursor_col = col.min(self.line_len(self.cursor_row));
+        self.preferred_col = self.cursor_col;
+        self.status = None;
+    }
+
+    pub fn start_command(&mut self) {
+        self.mode = EditorMode::Command;
+        self.command.clear();
+    }
+
+    pub fn cancel_command(&mut self) {
+        self.mode = EditorMode::Normal;
+        self.command.clear();
+    }
+
+    pub fn execute_command(&mut self) -> Result<EditorCommandResult> {
+        let command = self.command.trim().to_string();
+        self.mode = EditorMode::Normal;
+        self.command.clear();
+
+        match command.as_str() {
+            "" => Ok(EditorCommandResult {
+                saved: false,
+                close: false,
+            }),
+            "w" => {
+                self.save()?;
+                Ok(EditorCommandResult {
+                    saved: true,
+                    close: false,
+                })
+            }
+            "q" => {
+                if self.dirty {
+                    self.status = Some("Unsaved changes. Use :w, :wq or :q!".to_string());
+                    Ok(EditorCommandResult {
+                        saved: false,
+                        close: false,
+                    })
+                } else {
+                    Ok(EditorCommandResult {
+                        saved: false,
+                        close: true,
+                    })
+                }
+            }
+            "q!" => Ok(EditorCommandResult {
+                saved: false,
+                close: true,
+            }),
+            "wq" | "x" => {
+                self.save()?;
+                Ok(EditorCommandResult {
+                    saved: true,
+                    close: true,
+                })
+            }
+            other => {
+                self.status = Some(format!("Unknown command: {other}"));
+                Ok(EditorCommandResult {
+                    saved: false,
+                    close: false,
+                })
+            }
+        }
+    }
+
+    fn line_len(&self, row: usize) -> usize {
+        self.lines
+            .get(row)
+            .map(|line| line.chars().count())
+            .unwrap_or(0)
+    }
+
+    fn clamp_cursor(&mut self) {
+        self.cursor_row = self.cursor_row.min(self.lines.len().saturating_sub(1));
+        self.cursor_col = self.cursor_col.min(self.line_len(self.cursor_row));
+        self.preferred_col = self.cursor_col;
+    }
+}
+
 impl DiffBrowserState {
     pub fn refresh(&mut self, root: &Path) {
-        match build_diff_entries(root).and_then(|entries| {
-            self.entries = entries;
-            self.selected = self.selected.min(self.entries.len().saturating_sub(1));
+        match build_diff_entries(root).and_then(|sections| {
+            self.changes = sections.changes;
+            self.staged = sections.staged;
+            self.selected_changes = self
+                .selected_changes
+                .min(self.changes.len().saturating_sub(1));
+            self.selected_staged = self
+                .selected_staged
+                .min(self.staged.len().saturating_sub(1));
+            self.adjust_active_section();
             self.content_scroll = 0;
             self.error = None;
             self.update_preview(root)
         }) {
             Ok(()) => {}
             Err(error) => {
-                self.entries.clear();
-                self.selected = 0;
+                self.changes.clear();
+                self.staged.clear();
+                self.selected_changes = 0;
+                self.selected_staged = 0;
                 self.preview_title = "Git Diff".to_string();
                 self.preview = plain_preview_lines("Unable to load git diff.");
                 self.error = Some(error.to_string());
@@ -156,29 +591,41 @@ impl DiffBrowserState {
     }
 
     pub fn move_up(&mut self, root: &Path) {
-        if self.entries.is_empty() {
+        if self.visible_entries().is_empty() {
             return;
         }
-        self.selected = self.selected.saturating_sub(1);
+        *self.selected_index_mut() = self.selected_index().saturating_sub(1);
         self.content_scroll = 0;
         let _ = self.update_preview(root);
     }
 
     pub fn move_down(&mut self, root: &Path) {
-        if self.entries.is_empty() {
+        if self.visible_entries().is_empty() {
             return;
         }
-        self.selected = (self.selected + 1).min(self.entries.len().saturating_sub(1));
+        let max_index = self.visible_entries().len().saturating_sub(1);
+        *self.selected_index_mut() = (self.selected_index() + 1).min(max_index);
         self.content_scroll = 0;
         let _ = self.update_preview(root);
     }
 
     pub fn select(&mut self, root: &Path, index: usize) {
-        if self.entries.is_empty() {
+        if self.visible_entries().is_empty() {
             return;
         }
-        self.selected = index.min(self.entries.len().saturating_sub(1));
+        *self.selected_index_mut() = index.min(self.visible_entries().len().saturating_sub(1));
         self.content_scroll = 0;
+        let _ = self.update_preview(root);
+    }
+
+    pub fn set_active_section(&mut self, root: &Path, section: DiffSection) {
+        if self.active_section == section {
+            return;
+        }
+
+        self.active_section = section;
+        self.content_scroll = 0;
+        self.error = None;
         let _ = self.update_preview(root);
     }
 
@@ -190,16 +637,149 @@ impl DiffBrowserState {
         self.content_scroll = self.content_scroll.saturating_add(lines);
     }
 
+    pub fn commit(&mut self, root: &Path) -> Result<()> {
+        let message = self.commit_message.trim();
+        if message.is_empty() {
+            return Err(anyhow::anyhow!("Commit message cannot be empty."));
+        }
+
+        let output = run_git_command(root, &["commit", "-m", message])?;
+        self.commit_message.clear();
+        self.status = Some(output);
+        self.error = None;
+        self.refresh(root);
+        Ok(())
+    }
+
+    pub fn stage_selected(&mut self, root: &Path) -> Result<()> {
+        if self.active_section != DiffSection::Changes {
+            return Err(anyhow::anyhow!("Switch to Changes before staging a file."));
+        }
+
+        let relative = self.selected_relative_path(root)?;
+        let output = run_git_command(root, &["add", "--", &relative])?;
+        self.status = Some(output);
+        self.error = None;
+        self.refresh(root);
+        Ok(())
+    }
+
+    pub fn unstage_selected(&mut self, root: &Path) -> Result<()> {
+        if self.active_section != DiffSection::Staged {
+            return Err(anyhow::anyhow!("Switch to Staged before unstaging a file."));
+        }
+
+        let relative = self.selected_relative_path(root)?;
+        let output = run_git_command(root, &["restore", "--staged", "--", &relative])?;
+        self.status = Some(output);
+        self.error = None;
+        self.refresh(root);
+        Ok(())
+    }
+
+    pub fn discard_selected(&mut self, root: &Path) -> Result<()> {
+        if self.active_section != DiffSection::Changes {
+            return Err(anyhow::anyhow!("Discard is only available in Changes."));
+        }
+
+        let entry = self.selected_entry()?.clone();
+        let relative = relative_entry_path(root, &entry.path)?;
+        let output = if entry.status.contains('?') {
+            run_git_command(root, &["clean", "-f", "--", &relative])?
+        } else {
+            run_git_command(root, &["restore", "--", &relative])?
+        };
+
+        self.status = Some(output);
+        self.error = None;
+        self.refresh(root);
+        Ok(())
+    }
+
+    pub fn push(&mut self, root: &Path) -> Result<()> {
+        let output = run_git_command(root, &["push"])?;
+        self.status = Some(output);
+        self.error = None;
+        self.refresh(root);
+        Ok(())
+    }
+
+    pub fn pull(&mut self, root: &Path) -> Result<()> {
+        let output = run_git_command(root, &["pull", "--ff-only"])?;
+        self.status = Some(output);
+        self.error = None;
+        self.refresh(root);
+        Ok(())
+    }
+
+    pub fn visible_entries(&self) -> &[DiffEntry] {
+        match self.active_section {
+            DiffSection::Changes => &self.changes,
+            DiffSection::Staged => &self.staged,
+        }
+    }
+
+    pub fn selected_index(&self) -> usize {
+        match self.active_section {
+            DiffSection::Changes => self.selected_changes,
+            DiffSection::Staged => self.selected_staged,
+        }
+    }
+
+    pub fn count(&self, section: DiffSection) -> usize {
+        match section {
+            DiffSection::Changes => self.changes.len(),
+            DiffSection::Staged => self.staged.len(),
+        }
+    }
+
+    fn selected_index_mut(&mut self) -> &mut usize {
+        match self.active_section {
+            DiffSection::Changes => &mut self.selected_changes,
+            DiffSection::Staged => &mut self.selected_staged,
+        }
+    }
+
+    fn selected_entry(&self) -> Result<&DiffEntry> {
+        self.visible_entries()
+            .get(self.selected_index())
+            .ok_or_else(|| anyhow::anyhow!("No file is selected."))
+    }
+
+    fn selected_relative_path(&self, root: &Path) -> Result<String> {
+        let entry = self.selected_entry()?;
+        relative_entry_path(root, &entry.path)
+    }
+
+    fn adjust_active_section(&mut self) {
+        if self.visible_entries().is_empty() {
+            if !self.changes.is_empty() {
+                self.active_section = DiffSection::Changes;
+            } else if !self.staged.is_empty() {
+                self.active_section = DiffSection::Staged;
+            }
+        }
+    }
+
     fn update_preview(&mut self, root: &Path) -> Result<()> {
-        if self.entries.is_empty() {
-            self.preview_title = "Git Diff".to_string();
-            self.preview = plain_preview_lines("No modified files found.");
+        if self.visible_entries().is_empty() {
+            self.preview_title = match self.active_section {
+                DiffSection::Changes => "Changes".to_string(),
+                DiffSection::Staged => "Staged".to_string(),
+            };
+            self.preview = match self.active_section {
+                DiffSection::Changes => plain_preview_lines("No unstaged changes found."),
+                DiffSection::Staged => plain_preview_lines("No staged changes found."),
+            };
             return Ok(());
         }
 
-        let entry = &self.entries[self.selected];
-        self.preview_title = entry.path.display().to_string();
-        self.preview = read_diff_preview(root, entry)?;
+        let entry = self.visible_entries()[self.selected_index()].clone();
+        self.preview_title = match self.active_section {
+            DiffSection::Changes => format!("Changes · {}", entry.path.display()),
+            DiffSection::Staged => format!("Staged · {}", entry.path.display()),
+        };
+        self.preview = read_diff_preview(root, &entry, self.active_section)?;
         Ok(())
     }
 }
@@ -250,7 +830,13 @@ fn build_file_entries(root: &Path) -> Result<Vec<FileEntry>> {
     Ok(entries)
 }
 
-fn build_diff_entries(root: &Path) -> Result<Vec<DiffEntry>> {
+#[derive(Debug, Clone, Default)]
+struct DiffSections {
+    changes: Vec<DiffEntry>,
+    staged: Vec<DiffEntry>,
+}
+
+fn build_diff_entries(root: &Path) -> Result<DiffSections> {
     let output = Command::new("git")
         .arg("-C")
         .arg(root)
@@ -264,14 +850,15 @@ fn build_diff_entries(root: &Path) -> Result<Vec<DiffEntry>> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut entries = Vec::new();
+    let mut sections = DiffSections::default();
 
     for line in stdout.lines() {
-        if line.len() < 3 {
+        if line.len() < 3 || !line.is_char_boundary(2) || !line.is_char_boundary(3) {
             continue;
         }
 
-        let status = line[..2].trim().to_string();
+        let index_status = line.as_bytes()[0] as char;
+        let worktree_status = line.as_bytes()[1] as char;
         let raw_path = line[3..].trim();
         let path = raw_path
             .rsplit_once(" -> ")
@@ -279,14 +866,36 @@ fn build_diff_entries(root: &Path) -> Result<Vec<DiffEntry>> {
             .unwrap_or(raw_path);
         let full_path = root.join(path);
 
-        entries.push(DiffEntry {
-            label: format!("[{}] {}", status, path),
-            path: full_path,
-            status,
-        });
+        if index_status != ' ' && index_status != '?' {
+            sections.staged.push(DiffEntry {
+                label: format!("[{}] {}", index_status, path),
+                path: full_path.clone(),
+                status: index_status.to_string(),
+            });
+        }
+
+        if worktree_status != ' ' || (index_status == '?' && worktree_status == '?') {
+            let status = if index_status == '?' && worktree_status == '?' {
+                "??".to_string()
+            } else {
+                worktree_status.to_string()
+            };
+            sections.changes.push(DiffEntry {
+                label: format!("[{}] {}", status, path),
+                path: full_path,
+                status,
+            });
+        }
     }
 
-    Ok(entries)
+    sections
+        .changes
+        .sort_by(|left, right| left.path.cmp(&right.path));
+    sections
+        .staged
+        .sort_by(|left, right| left.path.cmp(&right.path));
+
+    Ok(sections)
 }
 
 fn read_text_preview(path: &Path) -> Result<Vec<Line<'static>>> {
@@ -315,7 +924,11 @@ fn read_text_preview(path: &Path) -> Result<Vec<Line<'static>>> {
     Ok(lines)
 }
 
-fn read_diff_preview(root: &Path, entry: &DiffEntry) -> Result<Vec<Line<'static>>> {
+fn read_diff_preview(
+    root: &Path,
+    entry: &DiffEntry,
+    section: DiffSection,
+) -> Result<Vec<Line<'static>>> {
     if entry.status.contains('?') {
         let mut lines = plain_preview_lines(&format!("Untracked file: {}", entry.path.display()));
         lines.push(Line::default());
@@ -323,33 +936,21 @@ fn read_diff_preview(root: &Path, entry: &DiffEntry) -> Result<Vec<Line<'static>
         return Ok(lines);
     }
 
-    let relative = entry
-        .path
-        .strip_prefix(root)
-        .unwrap_or(entry.path.as_path())
-        .to_string_lossy()
-        .to_string();
+    let relative = relative_entry_path(root, &entry.path)?;
 
-    let unstaged = git_output(root, &["diff", "--no-ext-diff", "--", &relative])?;
-    let staged = git_output(
-        root,
-        &["diff", "--no-ext-diff", "--cached", "--", &relative],
-    )?;
+    let diff = match section {
+        DiffSection::Changes => git_output(root, &["diff", "--no-ext-diff", "--", &relative])?,
+        DiffSection::Staged => git_output(
+            root,
+            &["diff", "--no-ext-diff", "--cached", "--", &relative],
+        )?,
+    };
 
-    let mut sections = Vec::new();
-    if !unstaged.trim().is_empty() {
-        sections.push(unstaged);
-    }
-    if !staged.trim().is_empty() {
-        sections.push(format!("--- staged ---\n{staged}"));
-    }
-
-    if sections.is_empty() {
+    if diff.trim().is_empty() {
         Ok(plain_preview_lines("No diff available for this file."))
     } else {
-        let combined = normalize_newlines(&sections.join("\n\n"));
         Ok(add_line_numbers(highlighted_preview_lines(
-            &combined,
+            &normalize_newlines(&diff),
             SYNTAX_SET.find_syntax_by_extension("diff"),
         )))
     }
@@ -373,6 +974,61 @@ fn git_output(root: &Path, args: &[&str]) -> Result<String> {
     } else {
         Ok(stdout)
     }
+}
+
+fn relative_entry_path(root: &Path, path: &Path) -> Result<String> {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_str()
+        .map(|value| value.to_string())
+        .ok_or_else(|| anyhow::anyhow!("Path contains unsupported characters: {}", path.display()))
+}
+
+fn run_git_command(root: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .with_context(|| format!("failed to run git {:?} in {}", args, root.display()))?;
+
+    let stdout = normalize_newlines(&String::from_utf8_lossy(&output.stdout));
+    let stderr = normalize_newlines(&String::from_utf8_lossy(&output.stderr));
+    let summary = summarize_git_command_output(&stdout, &stderr);
+
+    if !output.status.success() {
+        return Err(anyhow::anyhow!(if summary.is_empty() {
+            format!("git {:?} failed", args)
+        } else {
+            summary
+        }));
+    }
+
+    Ok(if summary.is_empty() {
+        format!("git {} finished successfully", args.join(" "))
+    } else {
+        summary
+    })
+}
+
+fn summarize_git_command_output(stdout: &str, stderr: &str) -> String {
+    let combined = [stdout.trim(), stderr.trim()]
+        .into_iter()
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if combined.is_empty() {
+        return String::new();
+    }
+
+    let mut summary = combined.lines().take(3).collect::<Vec<_>>().join(" ");
+    if summary.chars().count() > 240 {
+        summary = summary.chars().take(237).collect::<String>();
+        summary.push_str("...");
+    }
+    summary
 }
 
 fn contains_git_component(path: &Path) -> bool {
@@ -450,6 +1106,21 @@ fn add_line_numbers(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
         .collect()
 }
 
+fn highlight_editor_line(line: &mut Line<'static>) {
+    let background = Color::Rgb(45, 50, 60);
+    for span in &mut line.spans {
+        span.style = span.style.bg(background);
+    }
+}
+
+fn byte_index_for_char(source: &str, char_index: usize) -> usize {
+    source
+        .char_indices()
+        .nth(char_index)
+        .map(|(index, _)| index)
+        .unwrap_or(source.len())
+}
+
 fn split_preserving_lines(source: &str) -> Vec<String> {
     if source.is_empty() {
         return vec![String::new()];
@@ -525,5 +1196,196 @@ mod tests {
         assert_eq!(lines[1].spans[0].content, "2 | ");
         assert_eq!(lines[2].spans[0].content, "3 | ");
         assert_eq!(lines[2].spans[1].content, "third");
+    }
+
+    #[test]
+    fn editor_inserts_text_and_saves() {
+        let path =
+            std::env::temp_dir().join(format!("cmdex-editor-save-{}.txt", std::process::id()));
+        fs::write(&path, "hello\n").unwrap();
+
+        let mut editor = WorkspaceEditorState::open(&path).unwrap();
+        editor.move_line_end();
+        editor.enter_insert_mode();
+        editor.insert_char('!');
+        editor.save().unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "hello!\n");
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn editor_backspace_merges_lines() {
+        let path =
+            std::env::temp_dir().join(format!("cmdex-editor-merge-{}.txt", std::process::id()));
+        fs::write(&path, "hello\nworld").unwrap();
+
+        let mut editor = WorkspaceEditorState::open(&path).unwrap();
+        editor.cursor_row = 1;
+        editor.cursor_col = 0;
+        editor.backspace();
+
+        assert_eq!(editor.lines, vec!["helloworld".to_string()]);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn editor_refuses_quit_when_dirty_without_bang() {
+        let path = std::env::temp_dir().join(format!("cmdex-editor-q-{}.txt", std::process::id()));
+        fs::write(&path, "hello").unwrap();
+
+        let mut editor = WorkspaceEditorState::open(&path).unwrap();
+        editor.enter_insert_mode();
+        editor.insert_char('!');
+        editor.mode = EditorMode::Command;
+        editor.command = "q".to_string();
+
+        let result = editor.execute_command().unwrap();
+
+        assert!(!result.close);
+        assert!(
+            editor
+                .status
+                .as_deref()
+                .is_some_and(|status| status.contains("Unsaved"))
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn selecting_a_file_auto_opens_editor_in_normal_mode() {
+        let path =
+            std::env::temp_dir().join(format!("cmdex-editor-auto-open-{}.txt", std::process::id()));
+        fs::write(&path, "hello").unwrap();
+
+        let mut browser = FileBrowserState {
+            entries: vec![FileEntry {
+                label: "[F] hello.txt".to_string(),
+                path: path.clone(),
+                is_dir: false,
+            }],
+            ..Default::default()
+        };
+
+        browser.select(0);
+
+        let editor = browser.editor.as_ref().expect("editor");
+        assert_eq!(editor.path, path);
+        assert_eq!(editor.mode, EditorMode::Normal);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn dirty_editor_blocks_switching_selected_file() {
+        let first =
+            std::env::temp_dir().join(format!("cmdex-editor-first-{}.txt", std::process::id()));
+        let second =
+            std::env::temp_dir().join(format!("cmdex-editor-second-{}.txt", std::process::id()));
+        fs::write(&first, "first").unwrap();
+        fs::write(&second, "second").unwrap();
+
+        let mut browser = FileBrowserState {
+            entries: vec![
+                FileEntry {
+                    label: "[F] first.txt".to_string(),
+                    path: first.clone(),
+                    is_dir: false,
+                },
+                FileEntry {
+                    label: "[F] second.txt".to_string(),
+                    path: second.clone(),
+                    is_dir: false,
+                },
+            ],
+            ..Default::default()
+        };
+
+        browser.select(0);
+        browser.editor.as_mut().unwrap().insert_char('!');
+        browser.select(1);
+
+        assert_eq!(browser.selected, 0);
+        assert_eq!(browser.editor.as_ref().unwrap().path, first);
+        assert!(
+            browser
+                .editor
+                .as_ref()
+                .and_then(|editor| editor.status.as_deref())
+                .is_some_and(|status| status.contains("Unsaved changes"))
+        );
+
+        let _ = fs::remove_file(first);
+        let _ = fs::remove_file(second);
+    }
+
+    #[test]
+    fn splits_git_status_into_changes_and_staged_sections() {
+        let root = Path::new("/tmp/repo");
+        let output = "\
+MM src/app.rs
+A  src/new.rs
+ M src/dirty.rs
+?? README.md
+R  src/old.rs -> src/new_name.rs
+";
+
+        let mut sections = DiffSections::default();
+
+        for line in output.lines() {
+            if line.len() < 3 || !line.is_char_boundary(2) || !line.is_char_boundary(3) {
+                continue;
+            }
+
+            let index_status = line.as_bytes()[0] as char;
+            let worktree_status = line.as_bytes()[1] as char;
+            let raw_path = line[3..].trim();
+            let path = raw_path
+                .rsplit_once(" -> ")
+                .map(|(_, new_path)| new_path)
+                .unwrap_or(raw_path);
+            let full_path = root.join(path);
+
+            if index_status != ' ' && index_status != '?' {
+                sections.staged.push(DiffEntry {
+                    label: format!("[{}] {}", index_status, path),
+                    path: full_path.clone(),
+                    status: index_status.to_string(),
+                });
+            }
+
+            if worktree_status != ' ' || (index_status == '?' && worktree_status == '?') {
+                let status = if index_status == '?' && worktree_status == '?' {
+                    "??".to_string()
+                } else {
+                    worktree_status.to_string()
+                };
+                sections.changes.push(DiffEntry {
+                    label: format!("[{}] {}", status, path),
+                    path: full_path,
+                    status,
+                });
+            }
+        }
+
+        assert_eq!(
+            sections
+                .changes
+                .iter()
+                .map(|entry| entry.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["[M] src/app.rs", "[M] src/dirty.rs", "[??] README.md"]
+        );
+        assert_eq!(
+            sections
+                .staged
+                .iter()
+                .map(|entry| entry.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["[M] src/app.rs", "[A] src/new.rs", "[R] src/new_name.rs"]
+        );
     }
 }

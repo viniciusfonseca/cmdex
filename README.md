@@ -6,7 +6,6 @@ It is built with Rust and Ratatui, reads agents from `~/.cmdex.yml`, and talks t
 
 ## Features
 
-- ASCII logo and agent sidebar
 - Chat tab with streaming responses
 - Workspace tab with a file tree on the left and file preview on the right
 - Git Diff tab with modified files on the left and diff preview on the right

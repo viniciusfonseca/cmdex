@@ -1,5 +1,4 @@
-use std::path::PathBuf;
-use std::time::Duration;
+use std::{env, fs, path::PathBuf, time::Duration};
 
 use anyhow::Result;
 use crossterm::{
@@ -16,7 +15,7 @@ use pulldown_cmark::{
 };
 use ratatui::{
     DefaultTerminal, Frame,
-    layout::{Constraint, Direction, Layout, Margin, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{
@@ -36,7 +35,10 @@ use crate::config::{
     AgentDefinition, CmdexConfig, compact_home, default_config_path, load_config, save_config,
     validate_agent_input,
 };
-use crate::workspace::{DiffBrowserState, FileBrowserState};
+use crate::workspace::{
+    DiffBrowserState, DiffSection, EditorMode, FileBrowserState, WorkspaceEditorState,
+};
+use tokio::process::Command;
 
 const LOGO: [&str; 7] = [
     " ██████╗███╗   ███╗██████╗ ███████╗██╗  ██╗",
@@ -58,6 +60,7 @@ const TAB_LABELS: [(&str, AppTab); 3] = [
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const CONTENT_SCROLL_STEP: u16 = 12;
 const MOUSE_SCROLL_STEP: u16 = 4;
+const SHELL_OUTPUT_LIMIT: usize = 64_000;
 
 #[derive(Debug, Clone)]
 enum UiEvent {
@@ -72,6 +75,11 @@ enum UiEvent {
     SubmissionFailed {
         agent_index: usize,
         message: String,
+    },
+    ShellCompleted {
+        agent_index: usize,
+        output: String,
+        success: bool,
     },
 }
 
@@ -122,6 +130,7 @@ enum MessageRole {
     Assistant,
     Event,
     System,
+    Shell,
 }
 
 #[derive(Debug, Clone)]
@@ -133,6 +142,7 @@ struct AgentState {
     chat_follow_output: bool,
     chat_scroll: u16,
     thinking: bool,
+    shell_running: bool,
     streaming_item_id: Option<String>,
     workspace: FileBrowserState,
     git_diff: DiffBrowserState,
@@ -149,6 +159,18 @@ struct UiLayout {
     add_workspace: Option<Rect>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct GitDiffLayout {
+    sections: Rect,
+    preview: Rect,
+    commit_input: Rect,
+    stage_button: Rect,
+    discard_button: Rect,
+    push_button: Rect,
+    pull_button: Rect,
+    status: Rect,
+}
+
 impl AgentState {
     fn new(definition: AgentDefinition) -> Self {
         Self {
@@ -159,6 +181,7 @@ impl AgentState {
             chat_follow_output: true,
             chat_scroll: 0,
             thinking: false,
+            shell_running: false,
             streaming_item_id: None,
             workspace: FileBrowserState::default(),
             git_diff: DiffBrowserState::default(),
@@ -171,6 +194,7 @@ pub struct App {
     config_path: PathBuf,
     config: CmdexConfig,
     agents: Vec<AgentState>,
+    chat_model_label: String,
     current_tab: AppTab,
     current_agent: Option<usize>,
     chat_sidebar_index: usize,
@@ -201,6 +225,8 @@ impl App {
             config_path,
             config,
             agents,
+            chat_model_label: load_codex_chat_model_label()
+                .unwrap_or_else(|| "default".to_string()),
             current_tab: AppTab::Chat,
             current_agent,
             chat_sidebar_index,
@@ -254,7 +280,7 @@ impl App {
                 .map(|agent| {
                     agent
                         .git_diff
-                        .entries
+                        .visible_entries()
                         .iter()
                         .map(|entry| entry.label.clone())
                         .collect::<Vec<_>>()
@@ -355,6 +381,12 @@ impl App {
         match self.current_tab {
             AppTab::Workspace => {
                 if let Some(agent) = self.active_agent_mut() {
+                    if let Some(editor) = agent.workspace.editor.as_mut() {
+                        editor.vertical_scroll = editor.vertical_scroll.saturating_sub(lines);
+                        return;
+                    }
+                }
+                if let Some(agent) = self.active_agent_mut() {
                     agent.workspace.scroll_up(lines);
                 }
             }
@@ -371,7 +403,7 @@ impl App {
         let layout = self.compute_layout(area);
 
         match mouse.kind {
-            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left) => {
+            MouseEventKind::Down(MouseButton::Left) => {
                 self.handle_left_click(mouse.column, mouse.row, layout);
             }
             MouseEventKind::ScrollUp => self.handle_scroll(mouse.column, mouse.row, layout, true),
@@ -389,6 +421,12 @@ impl App {
     fn scroll_content_down_by(&mut self, lines: u16) {
         match self.current_tab {
             AppTab::Workspace => {
+                if let Some(agent) = self.active_agent_mut() {
+                    if let Some(editor) = agent.workspace.editor.as_mut() {
+                        editor.vertical_scroll = editor.vertical_scroll.saturating_add(lines);
+                        return;
+                    }
+                }
                 if let Some(agent) = self.active_agent_mut() {
                     agent.workspace.scroll_down(lines);
                 }
@@ -443,6 +481,13 @@ impl App {
         ui_tx: &mpsc::UnboundedSender<UiEvent>,
         area: Rect,
     ) {
+        if self.handle_workspace_key(key, area) {
+            return;
+        }
+        if self.handle_git_diff_key(key) {
+            return;
+        }
+
         match key.code {
             KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.should_quit = true;
@@ -450,8 +495,15 @@ impl App {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.should_quit = true;
             }
-            KeyCode::Left => self.previous_tab(),
-            KeyCode::Right => self.next_tab(),
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => self.previous_tab(),
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => self.next_tab(),
+            KeyCode::Enter
+                if self.current_tab == AppTab::Chat
+                    && !self.add_agent_selected()
+                    && key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                self.chat_input.push('\n');
+            }
             KeyCode::Up => self.move_selection_up(),
             KeyCode::Down => self.move_selection_down(),
             KeyCode::PageUp => {
@@ -503,6 +555,21 @@ impl App {
                 AddAgentField::Name => self.add_form.name.push(character),
                 AddAgentField::Workspace => self.add_form.workspace.push(character),
             }
+        } else if self.current_tab == AppTab::Workspace {
+            if let Some(agent) = self.active_agent_mut() {
+                if let Some(editor) = agent.workspace.editor.as_mut() {
+                    match editor.mode {
+                        EditorMode::Insert => editor.insert_char(character),
+                        EditorMode::Command => editor.command.push(character),
+                        EditorMode::Normal => {}
+                    }
+                }
+            }
+        } else if self.current_tab == AppTab::GitDiff {
+            if let Some(agent) = self.active_agent_mut() {
+                agent.git_diff.commit_message.push(character);
+                agent.git_diff.error = None;
+            }
         } else if self.current_tab == AppTab::Chat {
             self.chat_input.push(character);
         }
@@ -518,8 +585,390 @@ impl App {
                     self.add_form.workspace.pop();
                 }
             }
+        } else if self.current_tab == AppTab::Workspace {
+            if let Some(agent) = self.active_agent_mut() {
+                if let Some(editor) = agent.workspace.editor.as_mut() {
+                    match editor.mode {
+                        EditorMode::Insert => editor.backspace(),
+                        EditorMode::Command => {
+                            editor.command.pop();
+                        }
+                        EditorMode::Normal => {}
+                    }
+                }
+            }
+        } else if self.current_tab == AppTab::GitDiff {
+            if let Some(agent) = self.active_agent_mut() {
+                agent.git_diff.commit_message.pop();
+                agent.git_diff.error = None;
+            }
         } else if self.current_tab == AppTab::Chat {
             self.chat_input.pop();
+        }
+    }
+
+    fn handle_workspace_key(&mut self, key: KeyEvent, area: Rect) -> bool {
+        if self.current_tab != AppTab::Workspace {
+            return false;
+        }
+
+        let Some(agent_index) = self.current_agent else {
+            return false;
+        };
+
+        let viewport = workspace_editor_viewport(self.compute_layout(area).body);
+        let page_step = usize::from(CONTENT_SCROLL_STEP);
+        let mut saved = false;
+        let mut close = false;
+        let mut handled = false;
+        let mut selection_delta = 0i8;
+
+        {
+            let agent = &mut self.agents[agent_index];
+            let workspace = &mut agent.workspace;
+
+            if workspace.editor.is_none() {
+                if key.code == KeyCode::Enter {
+                    match workspace.open_editor() {
+                        Ok(()) => {}
+                        Err(error) => workspace.error = Some(error.to_string()),
+                    }
+                    return true;
+                }
+                return false;
+            }
+
+            {
+                let editor = workspace.editor.as_mut().expect("editor checked above");
+                match editor.mode {
+                    EditorMode::Command => match key.code {
+                        KeyCode::Esc => {
+                            editor.cancel_command();
+                            handled = true;
+                        }
+                        KeyCode::Backspace => {
+                            editor.command.pop();
+                            handled = true;
+                        }
+                        KeyCode::Enter => {
+                            match editor.execute_command() {
+                                Ok(result) => {
+                                    saved = result.saved;
+                                    close = result.close;
+                                }
+                                Err(error) => editor.status = Some(error.to_string()),
+                            }
+                            handled = true;
+                        }
+                        KeyCode::Char(character)
+                            if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            editor.command.push(character);
+                            handled = true;
+                        }
+                        _ => handled = true,
+                    },
+                    EditorMode::Insert => match key.code {
+                        KeyCode::Esc => {
+                            editor.mode = EditorMode::Normal;
+                            handled = true;
+                        }
+                        KeyCode::Enter => {
+                            editor.insert_newline();
+                            handled = true;
+                        }
+                        KeyCode::Backspace => {
+                            editor.backspace();
+                            handled = true;
+                        }
+                        KeyCode::Delete => {
+                            editor.delete_char();
+                            handled = true;
+                        }
+                        KeyCode::Left => {
+                            editor.move_left();
+                            handled = true;
+                        }
+                        KeyCode::Right => {
+                            editor.move_right();
+                            handled = true;
+                        }
+                        KeyCode::Up => {
+                            editor.move_up();
+                            handled = true;
+                        }
+                        KeyCode::Down => {
+                            editor.move_down();
+                            handled = true;
+                        }
+                        KeyCode::Home => {
+                            editor.move_line_start();
+                            handled = true;
+                        }
+                        KeyCode::End => {
+                            editor.move_line_end();
+                            handled = true;
+                        }
+                        KeyCode::PageUp => {
+                            editor.move_page_up(page_step);
+                            handled = true;
+                        }
+                        KeyCode::PageDown => {
+                            editor.move_page_down(page_step);
+                            handled = true;
+                        }
+                        KeyCode::Tab => {
+                            for _ in 0..4 {
+                                editor.insert_char(' ');
+                            }
+                            handled = true;
+                        }
+                        _ => {}
+                    },
+                    EditorMode::Normal => match key.code {
+                        KeyCode::Esc => handled = true,
+                        KeyCode::Up => {
+                            selection_delta = -1;
+                            handled = true;
+                        }
+                        KeyCode::Down => {
+                            selection_delta = 1;
+                            handled = true;
+                        }
+                        KeyCode::Left => {
+                            editor.move_left();
+                            handled = true;
+                        }
+                        KeyCode::Right => {
+                            editor.move_right();
+                            handled = true;
+                        }
+                        KeyCode::Home => {
+                            editor.move_line_start();
+                            handled = true;
+                        }
+                        KeyCode::End => {
+                            editor.move_line_end();
+                            handled = true;
+                        }
+                        KeyCode::PageUp => {
+                            editor.move_page_up(page_step);
+                            handled = true;
+                        }
+                        KeyCode::PageDown => {
+                            editor.move_page_down(page_step);
+                            handled = true;
+                        }
+                        KeyCode::Delete => {
+                            editor.delete_char();
+                            handled = true;
+                        }
+                        KeyCode::Char('h') => {
+                            editor.move_left();
+                            handled = true;
+                        }
+                        KeyCode::Char('j') => {
+                            editor.move_down();
+                            handled = true;
+                        }
+                        KeyCode::Char('k') => {
+                            editor.move_up();
+                            handled = true;
+                        }
+                        KeyCode::Char('l') => {
+                            editor.move_right();
+                            handled = true;
+                        }
+                        KeyCode::Char('0') => {
+                            editor.move_line_start();
+                            handled = true;
+                        }
+                        KeyCode::Char('$') => {
+                            editor.move_line_end();
+                            handled = true;
+                        }
+                        KeyCode::Char('i') => {
+                            editor.enter_insert_mode();
+                            handled = true;
+                        }
+                        KeyCode::Char('a') => {
+                            editor.enter_insert_after();
+                            handled = true;
+                        }
+                        KeyCode::Char('o') => {
+                            editor.open_below();
+                            handled = true;
+                        }
+                        KeyCode::Char('x') => {
+                            editor.delete_char();
+                            handled = true;
+                        }
+                        KeyCode::Char(':') => {
+                            editor.start_command();
+                            handled = true;
+                        }
+                        _ => {}
+                    },
+                }
+            }
+
+            if selection_delta < 0 {
+                workspace.move_up();
+            } else if selection_delta > 0 {
+                workspace.move_down();
+            }
+
+            if handled {
+                if let Some(editor) = workspace.editor.as_mut() {
+                    editor.ensure_visible(viewport.width, viewport.height);
+                }
+            }
+        }
+
+        if saved {
+            let root = self.agents[agent_index].definition.workspace.clone();
+            self.agents[agent_index].git_diff.refresh(&root);
+        }
+
+        if close {
+            if let Err(error) = self.agents[agent_index].workspace.close_editor() {
+                self.agents[agent_index].workspace.error = Some(error.to_string());
+            }
+        }
+
+        handled || saved || close
+    }
+
+    fn handle_git_diff_key(&mut self, key: KeyEvent) -> bool {
+        if self.current_tab != AppTab::GitDiff {
+            return false;
+        }
+
+        match key.code {
+            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.stage_git_diff_changes();
+                true
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.unstage_git_diff_changes();
+                true
+            }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.discard_git_diff_changes();
+                true
+            }
+            KeyCode::Left if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(agent) = self.active_agent_mut() {
+                    let root = agent.definition.workspace.clone();
+                    agent
+                        .git_diff
+                        .set_active_section(&root, DiffSection::Changes);
+                }
+                true
+            }
+            KeyCode::Right if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(agent) = self.active_agent_mut() {
+                    let root = agent.definition.workspace.clone();
+                    agent
+                        .git_diff
+                        .set_active_section(&root, DiffSection::Staged);
+                }
+                true
+            }
+            KeyCode::Tab => {
+                if let Some(agent) = self.active_agent_mut() {
+                    let root = agent.definition.workspace.clone();
+                    let next = match agent.git_diff.active_section {
+                        DiffSection::Changes => DiffSection::Staged,
+                        DiffSection::Staged => DiffSection::Changes,
+                    };
+                    agent.git_diff.set_active_section(&root, next);
+                }
+                true
+            }
+            KeyCode::Enter => {
+                self.commit_git_diff_changes();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn commit_git_diff_changes(&mut self) {
+        let Some(agent) = self.active_agent_mut() else {
+            self.status_message = Some("Add an agent before committing changes.".to_string());
+            return;
+        };
+
+        let root = agent.definition.workspace.clone();
+        match agent.git_diff.commit(&root) {
+            Ok(()) => agent.workspace.refresh(&root),
+            Err(error) => agent.git_diff.error = Some(error.to_string()),
+        }
+    }
+
+    fn stage_git_diff_changes(&mut self) {
+        let Some(agent) = self.active_agent_mut() else {
+            self.status_message = Some("Add an agent before staging changes.".to_string());
+            return;
+        };
+
+        let root = agent.definition.workspace.clone();
+        match agent.git_diff.stage_selected(&root) {
+            Ok(()) => agent.workspace.refresh(&root),
+            Err(error) => agent.git_diff.error = Some(error.to_string()),
+        }
+    }
+
+    fn unstage_git_diff_changes(&mut self) {
+        let Some(agent) = self.active_agent_mut() else {
+            self.status_message = Some("Add an agent before unstaging changes.".to_string());
+            return;
+        };
+
+        let root = agent.definition.workspace.clone();
+        match agent.git_diff.unstage_selected(&root) {
+            Ok(()) => agent.workspace.refresh(&root),
+            Err(error) => agent.git_diff.error = Some(error.to_string()),
+        }
+    }
+
+    fn discard_git_diff_changes(&mut self) {
+        let Some(agent) = self.active_agent_mut() else {
+            self.status_message = Some("Add an agent before discarding changes.".to_string());
+            return;
+        };
+
+        let root = agent.definition.workspace.clone();
+        match agent.git_diff.discard_selected(&root) {
+            Ok(()) => agent.workspace.refresh(&root),
+            Err(error) => agent.git_diff.error = Some(error.to_string()),
+        }
+    }
+
+    fn push_git_diff_changes(&mut self) {
+        let Some(agent) = self.active_agent_mut() else {
+            self.status_message = Some("Add an agent before pushing changes.".to_string());
+            return;
+        };
+
+        let root = agent.definition.workspace.clone();
+        match agent.git_diff.push(&root) {
+            Ok(()) => agent.workspace.refresh(&root),
+            Err(error) => agent.git_diff.error = Some(error.to_string()),
+        }
+    }
+
+    fn pull_git_diff_changes(&mut self) {
+        let Some(agent) = self.active_agent_mut() else {
+            self.status_message = Some("Add an agent before pulling changes.".to_string());
+            return;
+        };
+
+        let root = agent.definition.workspace.clone();
+        match agent.git_diff.pull(&root) {
+            Ok(()) => agent.workspace.refresh(&root),
+            Err(error) => agent.git_diff.error = Some(error.to_string()),
         }
     }
 
@@ -560,6 +1009,11 @@ impl App {
     }
 
     fn submit_message(&mut self, codex: CodexAppServer, ui_tx: mpsc::UnboundedSender<UiEvent>) {
+        if let Some(command) = shell_command_from_input(&self.chat_input) {
+            self.submit_shell_command(command, ui_tx);
+            return;
+        }
+
         let text = self.chat_input.trim().to_string();
         if text.is_empty() {
             return;
@@ -571,7 +1025,7 @@ impl App {
         };
 
         let agent = &mut self.agents[agent_index];
-        if agent.thinking {
+        if agent.thinking || agent.shell_running {
             self.status_message = Some("Wait for the current response to finish.".to_string());
             return;
         }
@@ -638,6 +1092,69 @@ impl App {
                     message: error.to_string(),
                 });
             }
+        });
+    }
+
+    fn submit_shell_command(&mut self, command: String, ui_tx: mpsc::UnboundedSender<UiEvent>) {
+        let Some(agent_index) = self.current_agent else {
+            self.status_message = Some("Add an agent before running shell commands.".to_string());
+            return;
+        };
+
+        let agent = &mut self.agents[agent_index];
+        if agent.thinking || agent.shell_running {
+            self.status_message = Some("Wait for the current response to finish.".to_string());
+            return;
+        }
+
+        agent.messages.push(ChatMessage {
+            role: MessageRole::Shell,
+            text: format!("> {command}"),
+            item_id: None,
+        });
+        agent.shell_running = true;
+        agent.status = None;
+        let workspace = agent.definition.workspace.clone();
+        self.chat_input.clear();
+
+        tokio::spawn(async move {
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+            let result = Command::new(shell)
+                .arg("-c")
+                .arg(&command)
+                .current_dir(&workspace)
+                .output()
+                .await;
+
+            let (output, success) = match result {
+                Ok(output) => {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    (
+                        format_shell_output(
+                            &command,
+                            &stdout,
+                            &stderr,
+                            output.status.code(),
+                            output.status.success(),
+                        ),
+                        output.status.success(),
+                    )
+                }
+                Err(error) => (
+                    format!(
+                        "```text\n{}\n```\n\nExit code: unavailable",
+                        truncate_shell_text(&error.to_string())
+                    ),
+                    false,
+                ),
+            };
+
+            let _ = ui_tx.send(UiEvent::ShellCompleted {
+                agent_index,
+                output,
+                success,
+            });
         });
     }
 
@@ -737,6 +1254,7 @@ impl App {
             } => {
                 if let Some(agent) = self.agents.get_mut(agent_index) {
                     agent.thinking = false;
+                    agent.shell_running = false;
                     agent.streaming_item_id = None;
                     agent.status = Some(message.clone());
                     agent.messages.push(ChatMessage {
@@ -746,6 +1264,28 @@ impl App {
                     });
                 }
                 self.status_message = Some(message);
+            }
+            UiEvent::ShellCompleted {
+                agent_index,
+                output,
+                success,
+            } => {
+                if let Some(agent) = self.agents.get_mut(agent_index) {
+                    agent.shell_running = false;
+                    agent.messages.push(ChatMessage {
+                        role: MessageRole::Shell,
+                        text: output,
+                        item_id: None,
+                    });
+                    agent.status = Some(if success {
+                        "Shell command finished".to_string()
+                    } else {
+                        "Shell command failed".to_string()
+                    });
+                    let root = agent.definition.workspace.clone();
+                    agent.workspace.refresh(&root);
+                    agent.git_diff.refresh(&root);
+                }
             }
         }
     }
@@ -780,12 +1320,13 @@ impl App {
             .split(root[0]);
 
         if self.current_tab == AppTab::Chat && !self.add_agent_selected() {
+            let input_height = chat_input_height_for_main_area(&self.chat_input, root[1]);
             let main = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Length(3),
                     Constraint::Min(10),
-                    Constraint::Length(3),
+                    Constraint::Length(input_height),
                 ])
                 .split(root[1]);
 
@@ -848,6 +1389,21 @@ impl App {
 
         if rect_contains(layout.sidebar_list, column, row) {
             self.handle_sidebar_click(column, row, layout.sidebar_list);
+            return;
+        }
+
+        if self.current_tab == AppTab::GitDiff
+            && self.handle_git_diff_click(column, row, layout.body)
+        {
+            return;
+        }
+
+        if self.current_tab == AppTab::Workspace
+            && self
+                .active_agent()
+                .is_some_and(|agent| agent.workspace.editor.is_some())
+        {
+            self.handle_workspace_editor_click(column, row, layout.body);
             return;
         }
 
@@ -925,17 +1481,95 @@ impl App {
             }
             AppTab::GitDiff => {
                 if let Some(agent) = self.active_agent_mut() {
-                    let total = agent.git_diff.entries.len();
+                    let total = agent.git_diff.visible_entries().len();
                     if total == 0 {
                         return;
                     }
-                    let offset = list_offset(agent.git_diff.selected, total, inner.height as usize);
+                    let offset = list_offset(
+                        agent.git_diff.selected_index(),
+                        total,
+                        inner.height as usize,
+                    );
                     let index = (offset + visible_row).min(total.saturating_sub(1));
                     let root = agent.definition.workspace.clone();
                     agent.git_diff.select(&root, index);
                 }
             }
         }
+    }
+
+    fn handle_workspace_editor_click(&mut self, column: u16, row: u16, area: Rect) {
+        let viewport = workspace_editor_viewport(area);
+        if !rect_contains(viewport, column, row) {
+            return;
+        }
+
+        let Some(agent) = self.active_agent_mut() else {
+            return;
+        };
+        let Some(editor) = agent.workspace.editor.as_mut() else {
+            return;
+        };
+
+        let gutter_width = editor.gutter_width() as u16;
+        let target_row =
+            usize::from(row.saturating_sub(viewport.y)) + editor.vertical_scroll as usize;
+        let content_x = column.saturating_sub(viewport.x);
+        let target_col = if content_x <= gutter_width {
+            0
+        } else {
+            usize::from(content_x.saturating_sub(gutter_width)) + editor.horizontal_scroll as usize
+        };
+
+        editor.mode = EditorMode::Normal;
+        editor.set_cursor(target_row, target_col);
+        editor.ensure_visible(viewport.width, viewport.height);
+    }
+
+    fn handle_git_diff_click(&mut self, column: u16, row: u16, area: Rect) -> bool {
+        let layout = git_diff_layout(area);
+        let Some(agent) = self.active_agent() else {
+            return false;
+        };
+
+        let changes_label = format!("Changes ({})", agent.git_diff.count(DiffSection::Changes));
+        let staged_label = format!("Staged ({})", agent.git_diff.count(DiffSection::Staged));
+        let active_section = agent.git_diff.active_section;
+        if let Some(section) =
+            git_diff_section_from_click(layout.sections, &changes_label, &staged_label, column, row)
+        {
+            if let Some(agent) = self.active_agent_mut() {
+                let root = agent.definition.workspace.clone();
+                agent.git_diff.set_active_section(&root, section);
+            }
+            return true;
+        }
+
+        if rect_contains(layout.push_button, column, row) {
+            self.push_git_diff_changes();
+            return true;
+        }
+
+        if rect_contains(layout.stage_button, column, row) {
+            match active_section {
+                DiffSection::Changes => self.stage_git_diff_changes(),
+                DiffSection::Staged => self.unstage_git_diff_changes(),
+            }
+            return true;
+        }
+
+        if rect_contains(layout.discard_button, column, row) {
+            self.discard_git_diff_changes();
+            return true;
+        }
+
+        if rect_contains(layout.pull_button, column, row) {
+            self.pull_git_diff_changes();
+            return true;
+        }
+
+        rect_contains(layout.commit_input, column, row)
+            || rect_contains(layout.preview, column, row)
     }
 }
 
@@ -1119,10 +1753,12 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
             app.active_agent()
                 .map(|agent| agent.workspace.selected.min(items.len().saturating_sub(1))),
         ),
-        AppTab::GitDiff => state.select(
-            app.active_agent()
-                .map(|agent| agent.git_diff.selected.min(items.len().saturating_sub(1))),
-        ),
+        AppTab::GitDiff => state.select(app.active_agent().map(|agent| {
+            agent
+                .git_diff
+                .selected_index()
+                .min(items.len().saturating_sub(1))
+        })),
     }
 
     let list = List::new(items)
@@ -1207,12 +1843,13 @@ fn draw_main(frame: &mut Frame, app: &App, area: Rect) {
         );
 
     if app.current_tab == AppTab::Chat && !app.add_agent_selected() {
+        let input_height = chat_input_height_for_main_area(&app.chat_input, area);
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(3),
                 Constraint::Min(10),
-                Constraint::Length(3),
+                Constraint::Length(input_height),
             ])
             .split(area);
         frame.render_widget(tabs, chunks[0]);
@@ -1268,23 +1905,50 @@ fn draw_chat(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_chat_input(frame: &mut Frame, app: &App, area: Rect) {
+    let shell_mode = chat_input_is_shell(&app.chat_input);
     let thinking = app.active_agent().is_some_and(|agent| agent.thinking);
-    let title = if thinking {
-        format!("Message  {} Thinking...", SPINNER[app.spinner_index])
+    let shell_running = app.active_agent().is_some_and(|agent| agent.shell_running);
+    let title = if shell_running {
+        format!(
+            "Shell · {}  {} Running...",
+            app.chat_model_label, SPINNER[app.spinner_index]
+        )
+    } else if shell_mode {
+        format!("Shell · {}", app.chat_model_label)
+    } else if thinking {
+        format!(
+            "Message · {}  {} Thinking...",
+            app.chat_model_label, SPINNER[app.spinner_index]
+        )
     } else {
-        "Message".to_string()
+        format!("Message · {}", app.chat_model_label)
     };
 
-    let input = Paragraph::new(app.chat_input.as_str())
-        .block(Block::default().borders(Borders::ALL).title(title))
-        .wrap(Wrap { trim: false });
+    let wrapped_lines = wrapped_chat_input_lines(&app.chat_input, area.width.saturating_sub(2));
+    let input = Paragraph::new(Text::from(
+        wrapped_lines
+            .iter()
+            .cloned()
+            .map(Line::from)
+            .collect::<Vec<_>>(),
+    ))
+    .block(Block::default().borders(Borders::ALL).title(title))
+    .wrap(Wrap { trim: false });
     frame.render_widget(input, area);
 
+    let last_line = wrapped_lines
+        .last()
+        .map(|line| line.chars().count())
+        .unwrap_or(0) as u16;
+    let cursor_row = wrapped_lines.len().saturating_sub(1) as u16;
     let x = area
         .x
-        .saturating_add(1 + app.chat_input.chars().count() as u16)
+        .saturating_add(1 + last_line)
         .min(area.x + area.width.saturating_sub(2));
-    let y = area.y + 1;
+    let y = area
+        .y
+        .saturating_add(1 + cursor_row)
+        .min(area.y + area.height.saturating_sub(2));
     frame.set_cursor_position((x, y));
 }
 
@@ -1366,6 +2030,11 @@ fn draw_workspace(frame: &mut Frame, app: &App, area: Rect) {
         return;
     };
 
+    if let Some(editor) = agent.workspace.editor.as_ref() {
+        draw_workspace_editor(frame, editor, area);
+        return;
+    }
+
     let mut lines = vec![Line::from(format!(
         "Workspace: {}",
         compact_home(&agent.definition.workspace)
@@ -1393,6 +2062,80 @@ fn draw_workspace(frame: &mut Frame, app: &App, area: Rect) {
     render_vertical_scrollbar(frame, area, content_length, agent.workspace.content_scroll);
 }
 
+fn draw_workspace_editor(frame: &mut Frame, editor: &WorkspaceEditorState, area: Rect) {
+    let mode = match editor.mode {
+        EditorMode::Normal => "NORMAL",
+        EditorMode::Insert => "INSERT",
+        EditorMode::Command => "COMMAND",
+    };
+    let dirty = if editor.dirty { " [+]" } else { "" };
+    let block = Block::default().borders(Borders::ALL).title(format!(
+        "{}{} [{}]",
+        editor.path.display(),
+        dirty,
+        mode
+    ));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let (code_area, status_area) = workspace_editor_panes(inner);
+    let lines = editor.rendered_lines();
+    let code = Paragraph::new(Text::from(lines))
+        .scroll((editor.vertical_scroll, editor.horizontal_scroll));
+    frame.render_widget(code, code_area);
+    render_vertical_scrollbar_with_viewport(
+        frame,
+        code_area,
+        editor.content_height(),
+        editor.vertical_scroll,
+    );
+
+    if let Some(status_area) = status_area {
+        let status = workspace_editor_status(editor);
+        let status_widget = Paragraph::new(status).style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(status_widget, status_area);
+    }
+
+    match editor.mode {
+        EditorMode::Command => {
+            if let Some(status_area) = status_area {
+                let x = status_area
+                    .x
+                    .saturating_add(1 + editor.command.chars().count() as u16)
+                    .min(status_area.x + status_area.width.saturating_sub(1));
+                frame.set_cursor_position((x, status_area.y));
+            }
+        }
+        EditorMode::Normal | EditorMode::Insert => {
+            if code_area.width == 0 || code_area.height == 0 {
+                return;
+            }
+
+            let visible_row = editor
+                .cursor_row
+                .saturating_sub(editor.vertical_scroll as usize)
+                as u16;
+            if visible_row >= code_area.height {
+                return;
+            }
+
+            let gutter_width = editor.gutter_width() as u16;
+            let visible_col = editor
+                .cursor_col
+                .saturating_sub(editor.horizontal_scroll as usize)
+                as u16;
+            let max_x = code_area.x + code_area.width.saturating_sub(1);
+            let x = code_area
+                .x
+                .saturating_add(gutter_width)
+                .saturating_add(visible_col)
+                .min(max_x);
+            let y = code_area.y.saturating_add(visible_row);
+            frame.set_cursor_position((x, y));
+        }
+    }
+}
+
 fn draw_git_diff(frame: &mut Frame, app: &App, area: Rect) {
     let Some(agent) = app.active_agent() else {
         let empty = Paragraph::new("Select or create an agent in the Chat tab.")
@@ -1401,22 +2144,30 @@ fn draw_git_diff(frame: &mut Frame, app: &App, area: Rect) {
         return;
     };
 
-    let mut lines = vec![Line::from(format!(
-        "Workspace: {}",
+    let layout = git_diff_layout(area);
+    let tabs = Tabs::new([
+        format!("Changes ({})", agent.git_diff.count(DiffSection::Changes)),
+        format!("Staged ({})", agent.git_diff.count(DiffSection::Staged)),
+    ])
+    .select(match agent.git_diff.active_section {
+        DiffSection::Changes => 0,
+        DiffSection::Staged => 1,
+    })
+    .block(Block::default().borders(Borders::ALL).title(format!(
+        "Files · {}",
         compact_home(&agent.definition.workspace)
-    ))];
-    lines.push(Line::from(String::new()));
-    lines.extend(agent.git_diff.preview.iter().cloned());
-    if let Some(error) = &agent.git_diff.error {
-        lines.push(Line::from(String::new()));
-        lines.push(Line::from(Span::styled(
-            error.clone(),
-            Style::default().fg(Color::Red),
-        )));
-    }
-    let content_length = preview_content_height(&lines, area.width.saturating_sub(2));
+    )))
+    .highlight_style(
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+    );
+    frame.render_widget(tabs, layout.sections);
 
-    let widget = Paragraph::new(Text::from(lines))
+    let preview_lines = agent.git_diff.preview.clone();
+    let content_length =
+        preview_content_height(&preview_lines, layout.preview.width.saturating_sub(2));
+    let widget = Paragraph::new(Text::from(preview_lines))
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -1424,8 +2175,151 @@ fn draw_git_diff(frame: &mut Frame, app: &App, area: Rect) {
         )
         .scroll((agent.git_diff.content_scroll, 0))
         .wrap(Wrap { trim: false });
-    frame.render_widget(widget, area);
-    render_vertical_scrollbar(frame, area, content_length, agent.git_diff.content_scroll);
+    frame.render_widget(widget, layout.preview);
+    render_vertical_scrollbar(
+        frame,
+        layout.preview,
+        content_length,
+        agent.git_diff.content_scroll,
+    );
+
+    let commit_title = "Commit Message · Enter commits staged changes";
+    let commit_text = git_diff_commit_input_text(
+        &agent.git_diff.commit_message,
+        layout.commit_input.width.saturating_sub(2),
+    );
+    let commit_input = Paragraph::new(commit_text.as_str())
+        .block(Block::default().borders(Borders::ALL).title(commit_title));
+    frame.render_widget(commit_input, layout.commit_input);
+
+    let stage_label = match agent.git_diff.active_section {
+        DiffSection::Changes => "Stage",
+        DiffSection::Staged => "Unstage",
+    };
+    let stage_button = Paragraph::new(stage_label)
+        .alignment(Alignment::Center)
+        .block(Block::default().borders(Borders::ALL).title("Action"));
+    frame.render_widget(stage_button, layout.stage_button);
+
+    let discard_style = match agent.git_diff.active_section {
+        DiffSection::Changes => Style::default().fg(Color::Red),
+        DiffSection::Staged => Style::default().fg(Color::DarkGray),
+    };
+    let discard_button = Paragraph::new("Discard")
+        .alignment(Alignment::Center)
+        .style(discard_style)
+        .block(Block::default().borders(Borders::ALL).title("Action"));
+    frame.render_widget(discard_button, layout.discard_button);
+
+    let push_button = Paragraph::new("Push")
+        .alignment(Alignment::Center)
+        .block(Block::default().borders(Borders::ALL).title("Action"));
+    frame.render_widget(push_button, layout.push_button);
+
+    let pull_button = Paragraph::new("Pull")
+        .alignment(Alignment::Center)
+        .block(Block::default().borders(Borders::ALL).title("Action"));
+    frame.render_widget(pull_button, layout.pull_button);
+
+    let status = if let Some(error) = &agent.git_diff.error {
+        Paragraph::new(error.as_str()).style(Style::default().fg(Color::Red))
+    } else if let Some(status) = &agent.git_diff.status {
+        Paragraph::new(status.as_str()).style(Style::default().fg(Color::Green))
+    } else {
+        Paragraph::new(
+            "Tab/Left/Right switches sections. Ctrl+S stages, Ctrl+U unstages, Ctrl+D discards changes, Enter commits staged changes.",
+        )
+            .style(Style::default().fg(Color::DarkGray))
+    };
+    frame.render_widget(status, layout.status);
+
+    let cursor_x = layout
+        .commit_input
+        .x
+        .saturating_add(1 + commit_text.chars().count() as u16)
+        .min(layout.commit_input.x + layout.commit_input.width.saturating_sub(2));
+    let cursor_y = layout.commit_input.y.saturating_add(1);
+    frame.set_cursor_position((cursor_x, cursor_y));
+}
+
+fn git_diff_layout(area: Rect) -> GitDiffLayout {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(8),
+            Constraint::Length(5),
+        ])
+        .split(area);
+    let controls = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(1)])
+        .split(chunks[2]);
+    let controls_row = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Min(18),
+            Constraint::Length(12),
+            Constraint::Length(12),
+            Constraint::Length(12),
+            Constraint::Length(12),
+        ])
+        .split(controls[0]);
+
+    GitDiffLayout {
+        sections: chunks[0],
+        preview: chunks[1],
+        commit_input: controls_row[0],
+        stage_button: controls_row[1],
+        discard_button: controls_row[2],
+        push_button: controls_row[3],
+        pull_button: controls_row[4],
+        status: controls[1],
+    }
+}
+
+fn git_diff_section_from_click(
+    area: Rect,
+    changes_label: &str,
+    staged_label: &str,
+    column: u16,
+    row: u16,
+) -> Option<DiffSection> {
+    let inner = inner_rect(area);
+    if inner.width == 0 || inner.height == 0 {
+        return None;
+    }
+
+    let changes_width = changes_label.chars().count() as u16;
+    let staged_width = staged_label.chars().count() as u16;
+    let changes = Rect::new(inner.x, inner.y, changes_width.min(inner.width), 1);
+    let staged_x = inner.x.saturating_add(changes_width).saturating_add(3);
+    let staged = Rect::new(
+        staged_x,
+        inner.y,
+        staged_width.min(inner.x.saturating_add(inner.width).saturating_sub(staged_x)),
+        1,
+    );
+
+    if rect_contains(changes, column, row) {
+        Some(DiffSection::Changes)
+    } else if rect_contains(staged, column, row) {
+        Some(DiffSection::Staged)
+    } else {
+        None
+    }
+}
+
+fn git_diff_commit_input_text(input: &str, max_width: u16) -> String {
+    let max_width = usize::from(max_width.max(1));
+    let chars = input.chars().collect::<Vec<_>>();
+    if chars.len() <= max_width {
+        input.to_string()
+    } else {
+        chars[chars.len().saturating_sub(max_width)..]
+            .iter()
+            .collect()
+    }
 }
 
 fn render_vertical_scrollbar(frame: &mut Frame, area: Rect, content_length: usize, scroll: u16) {
@@ -1449,6 +2343,65 @@ fn render_vertical_scrollbar(frame: &mut Frame, area: Rect, content_length: usiz
     );
 }
 
+fn render_vertical_scrollbar_with_viewport(
+    frame: &mut Frame,
+    viewport: Rect,
+    content_length: usize,
+    scroll: u16,
+) {
+    if viewport.width == 0 || viewport.height == 0 {
+        return;
+    }
+
+    let mut state = ScrollbarState::new(content_length.max(1))
+        .position(scroll as usize)
+        .viewport_content_length(viewport.height as usize);
+
+    let scrollbar_area = Rect::new(
+        viewport.x.saturating_add(viewport.width.saturating_sub(1)),
+        viewport.y,
+        1,
+        viewport.height,
+    );
+    frame.render_stateful_widget(
+        Scrollbar::new(ScrollbarOrientation::VerticalRight),
+        scrollbar_area,
+        &mut state,
+    );
+}
+
+fn workspace_editor_panes(inner: Rect) -> (Rect, Option<Rect>) {
+    if inner.height <= 1 {
+        return (inner, None);
+    }
+
+    let panes = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+    (panes[0], Some(panes[1]))
+}
+
+fn workspace_editor_viewport(area: Rect) -> Rect {
+    let inner = area.inner(Margin {
+        vertical: 1,
+        horizontal: 1,
+    });
+    workspace_editor_panes(inner).0
+}
+
+fn workspace_editor_status(editor: &WorkspaceEditorState) -> String {
+    match editor.mode {
+        EditorMode::Command => format!(":{}", editor.command),
+        EditorMode::Insert => {
+            "-- INSERT --  Esc normal  Enter newline  Backspace delete".to_string()
+        }
+        EditorMode::Normal => editor.status.clone().unwrap_or_else(|| {
+            "NORMAL  ↑/↓ file  h/j/k/l move  i/a/o edit  x delete  :w save  :q preview".to_string()
+        }),
+    }
+}
+
 fn preview_content_height(lines: &[Line<'_>], width: u16) -> usize {
     let width = usize::from(width.max(1));
 
@@ -1465,6 +2418,60 @@ fn wrapped_text_height(text: &Text<'_>, width: u16) -> usize {
     Paragraph::new(text.clone())
         .wrap(Wrap { trim: false })
         .line_count(width.max(1))
+}
+
+fn chat_input_height_for_main_area(input: &str, main_area: Rect) -> u16 {
+    let available = main_area.height.saturating_sub(3);
+    if available == 0 {
+        return 0;
+    }
+
+    let desired = wrapped_chat_input_lines(input, main_area.width.saturating_sub(2))
+        .len()
+        .saturating_add(2) as u16;
+    let min_height = available.min(3);
+    let max_height = available.saturating_sub(1).max(min_height);
+
+    desired.clamp(min_height, max_height)
+}
+
+fn wrapped_chat_input_lines(input: &str, width: u16) -> Vec<String> {
+    let width = usize::from(width.max(1));
+    if input.is_empty() {
+        return vec![String::new()];
+    }
+
+    let mut wrapped = Vec::new();
+
+    for raw_line in input.split('\n') {
+        if raw_line.is_empty() {
+            wrapped.push(String::new());
+            continue;
+        }
+
+        let mut current = String::new();
+        let mut current_width = 0;
+
+        for character in raw_line.chars() {
+            current.push(character);
+            current_width += 1;
+
+            if current_width == width {
+                wrapped.push(std::mem::take(&mut current));
+                current_width = 0;
+            }
+        }
+
+        if !current.is_empty() {
+            wrapped.push(current);
+        }
+    }
+
+    if wrapped.is_empty() {
+        vec![String::new()]
+    } else {
+        wrapped
+    }
 }
 
 fn chat_lines(agent: &AgentState) -> Vec<Line<'static>> {
@@ -1493,6 +2500,7 @@ fn render_chat_message_lines(message: &ChatMessage, agent_name: &str) -> Vec<Lin
         MessageRole::Assistant => (agent_name, Color::Green),
         MessageRole::Event => ("Event", Color::Cyan),
         MessageRole::System => ("System", Color::Red),
+        MessageRole::Shell => ("Shell", Color::Magenta),
     };
 
     let mut lines = vec![Line::from(vec![Span::styled(
@@ -1801,6 +2809,127 @@ fn link_style() -> Style {
         .add_modifier(Modifier::UNDERLINED)
 }
 
+fn chat_input_is_shell(input: &str) -> bool {
+    input.starts_with('>')
+}
+
+fn shell_command_from_input(input: &str) -> Option<String> {
+    if !chat_input_is_shell(input) {
+        return None;
+    }
+
+    let command = input.strip_prefix('>').unwrap_or(input).trim().to_string();
+    if command.is_empty() {
+        None
+    } else {
+        Some(command)
+    }
+}
+
+fn truncate_shell_text(text: &str) -> String {
+    if text.chars().count() <= SHELL_OUTPUT_LIMIT {
+        return text.trim_end_matches('\n').to_string();
+    }
+
+    let truncated = text.chars().take(SHELL_OUTPUT_LIMIT).collect::<String>();
+    format!("{}\n[truncated]", truncated.trim_end_matches('\n'))
+}
+
+fn format_shell_output(
+    command: &str,
+    stdout: &str,
+    stderr: &str,
+    exit_code: Option<i32>,
+    success: bool,
+) -> String {
+    let mut body = String::new();
+    let stdout = truncate_shell_text(stdout);
+    let stderr = truncate_shell_text(stderr);
+
+    if !stdout.is_empty() {
+        body.push_str(&stdout);
+    }
+    if !stderr.is_empty() {
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        if !stdout.is_empty() {
+            body.push_str("[stderr]\n");
+        }
+        body.push_str(&stderr);
+    }
+    if body.is_empty() {
+        body.push_str("[no output]");
+    }
+
+    let exit_code = exit_code
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "unavailable".to_string());
+    let status = if success { "ok" } else { "failed" };
+
+    format!("Command: `{command}`\n\n```text\n{body}\n```\n\nExit code: {exit_code} ({status})")
+}
+
+fn load_codex_chat_model_label() -> Option<String> {
+    let config_path = codex_config_path()?;
+    let contents = fs::read_to_string(config_path).ok()?;
+
+    let model = parse_codex_top_level_string(&contents, "model")?;
+    match parse_codex_top_level_string(&contents, "model_reasoning_effort") {
+        Some(effort) => Some(format!("{model} · {effort}")),
+        None => Some(model),
+    }
+}
+
+fn codex_config_path() -> Option<PathBuf> {
+    env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
+        .map(|dir| dir.join("config.toml"))
+}
+
+#[cfg(test)]
+fn parse_codex_model_from_config(contents: &str) -> Option<String> {
+    parse_codex_top_level_string(contents, "model")
+}
+
+#[cfg(test)]
+fn parse_codex_reasoning_effort_from_config(contents: &str) -> Option<String> {
+    parse_codex_top_level_string(contents, "model_reasoning_effort")
+}
+
+fn parse_codex_top_level_string(contents: &str, wanted_key: &str) -> Option<String> {
+    let mut at_top_level = true;
+
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if trimmed.starts_with('[') {
+            at_top_level = false;
+            continue;
+        }
+        if !at_top_level {
+            continue;
+        }
+
+        let Some((key, value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        if key.trim() != wanted_key {
+            continue;
+        }
+
+        let parsed = value.trim().trim_matches('"').trim_matches('\'').trim();
+        if !parsed.is_empty() {
+            return Some(parsed.to_string());
+        }
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1827,5 +2956,93 @@ mod tests {
         let area = Rect::new(0, 0, 8, 5);
 
         assert_eq!(chat_max_scroll(&agent, area), 2);
+    }
+
+    #[test]
+    fn shell_command_is_detected_from_chat_input() {
+        assert_eq!(
+            shell_command_from_input("> cargo test"),
+            Some("cargo test".to_string())
+        );
+        assert_eq!(
+            shell_command_from_input(">   ls -la"),
+            Some("ls -la".to_string())
+        );
+        assert_eq!(shell_command_from_input("hello > world"), None);
+        assert_eq!(shell_command_from_input(">"), None);
+    }
+
+    #[test]
+    fn shell_output_is_formatted_for_chat() {
+        let output = format_shell_output("ls", "file.txt\n", "", Some(0), true);
+
+        assert!(output.contains("Command: `ls`"));
+        assert!(output.contains("```text"));
+        assert!(output.contains("file.txt"));
+        assert!(output.contains("Exit code: 0 (ok)"));
+    }
+
+    #[test]
+    fn chat_input_wraps_into_multiple_lines() {
+        assert_eq!(
+            wrapped_chat_input_lines("abcdef", 4),
+            vec!["abcd".to_string(), "ef".to_string()]
+        );
+        assert_eq!(
+            wrapped_chat_input_lines("ab\ncd", 4),
+            vec!["ab".to_string(), "cd".to_string()]
+        );
+    }
+
+    #[test]
+    fn chat_input_height_grows_with_wrapped_content() {
+        let main_area = Rect::new(0, 0, 10, 20);
+
+        assert_eq!(chat_input_height_for_main_area("short", main_area), 3);
+        assert_eq!(chat_input_height_for_main_area("abcdefghijk", main_area), 4);
+    }
+
+    #[test]
+    fn parses_codex_model_from_top_level_config() {
+        let config = r#"
+model = "gpt-5.4"
+model_reasoning_effort = "xhigh"
+
+[projects."/tmp/example"]
+trust_level = "trusted"
+"#;
+
+        assert_eq!(
+            parse_codex_model_from_config(config),
+            Some("gpt-5.4".to_string())
+        );
+        assert_eq!(
+            parse_codex_reasoning_effort_from_config(config),
+            Some("xhigh".to_string())
+        );
+    }
+
+    #[test]
+    fn ignores_non_top_level_model_keys() {
+        let config = r#"
+[profiles.fast]
+model = "gpt-5.5-mini"
+"#;
+
+        assert_eq!(parse_codex_model_from_config(config), None);
+        assert_eq!(parse_codex_reasoning_effort_from_config(config), None);
+    }
+
+    #[test]
+    fn builds_chat_model_label_with_reasoning_effort() {
+        let config = r#"
+model = "gpt-5.4"
+model_reasoning_effort = "xhigh"
+"#;
+
+        let model = parse_codex_model_from_config(config).unwrap();
+        let effort = parse_codex_reasoning_effort_from_config(config).unwrap();
+
+        assert_eq!(format!("{model} · {effort}"), "gpt-5.4 · xhigh");
     }
 }
