@@ -43,7 +43,7 @@ pub struct FileBrowserState {
     search_match_count: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileEntry {
     pub path: PathBuf,
     pub relative_path: PathBuf,
@@ -174,34 +174,22 @@ struct EditorRenderCache {
 
 impl FileBrowserState {
     pub fn refresh(&mut self, root: &Path) {
+        match build_file_entries(root).and_then(|entries| self.apply_entries(entries)) {
+            Ok(()) => {}
+            Err(error) => self.reset_with_error(error),
+        }
+    }
+
+    pub fn refresh_if_changed(&mut self, root: &Path) {
         match build_file_entries(root).and_then(|entries| {
-            self.entries = entries;
-            self.selected = self.selected.min(self.entries.len().saturating_sub(1));
-            self.sync_collapsed_dirs();
-            self.rebuild_tree_rows();
-            self.refresh_search_results();
-            self.content_scroll = 0;
-            self.error = None;
-            self.update_preview()?;
-            self.sync_editor_to_selection(true)
+            if entries == self.entries {
+                Ok(())
+            } else {
+                self.apply_entries(entries)
+            }
         }) {
             Ok(()) => {}
-            Err(error) => {
-                self.entries.clear();
-                self.tree_rows.clear();
-                self.selected = 0;
-                self.tree_cursor = 0;
-                self.sidebar_tab = WorkspaceSidebarTab::Files;
-                self.search_query.clear();
-                self.collapsed_dirs.clear();
-                self.known_dirs.clear();
-                self.search_rows.clear();
-                self.search_selected_row = 0;
-                self.search_match_count = 0;
-                self.preview_title = "Workspace".to_string();
-                self.preview = plain_preview_lines("Unable to load workspace.");
-                self.error = Some(error.to_string());
-            }
+            Err(error) => self.reset_with_error(error),
         }
     }
 
@@ -393,6 +381,71 @@ impl FileBrowserState {
         }
         self.update_preview()?;
         self.sync_editor_to_selection(auto_open)
+    }
+
+    fn apply_entries(&mut self, entries: Vec<FileEntry>) -> Result<()> {
+        let previous_selected = self.selected;
+        let previous_selected_path = self
+            .entries
+            .get(self.selected)
+            .map(|entry| entry.path.clone());
+        let previous_editor_path = self.editor.as_ref().map(|editor| editor.path.clone());
+        let previous_directory_cursor = self
+            .tree_rows
+            .get(self.tree_cursor)
+            .and_then(FileTreeRow::directory_path)
+            .cloned();
+        let previous_content_scroll = self.content_scroll;
+        let keep_dirty_editor = self.editor.as_ref().is_some_and(|editor| {
+            editor.dirty && !entries.iter().any(|entry| entry.path == editor.path)
+        });
+
+        self.entries = entries;
+        self.selected = self.resolve_selected_index(
+            previous_editor_path
+                .as_ref()
+                .or(previous_selected_path.as_ref()),
+            previous_selected,
+        );
+        self.sync_collapsed_dirs();
+        self.rebuild_tree_rows();
+        if let Some(row) = previous_directory_cursor
+            .as_ref()
+            .and_then(|relative_path| self.row_for_directory(relative_path))
+        {
+            self.tree_cursor = row;
+        }
+        self.refresh_search_results();
+        self.content_scroll = if previous_selected_path.as_ref().is_some_and(|path| {
+            self.entries
+                .get(self.selected)
+                .is_some_and(|entry| &entry.path == path)
+        }) {
+            previous_content_scroll
+        } else {
+            0
+        };
+        self.error = None;
+        self.update_preview()?;
+        if keep_dirty_editor {
+            Ok(())
+        } else {
+            self.sync_editor_to_selection(true)
+        }
+    }
+
+    fn resolve_selected_index(
+        &self,
+        selected_path: Option<&PathBuf>,
+        fallback_index: usize,
+    ) -> usize {
+        if self.entries.is_empty() {
+            return 0;
+        }
+
+        selected_path
+            .and_then(|path| self.entries.iter().position(|entry| entry.path == *path))
+            .unwrap_or_else(|| fallback_index.min(self.entries.len().saturating_sub(1)))
     }
 
     fn select_tree_row(&mut self, row: usize, auto_open: bool) -> Result<()> {
@@ -639,6 +692,23 @@ impl FileBrowserState {
         self.preview_title = entry.path.display().to_string();
         self.preview = read_text_preview(&entry.path)?;
         Ok(())
+    }
+
+    fn reset_with_error(&mut self, error: anyhow::Error) {
+        self.entries.clear();
+        self.tree_rows.clear();
+        self.selected = 0;
+        self.tree_cursor = 0;
+        self.sidebar_tab = WorkspaceSidebarTab::Files;
+        self.search_query.clear();
+        self.collapsed_dirs.clear();
+        self.known_dirs.clear();
+        self.search_rows.clear();
+        self.search_selected_row = 0;
+        self.search_match_count = 0;
+        self.preview_title = "Workspace".to_string();
+        self.preview = plain_preview_lines("Unable to load workspace.");
+        self.error = Some(error.to_string());
     }
 }
 
@@ -2456,6 +2526,51 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["└── ▸ src"]
         );
+    }
+
+    #[test]
+    fn refresh_if_changed_preserves_selected_file_and_updates_tree_rows() {
+        let root = std::env::temp_dir().join(format!(
+            "cmdex-workspace-refresh-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let selected = root.join("b.txt");
+        let added = root.join("a.txt");
+        fs::write(&selected, "b").unwrap();
+
+        let mut browser = FileBrowserState::default();
+        browser.refresh(&root);
+
+        assert_eq!(browser.entries[browser.selected].path, selected);
+
+        fs::write(&added, "a").unwrap();
+        browser.refresh_if_changed(&root);
+
+        assert_eq!(browser.entries[browser.selected].path, selected);
+        assert!(
+            browser
+                .sidebar_labels()
+                .iter()
+                .any(|label| label.contains("a.txt"))
+        );
+
+        fs::remove_file(&added).unwrap();
+        browser.refresh_if_changed(&root);
+
+        assert!(
+            !browser
+                .sidebar_labels()
+                .iter()
+                .any(|label| label.contains("a.txt"))
+        );
+
+        let _ = fs::remove_file(selected);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
