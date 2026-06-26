@@ -2568,7 +2568,7 @@ fn draw_git_diff(frame: &mut Frame, app: &App, area: Rect) {
     let stage_button = Paragraph::new(stage_label)
         .alignment(Alignment::Center)
         .style(action_style(theme().foreground))
-        .block(panel_block().title("Action"));
+        .block(panel_block());
     frame.render_widget(stage_button, layout.stage_button);
 
     let discard_style = match agent.git_diff.active_section {
@@ -2578,19 +2578,19 @@ fn draw_git_diff(frame: &mut Frame, app: &App, area: Rect) {
     let discard_button = Paragraph::new("Discard")
         .alignment(Alignment::Center)
         .style(discard_style)
-        .block(panel_block().title("Action"));
+        .block(panel_block());
     frame.render_widget(discard_button, layout.discard_button);
 
     let push_button = Paragraph::new("Push")
         .alignment(Alignment::Center)
         .style(action_style(theme().accent))
-        .block(panel_block().title("Action"));
+        .block(panel_block());
     frame.render_widget(push_button, layout.push_button);
 
     let pull_button = Paragraph::new("Pull")
         .alignment(Alignment::Center)
         .style(action_style(theme().foreground))
-        .block(panel_block().title("Action"));
+        .block(panel_block());
     frame.render_widget(pull_button, layout.pull_button);
 
     let status = if let Some(error) = &agent.git_diff.error {
