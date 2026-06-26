@@ -1,4 +1,8 @@
-use std::{env, fs, path::PathBuf, time::Duration};
+use std::{
+    env, fs,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use anyhow::Result;
 use crossterm::{
@@ -63,6 +67,7 @@ const TAB_LABELS: [(&str, AppTab); 3] = [
 const SPINNER: [&str; 8] = ["⠏", "⠛", "⠹", "⢸", "⣰", "⣤", "⣆", "⡇"];
 const CONTENT_SCROLL_STEP: u16 = 4;
 const MOUSE_SCROLL_STEP: u16 = 4;
+const MOUSE_SCROLL_DEBOUNCE: Duration = Duration::from_millis(20);
 const SHELL_OUTPUT_LIMIT: usize = 64_000;
 
 #[derive(Debug, Clone)]
@@ -91,6 +96,27 @@ enum AppTab {
     Chat,
     Workspace,
     GitDiff,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScrollDirection {
+    Up,
+    Down,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScrollbarDragTarget {
+    Chat,
+    WorkspacePreview,
+    WorkspaceEditor,
+    GitDiffPreview,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScrollbarMetrics {
+    track: Rect,
+    content_length: usize,
+    viewport_length: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -213,6 +239,8 @@ pub struct App {
     spinner_index: usize,
     status_message: Option<String>,
     should_quit: bool,
+    last_mouse_scroll: Option<(ScrollDirection, Instant)>,
+    active_scrollbar_drag: Option<ScrollbarDragTarget>,
 }
 
 impl App {
@@ -245,6 +273,8 @@ impl App {
             spinner_index: 0,
             status_message: None,
             should_quit: false,
+            last_mouse_scroll: None,
+            active_scrollbar_drag: None,
         }
     }
 
@@ -415,14 +445,182 @@ impl App {
 
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                if self.handle_scrollbar_press(mouse.column, mouse.row, layout) {
+                    return;
+                }
                 self.handle_left_click(mouse.column, mouse.row, layout);
             }
-            MouseEventKind::ScrollUp => self.handle_scroll(mouse.column, mouse.row, layout, true),
-            MouseEventKind::ScrollDown => {
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if self.handle_scrollbar_drag(mouse.row, layout) {
+                    return;
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.active_scrollbar_drag = None;
+            }
+            MouseEventKind::ScrollUp if self.should_handle_mouse_scroll(ScrollDirection::Up) => {
+                self.handle_scroll(mouse.column, mouse.row, layout, true)
+            }
+            MouseEventKind::ScrollDown
+                if self.should_handle_mouse_scroll(ScrollDirection::Down) =>
+            {
                 self.handle_scroll(mouse.column, mouse.row, layout, false)
             }
             _ => {}
         }
+    }
+
+    fn handle_scrollbar_press(&mut self, column: u16, row: u16, layout: UiLayout) -> bool {
+        self.active_scrollbar_drag = None;
+
+        let Some(target) = self.scrollbar_drag_target_at(column, row, layout) else {
+            return false;
+        };
+
+        self.active_scrollbar_drag = Some(target);
+        self.update_scrollbar_drag(target, row, layout)
+    }
+
+    fn handle_scrollbar_drag(&mut self, row: u16, layout: UiLayout) -> bool {
+        let Some(target) = self.active_scrollbar_drag else {
+            return false;
+        };
+
+        if self.update_scrollbar_drag(target, row, layout) {
+            true
+        } else {
+            self.active_scrollbar_drag = None;
+            false
+        }
+    }
+
+    fn scrollbar_drag_target_at(
+        &self,
+        column: u16,
+        row: u16,
+        layout: UiLayout,
+    ) -> Option<ScrollbarDragTarget> {
+        let target = match self.current_tab {
+            AppTab::Chat if !self.add_agent_selected() => ScrollbarDragTarget::Chat,
+            AppTab::Workspace => {
+                if self
+                    .active_agent()
+                    .is_some_and(|agent| agent.workspace.editor.is_some())
+                {
+                    ScrollbarDragTarget::WorkspaceEditor
+                } else {
+                    ScrollbarDragTarget::WorkspacePreview
+                }
+            }
+            AppTab::GitDiff => ScrollbarDragTarget::GitDiffPreview,
+            AppTab::Chat => return None,
+        };
+
+        let metrics = self.scrollbar_metrics(target, layout)?;
+        rect_contains(metrics.track, column, row).then_some(target)
+    }
+
+    fn update_scrollbar_drag(
+        &mut self,
+        target: ScrollbarDragTarget,
+        row: u16,
+        layout: UiLayout,
+    ) -> bool {
+        let Some(metrics) = self.scrollbar_metrics(target, layout) else {
+            return false;
+        };
+        let scroll = scroll_position_from_row(metrics, row);
+
+        match target {
+            ScrollbarDragTarget::Chat => {
+                let Some(agent) = self.active_agent_mut() else {
+                    return false;
+                };
+                agent.chat_follow_output = false;
+                agent.chat_scroll = scroll;
+            }
+            ScrollbarDragTarget::WorkspacePreview => {
+                let Some(agent) = self.active_agent_mut() else {
+                    return false;
+                };
+                agent.workspace.content_scroll = scroll;
+            }
+            ScrollbarDragTarget::WorkspaceEditor => {
+                let Some(agent) = self.active_agent_mut() else {
+                    return false;
+                };
+                let Some(editor) = agent.workspace.editor.as_mut() else {
+                    return false;
+                };
+                editor.set_vertical_scroll(scroll, metrics.viewport_length as u16);
+            }
+            ScrollbarDragTarget::GitDiffPreview => {
+                let Some(agent) = self.active_agent_mut() else {
+                    return false;
+                };
+                agent.git_diff.content_scroll = scroll;
+            }
+        }
+
+        true
+    }
+
+    fn scrollbar_metrics(
+        &self,
+        target: ScrollbarDragTarget,
+        layout: UiLayout,
+    ) -> Option<ScrollbarMetrics> {
+        let agent = self.active_agent()?;
+
+        match target {
+            ScrollbarDragTarget::Chat => {
+                let text = Text::from(chat_lines(agent));
+                let content_length =
+                    wrapped_text_height(&text, layout.body.width.saturating_sub(2));
+                vertical_scrollbar_metrics(layout.body, content_length)
+            }
+            ScrollbarDragTarget::WorkspacePreview => {
+                let content_length = preview_content_height(
+                    &agent.workspace.preview,
+                    layout.body.width.saturating_sub(2),
+                );
+                vertical_scrollbar_metrics(layout.body, content_length)
+            }
+            ScrollbarDragTarget::WorkspaceEditor => {
+                let editor = agent.workspace.editor.as_ref()?;
+                let viewport = workspace_editor_viewport(layout.body);
+                vertical_scrollbar_metrics_for_viewport(viewport, editor.content_height())
+            }
+            ScrollbarDragTarget::GitDiffPreview => {
+                let diff_layout = git_diff_layout(layout.body);
+                let content_length = preview_content_height(
+                    &agent.git_diff.preview,
+                    diff_layout.preview.width.saturating_sub(2),
+                );
+                vertical_scrollbar_metrics(diff_layout.preview, content_length)
+            }
+        }
+    }
+
+    fn should_handle_mouse_scroll(&mut self, direction: ScrollDirection) -> bool {
+        self.should_handle_mouse_scroll_at(direction, Instant::now())
+    }
+
+    fn should_handle_mouse_scroll_at(&mut self, direction: ScrollDirection, now: Instant) -> bool {
+        if self
+            .last_mouse_scroll
+            .is_some_and(|(last_direction, last_at)| {
+                last_direction == direction
+                    && now
+                        .checked_duration_since(last_at)
+                        .is_some_and(|elapsed| elapsed < MOUSE_SCROLL_DEBOUNCE)
+            })
+        {
+            return false;
+        }
+
+        self.last_mouse_scroll = Some((direction, now));
+        true
     }
 
     fn scroll_content_down(&mut self, area: Rect) {
@@ -2696,27 +2894,15 @@ fn git_diff_commit_input_text(input: &str, max_width: u16) -> String {
 }
 
 fn render_vertical_scrollbar(frame: &mut Frame, area: Rect, content_length: usize, scroll: u16) {
-    let inner_width = area.width.saturating_sub(2);
-    let inner_height = area.height.saturating_sub(2);
-    if inner_width == 0 || inner_height == 0 {
+    let Some(metrics) = vertical_scrollbar_metrics(area, content_length) else {
         return;
-    }
-    if content_length <= inner_height as usize {
-        return;
-    }
+    };
 
     let mut state = ScrollbarState::new(content_length.max(1))
         .position(scroll as usize)
-        .viewport_content_length(inner_height as usize);
+        .viewport_content_length(metrics.viewport_length);
 
-    frame.render_stateful_widget(
-        scrollbar_widget(),
-        area.inner(Margin {
-            vertical: 1,
-            horizontal: 0,
-        }),
-        &mut state,
-    );
+    frame.render_stateful_widget(scrollbar_widget(), metrics.track, &mut state);
 }
 
 fn render_vertical_scrollbar_with_viewport(
@@ -2725,24 +2911,61 @@ fn render_vertical_scrollbar_with_viewport(
     content_length: usize,
     scroll: u16,
 ) {
-    if viewport.width == 0 || viewport.height == 0 {
+    let Some(metrics) = vertical_scrollbar_metrics_for_viewport(viewport, content_length) else {
         return;
-    }
-    if content_length <= viewport.height as usize {
-        return;
-    }
+    };
 
     let mut state = ScrollbarState::new(content_length.max(1))
         .position(scroll as usize)
-        .viewport_content_length(viewport.height as usize);
+        .viewport_content_length(metrics.viewport_length);
 
-    let scrollbar_area = Rect::new(
-        viewport.x.saturating_add(viewport.width.saturating_sub(1)),
-        viewport.y,
-        1,
-        viewport.height,
-    );
-    frame.render_stateful_widget(scrollbar_widget(), scrollbar_area, &mut state);
+    frame.render_stateful_widget(scrollbar_widget(), metrics.track, &mut state);
+}
+
+fn vertical_scrollbar_metrics(area: Rect, content_length: usize) -> Option<ScrollbarMetrics> {
+    vertical_scrollbar_metrics_for_viewport(inner_rect(area), content_length)
+}
+
+fn vertical_scrollbar_metrics_for_viewport(
+    viewport: Rect,
+    content_length: usize,
+) -> Option<ScrollbarMetrics> {
+    if viewport.width == 0 || viewport.height == 0 {
+        return None;
+    }
+    if content_length <= viewport.height as usize {
+        return None;
+    }
+
+    Some(ScrollbarMetrics {
+        track: Rect::new(
+            viewport.x.saturating_add(viewport.width.saturating_sub(1)),
+            viewport.y,
+            1,
+            viewport.height,
+        ),
+        content_length,
+        viewport_length: viewport.height as usize,
+    })
+}
+
+fn scroll_position_from_row(metrics: ScrollbarMetrics, row: u16) -> u16 {
+    let max_scroll = metrics
+        .content_length
+        .saturating_sub(metrics.viewport_length)
+        .min(u16::MAX as usize);
+    if max_scroll == 0 {
+        return 0;
+    }
+
+    let row_offset = row
+        .saturating_sub(metrics.track.y)
+        .min(metrics.track.height.saturating_sub(1)) as usize;
+    let track_height = usize::from(metrics.track.height.saturating_sub(1).max(1));
+
+    ((row_offset * max_scroll) + track_height / 2)
+        .checked_div(track_height)
+        .unwrap_or(0) as u16
 }
 
 fn workspace_editor_panes(inner: Rect) -> (Rect, Option<Rect>) {
@@ -3419,5 +3642,52 @@ model_reasoning_effort = "xhigh"
         let effort = parse_codex_reasoning_effort_from_config(config).unwrap();
 
         assert_eq!(format!("{model} · {effort}"), "gpt-5.4 · xhigh");
+    }
+
+    #[test]
+    fn debounces_repeated_mouse_scroll_events() {
+        let mut app = App::new(PathBuf::new(), CmdexConfig::default());
+        let now = Instant::now();
+
+        assert!(app.should_handle_mouse_scroll_at(ScrollDirection::Down, now));
+        assert!(
+            !app.should_handle_mouse_scroll_at(
+                ScrollDirection::Down,
+                now + Duration::from_millis(10)
+            )
+        );
+        assert!(
+            app.should_handle_mouse_scroll_at(ScrollDirection::Up, now + Duration::from_millis(10))
+        );
+        assert!(
+            app.should_handle_mouse_scroll_at(
+                ScrollDirection::Down,
+                now + Duration::from_millis(40)
+            )
+        );
+    }
+
+    #[test]
+    fn vertical_scrollbar_track_stays_inside_container_border() {
+        let area = Rect::new(10, 5, 20, 8);
+        let metrics = vertical_scrollbar_metrics(area, 32).expect("scrollbar metrics");
+
+        assert_eq!(metrics.track.x, 28);
+        assert_eq!(metrics.track.y, 6);
+        assert_eq!(metrics.track.width, 1);
+        assert_eq!(metrics.track.height, 6);
+    }
+
+    #[test]
+    fn scrollbar_drag_maps_mouse_row_to_scroll_position() {
+        let metrics = ScrollbarMetrics {
+            track: Rect::new(0, 10, 1, 6),
+            content_length: 30,
+            viewport_length: 6,
+        };
+
+        assert_eq!(scroll_position_from_row(metrics, 10), 0);
+        assert_eq!(scroll_position_from_row(metrics, 13), 14);
+        assert_eq!(scroll_position_from_row(metrics, 15), 24);
     }
 }

@@ -764,6 +764,10 @@ impl WorkspaceEditorState {
             .min(self.max_vertical_scroll(viewport_height));
     }
 
+    pub fn set_vertical_scroll(&mut self, scroll: u16, viewport_height: u16) {
+        self.vertical_scroll = scroll.min(self.max_vertical_scroll(viewport_height));
+    }
+
     pub fn gutter_width(&self) -> usize {
         self.lines.len().max(1).to_string().len() + 3
     }
