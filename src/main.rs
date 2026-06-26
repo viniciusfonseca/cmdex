@@ -1,6 +1,7 @@
 mod app;
 mod codex;
 mod config;
+mod theme;
 mod workspace;
 
 use anyhow::Result;

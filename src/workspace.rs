@@ -14,20 +14,14 @@ use ratatui::{
 };
 use syntect::{
     easy::HighlightLines,
-    highlighting::{FontStyle, Theme, ThemeSet},
+    highlighting::FontStyle,
     parsing::{SyntaxReference, SyntaxSet},
 };
 
+use crate::theme::{app_theme, syntax_theme};
+
 const PREVIEW_LIMIT: usize = 200_000;
 static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
-static THEME: LazyLock<Theme> = LazyLock::new(|| {
-    let themes = ThemeSet::load_defaults();
-    themes
-        .themes
-        .get("base16-ocean.dark")
-        .cloned()
-        .unwrap_or_default()
-});
 
 #[derive(Debug, Clone, Default)]
 pub struct FileBrowserState {
@@ -35,12 +29,18 @@ pub struct FileBrowserState {
     pub tree_rows: Vec<FileTreeRow>,
     pub selected: usize,
     pub tree_cursor: usize,
+    pub sidebar_tab: WorkspaceSidebarTab,
+    pub search_query: String,
     pub preview_title: String,
     pub preview: Vec<Line<'static>>,
     pub content_scroll: u16,
     pub error: Option<String>,
     pub editor: Option<WorkspaceEditorState>,
     collapsed_dirs: BTreeSet<PathBuf>,
+    known_dirs: BTreeSet<PathBuf>,
+    search_rows: Vec<WorkspaceSearchRow>,
+    search_selected_row: usize,
+    search_match_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -55,6 +55,13 @@ pub struct FileTreeRow {
     kind: FileTreeRowKind,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WorkspaceSidebarTab {
+    #[default]
+    Files,
+    Search,
+}
+
 #[derive(Debug, Clone)]
 enum FileTreeRowKind {
     Directory {
@@ -63,6 +70,18 @@ enum FileTreeRowKind {
     },
     File {
         file_index: usize,
+    },
+}
+
+#[derive(Debug, Clone)]
+enum WorkspaceSearchRow {
+    FileHeader {
+        label: String,
+    },
+    Match {
+        label: String,
+        file_index: usize,
+        line_number: usize,
     },
 }
 
@@ -96,6 +115,30 @@ pub struct DiffEntry {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiffPreviewKind {
+    Context,
+    Added,
+    Modified,
+    Removed,
+}
+
+#[derive(Debug, Clone)]
+struct DiffPreviewRow {
+    line_number: Option<usize>,
+    kind: DiffPreviewKind,
+    line: Line<'static>,
+}
+
+#[derive(Debug, Clone)]
+struct DiffHunk {
+    old_start: usize,
+    old_count: usize,
+    new_start: usize,
+    new_count: usize,
+    removed_lines: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditorMode {
     Normal,
     Insert,
@@ -121,6 +164,12 @@ pub struct WorkspaceEditorState {
     pub dirty: bool,
     pub status: Option<String>,
     preferred_col: usize,
+    render_cache: EditorRenderCache,
+}
+
+#[derive(Debug, Clone, Default)]
+struct EditorRenderCache {
+    lines: Vec<Line<'static>>,
 }
 
 impl FileBrowserState {
@@ -128,7 +177,9 @@ impl FileBrowserState {
         match build_file_entries(root).and_then(|entries| {
             self.entries = entries;
             self.selected = self.selected.min(self.entries.len().saturating_sub(1));
+            self.sync_collapsed_dirs();
             self.rebuild_tree_rows();
+            self.refresh_search_results();
             self.content_scroll = 0;
             self.error = None;
             self.update_preview()?;
@@ -140,6 +191,13 @@ impl FileBrowserState {
                 self.tree_rows.clear();
                 self.selected = 0;
                 self.tree_cursor = 0;
+                self.sidebar_tab = WorkspaceSidebarTab::Files;
+                self.search_query.clear();
+                self.collapsed_dirs.clear();
+                self.known_dirs.clear();
+                self.search_rows.clear();
+                self.search_selected_row = 0;
+                self.search_match_count = 0;
                 self.preview_title = "Workspace".to_string();
                 self.preview = plain_preview_lines("Unable to load workspace.");
                 self.error = Some(error.to_string());
@@ -206,6 +264,83 @@ impl FileBrowserState {
 
     pub fn sidebar_len(&self) -> usize {
         self.tree_rows.len()
+    }
+
+    pub fn set_sidebar_tab(&mut self, tab: WorkspaceSidebarTab) {
+        self.sidebar_tab = tab;
+    }
+
+    pub fn search_rows_labels(&self) -> Vec<String> {
+        self.search_rows
+            .iter()
+            .map(|row| row.label().to_string())
+            .collect::<Vec<_>>()
+    }
+
+    pub fn search_total_rows(&self) -> usize {
+        self.search_rows.len()
+    }
+
+    pub fn search_selected_row(&self) -> usize {
+        self.search_selected_row
+            .min(self.search_rows.len().saturating_sub(1))
+    }
+
+    pub fn search_match_count(&self) -> usize {
+        self.search_match_count
+    }
+
+    pub fn push_search_char(&mut self, character: char) {
+        self.search_query.push(character);
+        self.refresh_search_results();
+    }
+
+    pub fn pop_search_char(&mut self) {
+        self.search_query.pop();
+        self.refresh_search_results();
+    }
+
+    pub fn search_move_up(&mut self) {
+        if let Some(row) = self.previous_search_match_row(self.search_selected_row) {
+            self.search_selected_row = row;
+        }
+    }
+
+    pub fn search_move_down(&mut self) {
+        let start = self.search_selected_row.saturating_add(1);
+        if let Some(row) = self.next_search_match_row(start) {
+            self.search_selected_row = row;
+        }
+    }
+
+    pub fn select_search_row(&mut self, row: usize) {
+        if self
+            .search_rows
+            .get(row)
+            .is_some_and(WorkspaceSearchRow::is_match)
+        {
+            self.search_selected_row = row;
+        }
+    }
+
+    pub fn open_selected_search_result(&mut self) -> Result<bool> {
+        let Some((file_index, line_number)) = self.selected_search_target() else {
+            return Ok(false);
+        };
+
+        self.select_index(file_index, true)?;
+        if self.selected != file_index {
+            return Ok(false);
+        }
+
+        if let Some(editor) = self.editor.as_mut() {
+            let row = line_number.saturating_sub(1);
+            editor.set_cursor(row, 0);
+            editor.vertical_scroll = row as u16;
+            editor.horizontal_scroll = 0;
+        }
+
+        Ok(true)
     }
 
     pub fn sidebar_selected_row(&self) -> usize {
@@ -321,6 +456,74 @@ impl FileBrowserState {
         }
     }
 
+    fn sync_collapsed_dirs(&mut self) {
+        let directory_paths = collect_directory_paths(&self.entries);
+
+        if self.known_dirs.is_empty() {
+            self.collapsed_dirs = directory_paths.clone();
+        } else {
+            self.collapsed_dirs
+                .retain(|path| directory_paths.contains(path));
+            for path in directory_paths.difference(&self.known_dirs) {
+                self.collapsed_dirs.insert(path.clone());
+            }
+        }
+
+        self.known_dirs = directory_paths;
+    }
+
+    fn refresh_search_results(&mut self) {
+        let previous_target = self.selected_search_target();
+        self.search_rows.clear();
+        self.search_selected_row = 0;
+        self.search_match_count = 0;
+
+        let query = self.search_query.trim();
+        if query.is_empty() {
+            return;
+        }
+
+        for (file_index, entry) in self.entries.iter().enumerate() {
+            let Ok(bytes) = fs::read(&entry.path) else {
+                continue;
+            };
+            if bytes.contains(&0) {
+                continue;
+            }
+
+            let source = normalize_newlines(&String::from_utf8_lossy(&bytes));
+            let mut matches = Vec::new();
+            for (line_index, line) in source.lines().enumerate() {
+                if line.contains(query) {
+                    matches.push(WorkspaceSearchRow::Match {
+                        label: format!("  {}: {}", line_index + 1, search_result_excerpt(line)),
+                        file_index,
+                        line_number: line_index + 1,
+                    });
+                }
+            }
+
+            if !matches.is_empty() {
+                self.search_match_count += matches.len();
+                self.search_rows.push(WorkspaceSearchRow::FileHeader {
+                    label: entry.relative_path.display().to_string(),
+                });
+                self.search_rows.extend(matches);
+            }
+        }
+
+        if let Some((file_index, line_number)) = previous_target {
+            if let Some(row) = self.find_search_match_row(file_index, line_number) {
+                self.search_selected_row = row;
+                return;
+            }
+        }
+
+        if let Some(row) = self.first_search_match_row() {
+            self.search_selected_row = row;
+        }
+    }
+
     fn row_for_file(&self, file_index: usize) -> Option<usize> {
         self.tree_rows
             .iter()
@@ -346,6 +549,52 @@ impl FileBrowserState {
         }
 
         None
+    }
+
+    fn selected_search_target(&self) -> Option<(usize, usize)> {
+        self.search_rows
+            .get(self.search_selected_row)
+            .and_then(WorkspaceSearchRow::target)
+    }
+
+    fn first_search_match_row(&self) -> Option<usize> {
+        self.next_search_match_row(0)
+    }
+
+    fn next_search_match_row(&self, start: usize) -> Option<usize> {
+        self.search_rows
+            .iter()
+            .enumerate()
+            .skip(start)
+            .find_map(|(index, row)| row.is_match().then_some(index))
+    }
+
+    fn previous_search_match_row(&self, start: usize) -> Option<usize> {
+        self.search_rows
+            .iter()
+            .enumerate()
+            .take(start)
+            .rev()
+            .find_map(|(index, row)| row.is_match().then_some(index))
+            .or_else(|| {
+                self.search_rows
+                    .get(start)
+                    .is_some_and(WorkspaceSearchRow::is_match)
+                    .then_some(start)
+            })
+    }
+
+    fn find_search_match_row(&self, file_index: usize, line_number: usize) -> Option<usize> {
+        self.search_rows
+            .iter()
+            .enumerate()
+            .find_map(|(index, row)| {
+                row.target()
+                    .is_some_and(|(candidate_file, candidate_line)| {
+                        candidate_file == file_index && candidate_line == line_number
+                    })
+                    .then_some(index)
+            })
     }
 
     fn sync_editor_to_selection(&mut self, auto_open: bool) -> Result<()> {
@@ -419,6 +668,29 @@ impl FileTreeRow {
     }
 }
 
+impl WorkspaceSearchRow {
+    fn label(&self) -> &str {
+        match self {
+            Self::FileHeader { label } | Self::Match { label, .. } => label,
+        }
+    }
+
+    fn is_match(&self) -> bool {
+        matches!(self, Self::Match { .. })
+    }
+
+    fn target(&self) -> Option<(usize, usize)> {
+        match self {
+            Self::FileHeader { .. } => None,
+            Self::Match {
+                file_index,
+                line_number,
+                ..
+            } => Some((*file_index, *line_number)),
+        }
+    }
+}
+
 impl WorkspaceEditorState {
     pub fn open(path: &Path) -> Result<Self> {
         let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
@@ -438,7 +710,7 @@ impl WorkspaceEditorState {
             lines.push(String::new());
         }
 
-        Ok(Self {
+        let mut editor = Self {
             path: path.to_path_buf(),
             lines,
             cursor_row: 0,
@@ -450,21 +722,30 @@ impl WorkspaceEditorState {
             dirty: false,
             status: None,
             preferred_col: 0,
-        })
+            render_cache: EditorRenderCache::default(),
+        };
+        editor.rebuild_render_cache();
+        Ok(editor)
     }
 
-    pub fn rendered_lines(&self) -> Vec<Line<'static>> {
-        let source = self.lines.join("\n");
-        let syntax = syntax_for_path(&self.path, &source);
-        let mut lines = add_line_numbers(highlighted_preview_lines(&source, syntax));
-        if let Some(line) = lines.get_mut(self.cursor_row) {
+    pub fn rendered_lines(&self, viewport_height: u16) -> Vec<Line<'static>> {
+        let start = self.vertical_scroll as usize;
+        let end = start
+            .saturating_add(usize::from(viewport_height.max(1)))
+            .min(self.render_cache.lines.len());
+        let mut lines = self.render_cache.lines[start..end].to_vec();
+        if let Some(line) = self
+            .cursor_row
+            .checked_sub(start)
+            .and_then(|visible_row| lines.get_mut(visible_row))
+        {
             highlight_editor_line(line);
         }
         lines
     }
 
     pub fn content_height(&self) -> usize {
-        self.lines.len().max(1)
+        self.render_cache.lines.len().max(1)
     }
 
     pub fn gutter_width(&self) -> usize {
@@ -582,6 +863,7 @@ impl WorkspaceEditorState {
         self.preferred_col = 0;
         self.dirty = true;
         self.status = None;
+        self.rebuild_render_cache();
         self.enter_insert_mode();
     }
 
@@ -598,6 +880,9 @@ impl WorkspaceEditorState {
         }
         self.clamp_cursor();
         self.status = None;
+        if self.dirty {
+            self.rebuild_render_cache();
+        }
     }
 
     pub fn insert_char(&mut self, character: char) {
@@ -607,6 +892,7 @@ impl WorkspaceEditorState {
         self.preferred_col = self.cursor_col;
         self.dirty = true;
         self.status = None;
+        self.rebuild_render_cache();
     }
 
     pub fn insert_newline(&mut self) {
@@ -618,6 +904,7 @@ impl WorkspaceEditorState {
         self.preferred_col = 0;
         self.dirty = true;
         self.status = None;
+        self.rebuild_render_cache();
     }
 
     pub fn backspace(&mut self) {
@@ -638,6 +925,7 @@ impl WorkspaceEditorState {
         self.preferred_col = self.cursor_col;
         self.dirty = true;
         self.status = None;
+        self.rebuild_render_cache();
     }
 
     pub fn save(&mut self) -> Result<()> {
@@ -728,6 +1016,10 @@ impl WorkspaceEditorState {
         self.cursor_row = self.cursor_row.min(self.lines.len().saturating_sub(1));
         self.cursor_col = self.cursor_col.min(self.line_len(self.cursor_row));
         self.preferred_col = self.cursor_col;
+    }
+
+    fn rebuild_render_cache(&mut self) {
+        self.render_cache.lines = build_editor_render_lines(&self.path, &self.lines);
     }
 }
 
@@ -996,6 +1288,23 @@ struct FileTreeNode {
     files: Vec<(String, usize)>,
 }
 
+fn collect_directory_paths(entries: &[FileEntry]) -> BTreeSet<PathBuf> {
+    let mut directories = BTreeSet::new();
+
+    for entry in entries {
+        let mut ancestor = entry.relative_path.parent();
+        while let Some(path) = ancestor {
+            if path.as_os_str().is_empty() {
+                break;
+            }
+            directories.insert(path.to_path_buf());
+            ancestor = path.parent();
+        }
+    }
+
+    directories
+}
+
 fn build_file_tree_rows(
     entries: &[FileEntry],
     collapsed_dirs: &BTreeSet<PathBuf>,
@@ -1206,7 +1515,7 @@ fn read_text_preview(path: &Path) -> Result<Vec<Line<'static>>> {
         lines.push(Line::from(Span::styled(
             "[truncated]".to_string(),
             Style::default()
-                .fg(Color::DarkGray)
+                .fg(app_theme().muted)
                 .add_modifier(Modifier::ITALIC),
         )));
     }
@@ -1218,31 +1527,11 @@ fn read_diff_preview(
     entry: &DiffEntry,
     section: DiffSection,
 ) -> Result<Vec<Line<'static>>> {
-    if entry.status.contains('?') {
-        let mut lines = plain_preview_lines(&format!("Untracked file: {}", entry.path.display()));
-        lines.push(Line::default());
-        lines.extend(read_text_preview(&entry.path)?);
-        return Ok(lines);
-    }
-
-    let relative = relative_entry_path(root, &entry.path)?;
-
-    let diff = match section {
-        DiffSection::Changes => git_output(root, &["diff", "--no-ext-diff", "--", &relative])?,
-        DiffSection::Staged => git_output(
-            root,
-            &["diff", "--no-ext-diff", "--cached", "--", &relative],
-        )?,
-    };
-
-    if diff.trim().is_empty() {
-        Ok(plain_preview_lines("No diff available for this file."))
-    } else {
-        Ok(add_line_numbers(highlighted_preview_lines(
-            &normalize_newlines(&diff),
-            SYNTAX_SET.find_syntax_by_extension("diff"),
-        )))
-    }
+    let snapshot = read_diff_snapshot(root, entry, section)?;
+    Ok(render_diff_snapshot_preview(
+        entry.path.as_path(),
+        &snapshot,
+    ))
 }
 
 fn git_output(root: &Path, args: &[&str]) -> Result<String> {
@@ -1263,6 +1552,21 @@ fn git_output(root: &Path, args: &[&str]) -> Result<String> {
     } else {
         Ok(stdout)
     }
+}
+
+fn git_output_bytes(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .with_context(|| format!("failed to run git {:?} in {}", args, root.display()))?;
+
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+
+    Ok(output.stdout)
 }
 
 fn relative_entry_path(root: &Path, path: &Path) -> Result<String> {
@@ -1320,9 +1624,389 @@ fn summarize_git_command_output(stdout: &str, stderr: &str) -> String {
     summary
 }
 
+fn read_diff_snapshot(
+    root: &Path,
+    entry: &DiffEntry,
+    section: DiffSection,
+) -> Result<DiffSnapshot> {
+    if entry.status.contains('?') {
+        let bytes = fs::read(&entry.path)
+            .with_context(|| format!("failed to read {}", entry.path.display()))?;
+        return snapshot_from_bytes(bytes, Some(DiffPreviewKind::Added));
+    }
+
+    let relative = relative_entry_path(root, &entry.path)?;
+    let diff = match section {
+        DiffSection::Changes => git_output(
+            root,
+            &[
+                "diff",
+                "--no-ext-diff",
+                "--no-color",
+                "--unified=0",
+                "--",
+                &relative,
+            ],
+        )?,
+        DiffSection::Staged => git_output(
+            root,
+            &[
+                "diff",
+                "--no-ext-diff",
+                "--no-color",
+                "--cached",
+                "--unified=0",
+                "--",
+                &relative,
+            ],
+        )?,
+    };
+
+    let force_removed = entry.status.contains('D');
+    let default_kind = if force_removed {
+        Some(DiffPreviewKind::Removed)
+    } else {
+        None
+    };
+
+    let bytes = match section {
+        DiffSection::Changes => {
+            if force_removed {
+                git_output_bytes(root, &["show", &format!(":{relative}")])?
+            } else {
+                fs::read(&entry.path)
+                    .with_context(|| format!("failed to read {}", entry.path.display()))?
+            }
+        }
+        DiffSection::Staged => {
+            if force_removed {
+                git_output_bytes(root, &["show", &format!("HEAD:{relative}")])?
+            } else {
+                git_output_bytes(root, &["show", &format!(":{relative}")])?
+            }
+        }
+    };
+
+    let mut snapshot = snapshot_from_bytes(bytes, default_kind)?;
+    snapshot.hunks = parse_unified_diff_hunks(&diff);
+
+    if snapshot.default_kind.is_none() && snapshot.hunks.is_empty() {
+        snapshot.message = Some("No diff available for this file.".to_string());
+    }
+
+    Ok(snapshot)
+}
+
+fn snapshot_from_bytes(
+    bytes: Vec<u8>,
+    default_kind: Option<DiffPreviewKind>,
+) -> Result<DiffSnapshot> {
+    if bytes.contains(&0) {
+        return Ok(DiffSnapshot {
+            source: String::new(),
+            default_kind,
+            hunks: Vec::new(),
+            message: Some("Binary file preview is not available.".to_string()),
+        });
+    }
+
+    let truncated = bytes.len() > PREVIEW_LIMIT;
+    let source = String::from_utf8_lossy(&bytes[..bytes.len().min(PREVIEW_LIMIT)]).into_owned();
+    let mut snapshot = DiffSnapshot {
+        source: normalize_newlines(&source),
+        default_kind,
+        hunks: Vec::new(),
+        message: None,
+    };
+    if truncated {
+        snapshot.message = Some("[truncated]".to_string());
+    }
+    Ok(snapshot)
+}
+
+#[derive(Debug, Clone)]
+struct DiffSnapshot {
+    source: String,
+    default_kind: Option<DiffPreviewKind>,
+    hunks: Vec<DiffHunk>,
+    message: Option<String>,
+}
+
+fn render_diff_snapshot_preview(path: &Path, snapshot: &DiffSnapshot) -> Vec<Line<'static>> {
+    if snapshot.source.is_empty() && snapshot.message.is_some() {
+        return plain_preview_lines(snapshot.message.as_deref().unwrap_or_default());
+    }
+
+    let mut rows = build_diff_preview_rows(
+        path,
+        &snapshot.source,
+        snapshot.default_kind,
+        &snapshot.hunks,
+    );
+
+    if let Some(message) = &snapshot.message {
+        rows.push(DiffPreviewRow {
+            line_number: None,
+            kind: DiffPreviewKind::Context,
+            line: Line::default(),
+        });
+        rows.push(DiffPreviewRow {
+            line_number: None,
+            kind: DiffPreviewKind::Context,
+            line: Line::from(Span::styled(
+                message.clone(),
+                Style::default()
+                    .fg(app_theme().muted)
+                    .add_modifier(Modifier::ITALIC),
+            )),
+        });
+    }
+
+    render_diff_preview_rows(rows)
+}
+
+fn build_diff_preview_rows(
+    path: &Path,
+    source: &str,
+    default_kind: Option<DiffPreviewKind>,
+    hunks: &[DiffHunk],
+) -> Vec<DiffPreviewRow> {
+    let mut highlighted = highlighted_preview_lines(source, syntax_for_path(path, source));
+    maybe_trim_trailing_empty_line(&mut highlighted);
+
+    let mut rows = highlighted
+        .into_iter()
+        .enumerate()
+        .map(|(index, line)| DiffPreviewRow {
+            line_number: Some(index + 1),
+            kind: default_kind.unwrap_or_else(|| diff_kind_for_line(index + 1, hunks)),
+            line,
+        })
+        .collect::<Vec<_>>();
+
+    if default_kind.is_none() {
+        insert_removed_diff_rows(&mut rows, hunks);
+    }
+
+    rows
+}
+
+fn diff_kind_for_line(line_number: usize, hunks: &[DiffHunk]) -> DiffPreviewKind {
+    for hunk in hunks {
+        if hunk.new_count == 0 {
+            continue;
+        }
+
+        let start = hunk.new_start.max(1);
+        let end = start + hunk.new_count.saturating_sub(1);
+        if (start..=end).contains(&line_number) {
+            return if hunk.old_count == 0 {
+                DiffPreviewKind::Added
+            } else {
+                DiffPreviewKind::Modified
+            };
+        }
+    }
+
+    DiffPreviewKind::Context
+}
+
+fn insert_removed_diff_rows(rows: &mut Vec<DiffPreviewRow>, hunks: &[DiffHunk]) {
+    let mut inserted_rows = 0usize;
+
+    for hunk in hunks {
+        if hunk.removed_lines.is_empty() {
+            continue;
+        }
+
+        let insert_at = hunk
+            .new_start
+            .saturating_sub(1)
+            .saturating_add(inserted_rows)
+            .min(rows.len());
+
+        let removed_rows = hunk
+            .removed_lines
+            .iter()
+            .enumerate()
+            .map(|(offset, line)| DiffPreviewRow {
+                line_number: Some(hunk.old_start + offset),
+                kind: DiffPreviewKind::Removed,
+                line: Line::from(line.clone()),
+            })
+            .collect::<Vec<_>>();
+
+        inserted_rows += removed_rows.len();
+        rows.splice(insert_at..insert_at, removed_rows);
+    }
+}
+
+fn render_diff_preview_rows(rows: Vec<DiffPreviewRow>) -> Vec<Line<'static>> {
+    let gutter_width = rows
+        .iter()
+        .filter_map(|row| row.line_number)
+        .max()
+        .unwrap_or(1)
+        .to_string()
+        .len();
+
+    rows.into_iter()
+        .map(|row| {
+            let marker = match row.kind {
+                DiffPreviewKind::Context => ' ',
+                DiffPreviewKind::Added => '+',
+                DiffPreviewKind::Modified => '~',
+                DiffPreviewKind::Removed => '-',
+            };
+            let number = row
+                .line_number
+                .map(|value| format!("{value:>width$}", width = gutter_width))
+                .unwrap_or_else(|| " ".repeat(gutter_width));
+
+            let mut line = row.line;
+            let mut spans = Vec::with_capacity(line.spans.len() + 1);
+            spans.push(Span::styled(
+                format!("{number} {marker} | "),
+                Style::default().fg(diff_gutter_color(row.kind)),
+            ));
+            spans.append(&mut line.spans);
+            line.spans = spans;
+            apply_diff_preview_kind(&mut line, row.kind);
+            line
+        })
+        .collect()
+}
+
+fn diff_gutter_color(kind: DiffPreviewKind) -> Color {
+    match kind {
+        DiffPreviewKind::Context => app_theme().line_number,
+        DiffPreviewKind::Added => app_theme().success,
+        DiffPreviewKind::Modified => app_theme().warning,
+        DiffPreviewKind::Removed => app_theme().error,
+    }
+}
+
+fn apply_diff_preview_kind(line: &mut Line<'static>, kind: DiffPreviewKind) {
+    let Some(background) = diff_preview_background(kind) else {
+        return;
+    };
+
+    for span in &mut line.spans {
+        span.style = span.style.bg(background);
+    }
+}
+
+fn diff_preview_background(kind: DiffPreviewKind) -> Option<Color> {
+    match kind {
+        DiffPreviewKind::Context => None,
+        DiffPreviewKind::Added => Some(blend_tui_colors(
+            app_theme().panel_bg,
+            app_theme().success,
+            0.22,
+        )),
+        DiffPreviewKind::Modified => Some(blend_tui_colors(
+            app_theme().panel_bg,
+            app_theme().warning,
+            0.18,
+        )),
+        DiffPreviewKind::Removed => Some(blend_tui_colors(
+            app_theme().panel_bg,
+            app_theme().error,
+            0.22,
+        )),
+    }
+}
+
+fn blend_tui_colors(base: Color, overlay: Color, alpha: f32) -> Color {
+    let (Color::Rgb(base_r, base_g, base_b), Color::Rgb(overlay_r, overlay_g, overlay_b)) =
+        (base, overlay)
+    else {
+        return overlay;
+    };
+
+    let blend = |background: u8, foreground: u8| -> u8 {
+        ((background as f32 * (1.0 - alpha)) + (foreground as f32 * alpha)).round() as u8
+    };
+
+    Color::Rgb(
+        blend(base_r, overlay_r),
+        blend(base_g, overlay_g),
+        blend(base_b, overlay_b),
+    )
+}
+
+fn parse_unified_diff_hunks(diff: &str) -> Vec<DiffHunk> {
+    let mut hunks = Vec::new();
+    let mut current: Option<DiffHunk> = None;
+
+    for line in normalize_newlines(diff).lines() {
+        if line.starts_with("@@") {
+            if let Some(hunk) = current.take() {
+                hunks.push(hunk);
+            }
+            current =
+                parse_diff_hunk_header(line).map(|(old_start, old_count, new_start, new_count)| {
+                    DiffHunk {
+                        old_start,
+                        old_count,
+                        new_start,
+                        new_count,
+                        removed_lines: Vec::new(),
+                    }
+                });
+            continue;
+        }
+
+        if let Some(hunk) = current.as_mut() {
+            if let Some(removed) = line.strip_prefix('-') {
+                hunk.removed_lines.push(removed.to_string());
+            }
+        }
+    }
+
+    if let Some(hunk) = current {
+        hunks.push(hunk);
+    }
+
+    hunks
+}
+
+fn parse_diff_hunk_header(header: &str) -> Option<(usize, usize, usize, usize)> {
+    let mut parts = header.split_whitespace();
+    let _ = parts.next()?;
+    let old_range = parts.next()?;
+    let new_range = parts.next()?;
+    let (old_start, old_count) = parse_diff_range(old_range, '-')?;
+    let (new_start, new_count) = parse_diff_range(new_range, '+')?;
+    Some((old_start, old_count, new_start, new_count))
+}
+
+fn parse_diff_range(value: &str, prefix: char) -> Option<(usize, usize)> {
+    let value = value.strip_prefix(prefix)?;
+    let (start, count) = match value.split_once(',') {
+        Some((start, count)) => (start, count.parse().ok()?),
+        None => (value, 1),
+    };
+    Some((start.parse().ok()?, count))
+}
+
 fn contains_git_component(path: &Path) -> bool {
     path.components()
         .any(|component| component.as_os_str() == ".git")
+}
+
+fn syntax_for_editor_lines(
+    path: &Path,
+    source_lines: &[String],
+) -> Option<&'static SyntaxReference> {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .and_then(|extension| SYNTAX_SET.find_syntax_by_extension(extension))
+        .or_else(|| {
+            source_lines
+                .first()
+                .and_then(|line| SYNTAX_SET.find_syntax_by_first_line(line))
+        })
 }
 
 fn syntax_for_path<'a>(path: &Path, source: &'a str) -> Option<&'static SyntaxReference> {
@@ -1343,7 +2027,7 @@ fn highlighted_preview_lines(
 ) -> Vec<Line<'static>> {
     match syntax {
         Some(syntax) => {
-            let mut highlighter = HighlightLines::new(syntax, &THEME);
+            let mut highlighter = HighlightLines::new(syntax, syntax_theme());
             split_preserving_lines(source)
                 .into_iter()
                 .map(|line| {
@@ -1369,6 +2053,42 @@ fn highlighted_preview_lines(
     }
 }
 
+fn build_editor_render_lines(path: &Path, source_lines: &[String]) -> Vec<Line<'static>> {
+    let syntax = syntax_for_editor_lines(path, source_lines);
+    let lines = match syntax {
+        Some(syntax) => {
+            let mut highlighter = HighlightLines::new(syntax, syntax_theme());
+            source_lines
+                .iter()
+                .map(|line| {
+                    if line.is_empty() {
+                        return Line::default();
+                    }
+
+                    match highlighter.highlight_line(line, &SYNTAX_SET) {
+                        Ok(ranges) => Line::from(
+                            ranges
+                                .into_iter()
+                                .map(|(style, text)| {
+                                    Span::styled(text.to_string(), to_ratatui_style(style))
+                                })
+                                .collect::<Vec<_>>(),
+                        ),
+                        Err(_) => Line::from(line.clone()),
+                    }
+                })
+                .collect::<Vec<_>>()
+        }
+        None => source_lines
+            .iter()
+            .cloned()
+            .map(Line::from)
+            .collect::<Vec<_>>(),
+    };
+
+    add_line_numbers(lines)
+}
+
 fn plain_preview_lines(source: &str) -> Vec<Line<'static>> {
     split_preserving_lines(source)
         .into_iter()
@@ -1386,7 +2106,7 @@ fn add_line_numbers(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
             let mut spans = Vec::with_capacity(line.spans.len() + 1);
             spans.push(Span::styled(
                 format!("{:>width$} | ", index + 1, width = gutter_width),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(app_theme().line_number),
             ));
             spans.append(&mut line.spans);
             line.spans = spans;
@@ -1396,7 +2116,7 @@ fn add_line_numbers(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
 }
 
 fn highlight_editor_line(line: &mut Line<'static>) {
-    let background = Color::Rgb(45, 50, 60);
+    let background = app_theme().line_highlight;
     for span in &mut line.spans {
         span.style = span.style.bg(background);
     }
@@ -1420,6 +2140,16 @@ fn split_preserving_lines(source: &str) -> Vec<String> {
 
 fn normalize_newlines(source: &str) -> String {
     source.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+fn search_result_excerpt(line: &str) -> String {
+    let collapsed = line.replace('\t', " ").trim().to_string();
+    let chars = collapsed.chars().collect::<Vec<_>>();
+    if chars.len() <= 120 {
+        collapsed
+    } else {
+        chars[..117].iter().collect::<String>() + "..."
+    }
 }
 
 fn maybe_trim_trailing_empty_line(lines: &mut Vec<Line<'static>>) {
@@ -1449,6 +2179,11 @@ fn to_ratatui_style(style: syntect::highlighting::Style) -> Style {
             style.foreground.r,
             style.foreground.g,
             style.foreground.b,
+        ))
+        .bg(Color::Rgb(
+            style.background.r,
+            style.background.g,
+            style.background.b,
         ))
         .add_modifier(modifiers)
 }
@@ -1670,6 +2405,71 @@ mod tests {
     }
 
     #[test]
+    fn workspace_tree_starts_collapsed_by_default() {
+        let mut browser = FileBrowserState {
+            entries: vec![
+                FileEntry {
+                    path: PathBuf::from("/tmp/repo/src/app.rs"),
+                    relative_path: PathBuf::from("src/app.rs"),
+                },
+                FileEntry {
+                    path: PathBuf::from("/tmp/repo/src/ui/mod.rs"),
+                    relative_path: PathBuf::from("src/ui/mod.rs"),
+                },
+            ],
+            ..Default::default()
+        };
+
+        browser.sync_collapsed_dirs();
+        browser.rebuild_tree_rows();
+
+        assert_eq!(
+            browser
+                .tree_rows
+                .iter()
+                .map(|row| row.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["└── ▸ src"]
+        );
+    }
+
+    #[test]
+    fn editor_rendered_lines_are_limited_to_visible_viewport() {
+        let path =
+            std::env::temp_dir().join(format!("cmdex-editor-viewport-{}.txt", std::process::id()));
+        fs::write(&path, "one\ntwo\nthree\nfour").unwrap();
+
+        let mut editor = WorkspaceEditorState::open(&path).unwrap();
+        editor.vertical_scroll = 1;
+
+        let lines = editor.rendered_lines(2);
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!(line_text(&lines[0]), "2 | two");
+        assert_eq!(line_text(&lines[1]), "3 | three");
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn editor_render_cache_updates_after_insertions() {
+        let path =
+            std::env::temp_dir().join(format!("cmdex-editor-cache-{}.txt", std::process::id()));
+        fs::write(&path, "hello").unwrap();
+
+        let mut editor = WorkspaceEditorState::open(&path).unwrap();
+        editor.move_line_end();
+        editor.enter_insert_mode();
+        editor.insert_char('!');
+
+        let lines = editor.rendered_lines(1);
+
+        assert_eq!(line_text(&lines[0]), "1 | hello!");
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn splits_git_status_into_changes_and_staged_sections() {
         let root = Path::new("/tmp/repo");
         let output = "\
@@ -1734,5 +2534,57 @@ R  src/old.rs -> src/new_name.rs
                 .collect::<Vec<_>>(),
             vec!["[M] src/app.rs", "[A] src/new.rs", "[R] src/new_name.rs"]
         );
+    }
+
+    #[test]
+    fn parses_unified_diff_hunks_and_removed_lines() {
+        let diff = "\
+@@ -2,2 +2,3 @@
+-old one
+-old two
++new one
++new two
++new three
+";
+
+        let hunks = parse_unified_diff_hunks(diff);
+
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].old_start, 2);
+        assert_eq!(hunks[0].old_count, 2);
+        assert_eq!(hunks[0].new_start, 2);
+        assert_eq!(hunks[0].new_count, 3);
+        assert_eq!(hunks[0].removed_lines, vec!["old one", "old two"]);
+    }
+
+    #[test]
+    fn renders_removed_lines_inside_full_file_diff_preview() {
+        let hunks = vec![DiffHunk {
+            old_start: 2,
+            old_count: 1,
+            new_start: 2,
+            new_count: 1,
+            removed_lines: vec!["old value".to_string()],
+        }];
+
+        let rows = build_diff_preview_rows(
+            Path::new("example.txt"),
+            "one\nnew value\nthree",
+            None,
+            &hunks,
+        );
+        let lines = render_diff_preview_rows(rows);
+
+        assert_eq!(line_text(&lines[0]), "1   | one");
+        assert_eq!(line_text(&lines[1]), "2 - | old value");
+        assert_eq!(line_text(&lines[2]), "2 ~ | new value");
+        assert_eq!(line_text(&lines[3]), "3   | three");
+    }
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
     }
 }

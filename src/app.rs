@@ -16,7 +16,8 @@ use pulldown_cmark::{
 use ratatui::{
     DefaultTerminal, Frame,
     layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
+    symbols::border,
     text::{Line, Span, Text},
     widgets::{
         Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar,
@@ -35,8 +36,10 @@ use crate::config::{
     AgentDefinition, CmdexConfig, compact_home, default_config_path, load_config, save_config,
     validate_agent_input,
 };
+use crate::theme::app_theme;
 use crate::workspace::{
     DiffBrowserState, DiffSection, EditorMode, FileBrowserState, WorkspaceEditorState,
+    WorkspaceSidebarTab,
 };
 use tokio::process::Command;
 
@@ -57,8 +60,8 @@ const TAB_LABELS: [(&str, AppTab); 3] = [
     ("Workspace", AppTab::Workspace),
     ("Git Diff", AppTab::GitDiff),
 ];
-const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-const CONTENT_SCROLL_STEP: u16 = 12;
+const SPINNER: [&str; 8] = ["⠏", "⠛", "⠹", "⢸", "⣰", "⣤", "⣆", "⡇"];
+const CONTENT_SCROLL_STEP: u16 = 4;
 const MOUSE_SCROLL_STEP: u16 = 4;
 const SHELL_OUTPUT_LIMIT: usize = 64_000;
 
@@ -169,6 +172,13 @@ struct GitDiffLayout {
     push_button: Rect,
     pull_button: Rect,
     status: Rect,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WorkspaceSidebarLayout {
+    tabs: Rect,
+    input: Option<Rect>,
+    content: Rect,
 }
 
 impl AgentState {
@@ -334,7 +344,11 @@ impl App {
             }
             AppTab::Workspace => {
                 if let Some(agent) = self.active_agent_mut() {
-                    agent.workspace.move_up();
+                    if agent.workspace.sidebar_tab == WorkspaceSidebarTab::Search {
+                        agent.workspace.search_move_up();
+                    } else {
+                        agent.workspace.move_up();
+                    }
                 }
             }
             AppTab::GitDiff => {
@@ -354,7 +368,11 @@ impl App {
             }
             AppTab::Workspace => {
                 if let Some(agent) = self.active_agent_mut() {
-                    agent.workspace.move_down();
+                    if agent.workspace.sidebar_tab == WorkspaceSidebarTab::Search {
+                        agent.workspace.search_move_down();
+                    } else {
+                        agent.workspace.move_down();
+                    }
                 }
             }
             AppTab::GitDiff => {
@@ -550,6 +568,10 @@ impl App {
             }
         } else if self.current_tab == AppTab::Workspace {
             if let Some(agent) = self.active_agent_mut() {
+                if agent.workspace.sidebar_tab == WorkspaceSidebarTab::Search {
+                    agent.workspace.push_search_char(character);
+                    return;
+                }
                 if let Some(editor) = agent.workspace.editor.as_mut() {
                     match editor.mode {
                         EditorMode::Insert => editor.insert_char(character),
@@ -580,6 +602,10 @@ impl App {
             }
         } else if self.current_tab == AppTab::Workspace {
             if let Some(agent) = self.active_agent_mut() {
+                if agent.workspace.sidebar_tab == WorkspaceSidebarTab::Search {
+                    agent.workspace.pop_search_char();
+                    return;
+                }
                 if let Some(editor) = agent.workspace.editor.as_mut() {
                     match editor.mode {
                         EditorMode::Insert => editor.backspace(),
@@ -619,6 +645,44 @@ impl App {
         {
             let agent = &mut self.agents[agent_index];
             let workspace = &mut agent.workspace;
+
+            if workspace.sidebar_tab == WorkspaceSidebarTab::Search {
+                match key.code {
+                    KeyCode::Esc => {
+                        workspace.set_sidebar_tab(WorkspaceSidebarTab::Files);
+                        return true;
+                    }
+                    KeyCode::Up => {
+                        workspace.search_move_up();
+                        return true;
+                    }
+                    KeyCode::Down => {
+                        workspace.search_move_down();
+                        return true;
+                    }
+                    KeyCode::Enter => {
+                        match workspace.open_selected_search_result() {
+                            Ok(true) => {
+                                if let Some(editor) = workspace.editor.as_mut() {
+                                    editor.ensure_visible(viewport.width, viewport.height);
+                                }
+                            }
+                            Ok(false) => {}
+                            Err(error) => workspace.error = Some(error.to_string()),
+                        }
+                        return true;
+                    }
+                    KeyCode::Backspace => {
+                        workspace.pop_search_char();
+                        return true;
+                    }
+                    KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        workspace.push_search_char(character);
+                        return true;
+                    }
+                    _ => {}
+                }
+            }
 
             if workspace.editor.is_none() {
                 if key.code == KeyCode::Enter {
@@ -1304,17 +1368,21 @@ impl App {
     }
 
     fn compute_layout(&self, area: Rect) -> UiLayout {
+        let frame = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(area);
+
         let root = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(40)])
-            .split(area);
+            .split(frame[0]);
 
         let sidebar = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(LOGO.len() as u16 + 2),
                 Constraint::Min(10),
-                Constraint::Length(1),
             ])
             .split(root[0]);
 
@@ -1344,7 +1412,7 @@ impl App {
                 .split(root[1]);
 
             if self.current_tab == AppTab::Chat {
-                let outer = Block::default().borders(Borders::ALL).title("New Agent");
+                let outer = rounded_block().title("New Agent");
                 let inner = outer.inner(main[1]);
                 let fields = Layout::default()
                     .direction(Direction::Vertical)
@@ -1453,14 +1521,14 @@ impl App {
     }
 
     fn handle_sidebar_click(&mut self, column: u16, row: u16, sidebar_list: Rect) {
-        let inner = inner_rect(sidebar_list);
-        if inner.height == 0 || !rect_contains(inner, column, row) {
-            return;
-        }
-
-        let visible_row = row.saturating_sub(inner.y) as usize;
         match self.current_tab {
             AppTab::Chat => {
+                let inner = inner_rect(sidebar_list);
+                if inner.height == 0 || !rect_contains(inner, column, row) {
+                    return;
+                }
+
+                let visible_row = row.saturating_sub(inner.y) as usize;
                 let total = self.agents.len() + 1;
                 let offset = list_offset(self.chat_sidebar_index, total, inner.height as usize);
                 let index = (offset + visible_row).min(total.saturating_sub(1));
@@ -1468,20 +1536,72 @@ impl App {
             }
             AppTab::Workspace => {
                 if let Some(agent) = self.active_agent_mut() {
-                    let total = agent.workspace.sidebar_len();
-                    if total == 0 {
+                    let layout =
+                        workspace_sidebar_layout(sidebar_list, agent.workspace.sidebar_tab);
+                    if let Some(tab) = workspace_sidebar_tab_from_click(layout.tabs, column, row) {
+                        agent.workspace.set_sidebar_tab(tab);
                         return;
                     }
-                    let offset = list_offset(
-                        agent.workspace.sidebar_selected_row(),
-                        total,
-                        inner.height as usize,
-                    );
-                    let index = (offset + visible_row).min(total.saturating_sub(1));
-                    agent.workspace.select_sidebar_row(index);
+
+                    match agent.workspace.sidebar_tab {
+                        WorkspaceSidebarTab::Files => {
+                            let inner = inner_rect(layout.content);
+                            if inner.height == 0 || !rect_contains(inner, column, row) {
+                                return;
+                            }
+
+                            let visible_row = row.saturating_sub(inner.y) as usize;
+                            let total = agent.workspace.sidebar_len();
+                            if total == 0 {
+                                return;
+                            }
+                            let offset = list_offset(
+                                agent.workspace.sidebar_selected_row(),
+                                total,
+                                inner.height as usize,
+                            );
+                            let index = (offset + visible_row).min(total.saturating_sub(1));
+                            agent.workspace.select_sidebar_row(index);
+                        }
+                        WorkspaceSidebarTab::Search => {
+                            if layout
+                                .input
+                                .is_some_and(|input| rect_contains(input, column, row))
+                            {
+                                return;
+                            }
+
+                            let inner = inner_rect(layout.content);
+                            if inner.height == 0 || !rect_contains(inner, column, row) {
+                                return;
+                            }
+
+                            let visible_row = row.saturating_sub(inner.y) as usize;
+                            let total = agent.workspace.search_total_rows();
+                            if total == 0 {
+                                return;
+                            }
+                            let offset = list_offset(
+                                agent.workspace.search_selected_row(),
+                                total,
+                                inner.height as usize,
+                            );
+                            let index = (offset + visible_row).min(total.saturating_sub(1));
+                            agent.workspace.select_search_row(index);
+                            if let Err(error) = agent.workspace.open_selected_search_result() {
+                                agent.workspace.error = Some(error.to_string());
+                            }
+                        }
+                    }
                 }
             }
             AppTab::GitDiff => {
+                let inner = inner_rect(sidebar_list);
+                if inner.height == 0 || !rect_contains(inner, column, row) {
+                    return;
+                }
+
+                let visible_row = row.saturating_sub(inner.y) as usize;
                 if let Some(agent) = self.active_agent_mut() {
                     let total = agent.git_diff.visible_entries().len();
                     if total == 0 {
@@ -1658,7 +1778,7 @@ pub async fn run(terminal: &mut DefaultTerminal) -> Result<()> {
     hydrate_latest_sessions(&mut app, &codex).await?;
 
     let mut events = EventStream::new();
-    let mut ticker = interval(Duration::from_millis(120));
+    let mut ticker = interval(Duration::from_millis(80));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     app.refresh_current_tab();
@@ -1710,13 +1830,108 @@ pub async fn run(terminal: &mut DefaultTerminal) -> Result<()> {
 
 fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
+    frame.render_widget(Block::default().style(app_background_style()), area);
+    let frame_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(area);
     let root = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(40)])
-        .split(area);
+        .split(frame_layout[0]);
 
-    draw_sidebar(frame, app, root[0]);
     draw_main(frame, app, root[1]);
+    draw_sidebar(frame, app, root[0]);
+    draw_help_line(frame, frame_layout[1]);
+}
+
+fn rounded_block() -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_set(border::ROUNDED)
+        .border_style(Style::default().fg(theme().border))
+        .title_style(
+            Style::default()
+                .fg(theme().yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+}
+
+fn theme() -> &'static crate::theme::AppTheme {
+    app_theme()
+}
+
+fn app_background_style() -> Style {
+    Style::default().bg(theme().app_bg).fg(theme().foreground)
+}
+
+fn panel_style() -> Style {
+    Style::default().bg(theme().panel_bg).fg(theme().foreground)
+}
+
+fn sidebar_style() -> Style {
+    Style::default()
+        .bg(theme().sidebar_bg)
+        .fg(theme().foreground)
+}
+
+fn input_style() -> Style {
+    Style::default().bg(theme().input_bg).fg(theme().foreground)
+}
+
+fn editor_style() -> Style {
+    Style::default().bg(theme().app_bg).fg(theme().foreground)
+}
+
+fn muted_panel_style() -> Style {
+    Style::default().bg(theme().panel_bg).fg(theme().muted)
+}
+
+fn selection_style() -> Style {
+    Style::default()
+        .fg(theme().selection_fg)
+        .bg(theme().selection_bg)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn tab_style() -> Style {
+    Style::default().fg(theme().tab_fg).bg(theme().tab_bg)
+}
+
+fn tab_highlight_style() -> Style {
+    Style::default()
+        .fg(theme().accent)
+        .bg(theme().tab_bg)
+        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+}
+
+fn sidebar_block() -> Block<'static> {
+    rounded_block().style(sidebar_style())
+}
+
+fn panel_block() -> Block<'static> {
+    rounded_block().style(panel_style())
+}
+
+fn input_block() -> Block<'static> {
+    rounded_block().style(input_style())
+}
+
+fn editor_block() -> Block<'static> {
+    rounded_block().style(editor_style())
+}
+
+fn action_style(color: ratatui::style::Color) -> Style {
+    Style::default().bg(theme().panel_bg).fg(color)
+}
+
+fn scrollbar_widget() -> Scrollbar<'static> {
+    Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .begin_symbol(None)
+        .end_symbol(None)
+        .track_symbol(None)
+        .thumb_symbol("█")
+        .thumb_style(Style::default().fg(theme().scrollbar_thumb))
 }
 
 fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
@@ -1725,19 +1940,23 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
         .constraints([
             Constraint::Length(LOGO.len() as u16 + 2),
             Constraint::Min(10),
-            Constraint::Length(1),
         ])
         .split(area);
 
     let logo = Paragraph::new(LOGO.join("\n"))
-        .block(Block::default().borders(Borders::ALL).title("Cmdex"))
-        .style(Style::default().fg(Color::Cyan));
+        .block(sidebar_block())
+        .style(Style::default().fg(theme().accent).bg(theme().sidebar_bg));
     frame.render_widget(logo, chunks[0]);
+
+    if app.current_tab == AppTab::Workspace {
+        draw_workspace_sidebar(frame, app, chunks[1]);
+        return;
+    }
 
     let title = match app.current_tab {
         AppTab::Chat => "Agents",
-        AppTab::Workspace => "Workspace",
         AppTab::GitDiff => "Git Diff",
+        AppTab::Workspace => unreachable!("workspace sidebar is rendered separately"),
     };
 
     let items = app
@@ -1766,18 +1985,173 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(title))
-        .highlight_style(
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )
+        .block(sidebar_block().title(title))
+        .style(sidebar_style())
+        .highlight_style(selection_style())
         .highlight_symbol("› ");
     frame.render_stateful_widget(list, chunks[1], &mut state);
+}
 
-    let help = Paragraph::new("Quit: Ctrl+Q").style(Style::default().fg(Color::DarkGray));
-    frame.render_widget(help, chunks[2]);
+fn draw_help_line(frame: &mut Frame, area: Rect) {
+    let help =
+        Paragraph::new("Quit: Ctrl+Q").style(Style::default().bg(theme().app_bg).fg(theme().muted));
+    frame.render_widget(help, area);
+}
+
+fn draw_workspace_sidebar(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(agent) = app.active_agent() else {
+        let empty = Paragraph::new("Select or create an agent in the Chat tab.")
+            .block(sidebar_block().title("Workspace"))
+            .style(sidebar_style());
+        frame.render_widget(empty, area);
+        return;
+    };
+
+    let layout = workspace_sidebar_layout(area, agent.workspace.sidebar_tab);
+    let tabs = Tabs::new(["Files", "Search"])
+        .select(match agent.workspace.sidebar_tab {
+            WorkspaceSidebarTab::Files => 0,
+            WorkspaceSidebarTab::Search => 1,
+        })
+        .block(sidebar_block().title("Workspace"))
+        .style(sidebar_style())
+        .highlight_style(tab_highlight_style());
+    frame.render_widget(tabs, layout.tabs);
+
+    match agent.workspace.sidebar_tab {
+        WorkspaceSidebarTab::Files => {
+            let items = agent
+                .workspace
+                .sidebar_labels()
+                .into_iter()
+                .map(ListItem::new)
+                .collect::<Vec<_>>();
+            let mut state = ListState::default();
+            state.select(Some(
+                agent
+                    .workspace
+                    .sidebar_selected_row()
+                    .min(items.len().saturating_sub(1)),
+            ));
+
+            let list = List::new(items)
+                .block(sidebar_block().title("Files"))
+                .style(sidebar_style())
+                .highlight_style(selection_style())
+                .highlight_symbol("› ");
+            frame.render_stateful_widget(list, layout.content, &mut state);
+        }
+        WorkspaceSidebarTab::Search => {
+            let input = Paragraph::new(agent.workspace.search_query.as_str())
+                .block(panel_block().title("Search"))
+                .style(panel_style());
+            if let Some(input_area) = layout.input {
+                frame.render_widget(input, input_area);
+            }
+
+            let labels = if agent.workspace.search_query.trim().is_empty() {
+                vec!["Type to search".to_string()]
+            } else {
+                let labels = agent.workspace.search_rows_labels();
+                if labels.is_empty() {
+                    vec!["No matches".to_string()]
+                } else {
+                    labels
+                }
+            };
+            let items = labels.into_iter().map(ListItem::new).collect::<Vec<_>>();
+            let mut state = ListState::default();
+            if agent.workspace.search_total_rows() > 0 {
+                state.select(Some(
+                    agent
+                        .workspace
+                        .search_selected_row()
+                        .min(items.len().saturating_sub(1)),
+                ));
+            }
+            let list = List::new(items)
+                .block(sidebar_block().title(format!(
+                    "Results ({})",
+                    agent.workspace.search_match_count()
+                )))
+                .style(sidebar_style())
+                .highlight_style(selection_style())
+                .highlight_symbol("› ");
+            frame.render_stateful_widget(list, layout.content, &mut state);
+
+            if let Some(input_area) = layout.input {
+                let cursor_x = input_area
+                    .x
+                    .saturating_add(1 + agent.workspace.search_query.chars().count() as u16)
+                    .min(input_area.x + input_area.width.saturating_sub(2));
+                frame.set_cursor_position((cursor_x, input_area.y + 1));
+            }
+        }
+    }
+}
+
+fn workspace_sidebar_layout(
+    area: Rect,
+    sidebar_tab: WorkspaceSidebarTab,
+) -> WorkspaceSidebarLayout {
+    match sidebar_tab {
+        WorkspaceSidebarTab::Files => {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(3), Constraint::Min(4)])
+                .split(area);
+            WorkspaceSidebarLayout {
+                tabs: chunks[0],
+                input: None,
+                content: chunks[1],
+            }
+        }
+        WorkspaceSidebarTab::Search => {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Length(3),
+                    Constraint::Min(4),
+                ])
+                .split(area);
+            WorkspaceSidebarLayout {
+                tabs: chunks[0],
+                input: Some(chunks[1]),
+                content: chunks[2],
+            }
+        }
+    }
+}
+
+fn workspace_sidebar_tab_from_click(
+    area: Rect,
+    column: u16,
+    row: u16,
+) -> Option<WorkspaceSidebarTab> {
+    let inner = inner_rect(area);
+    if inner.width == 0 || inner.height == 0 {
+        return None;
+    }
+
+    let files_width = "Files".chars().count() as u16;
+    let search_width = "Search".chars().count() as u16;
+    let files = Rect::new(inner.x, inner.y, files_width.min(inner.width), 1);
+    let search_x = inner.x.saturating_add(files_width).saturating_add(3);
+    let search = Rect::new(
+        search_x,
+        inner.y,
+        search_width.min(inner.x.saturating_add(inner.width).saturating_sub(search_x)),
+        1,
+    );
+
+    if rect_contains(files, column, row) {
+        Some(WorkspaceSidebarTab::Files)
+    } else if rect_contains(search, column, row) {
+        Some(WorkspaceSidebarTab::Search)
+    } else {
+        None
+    }
 }
 
 fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
@@ -1839,12 +2213,9 @@ fn tab_from_click(tabs: Rect, column: u16, row: u16) -> Option<AppTab> {
 fn draw_main(frame: &mut Frame, app: &App, area: Rect) {
     let tabs = Tabs::new(TAB_LABELS.map(|(label, _)| label))
         .select(app.selected_tab_index())
-        .block(Block::default().borders(Borders::ALL))
-        .highlight_style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-        );
+        .block(rounded_block().style(tab_style()))
+        .style(tab_style())
+        .highlight_style(tab_highlight_style());
 
     if app.current_tab == AppTab::Chat && !app.add_agent_selected() {
         let input_height = chat_input_height_for_main_area(&app.chat_input, area);
@@ -1877,7 +2248,8 @@ fn draw_main(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_chat(frame: &mut Frame, app: &App, area: Rect) {
     let Some(agent) = app.active_agent() else {
         let empty = Paragraph::new("Add an agent from the sidebar to start chatting.")
-            .block(Block::default().borders(Borders::ALL).title("Chat"));
+            .block(panel_block().title("Chat"))
+            .style(panel_style());
         frame.render_widget(empty, area);
         return;
     };
@@ -1901,7 +2273,8 @@ fn draw_chat(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     let chat = Paragraph::new(text)
-        .block(Block::default().borders(Borders::ALL).title(title))
+        .block(panel_block().title(title))
+        .style(panel_style())
         .scroll((scroll, 0))
         .wrap(Wrap { trim: false });
     frame.render_widget(chat, area);
@@ -1936,7 +2309,8 @@ fn draw_chat_input(frame: &mut Frame, app: &App, area: Rect) {
             .map(Line::from)
             .collect::<Vec<_>>(),
     ))
-    .block(Block::default().borders(Borders::ALL).title(title))
+    .block(panel_block().title(title))
+    .style(panel_style())
     .wrap(Wrap { trim: false });
     frame.render_widget(input, area);
 
@@ -1958,7 +2332,7 @@ fn draw_chat_input(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_add_agent_form(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Clear, area);
-    let outer = Block::default().borders(Borders::ALL).title("New Agent");
+    let outer = panel_block().title("New Agent");
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
 
@@ -1974,7 +2348,7 @@ fn draw_add_agent_form(frame: &mut Frame, app: &App, area: Rect) {
         .split(inner);
 
     let help = Paragraph::new("Use Tab to switch fields and Enter to save the agent.")
-        .style(Style::default().fg(Color::DarkGray));
+        .style(muted_panel_style());
     frame.render_widget(help, chunks[0]);
 
     let name_title = if app.add_form.active_field == AddAgentField::Name {
@@ -1989,12 +2363,11 @@ fn draw_add_agent_form(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     let name = Paragraph::new(app.add_form.name.as_str())
-        .block(Block::default().borders(Borders::ALL).title(name_title));
-    let workspace = Paragraph::new(app.add_form.workspace.as_str()).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(workspace_title),
-    );
+        .block(input_block().title(name_title))
+        .style(input_style());
+    let workspace = Paragraph::new(app.add_form.workspace.as_str())
+        .block(input_block().title(workspace_title))
+        .style(input_style());
     frame.render_widget(name, chunks[1]);
     frame.render_widget(workspace, chunks[2]);
 
@@ -2003,12 +2376,13 @@ fn draw_add_agent_form(frame: &mut Frame, app: &App, area: Rect) {
         .error
         .clone()
         .unwrap_or_else(|| "Saved agents live in ~/.cmdex.yml".to_string());
-    let status =
-        Paragraph::new(status).style(Style::default().fg(if app.add_form.error.is_some() {
-            Color::Red
+    let status = Paragraph::new(status).style(Style::default().bg(theme().panel_bg).fg(
+        if app.add_form.error.is_some() {
+            theme().error
         } else {
-            Color::DarkGray
-        }));
+            theme().muted
+        },
+    ));
     frame.render_widget(status, chunks[3]);
 
     let target = match app.add_form.active_field {
@@ -2029,7 +2403,8 @@ fn draw_add_agent_form(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_workspace(frame: &mut Frame, app: &App, area: Rect) {
     let Some(agent) = app.active_agent() else {
         let empty = Paragraph::new("Select or create an agent in the Chat tab.")
-            .block(Block::default().borders(Borders::ALL).title("Workspace"));
+            .block(panel_block().title("Workspace"))
+            .style(panel_style());
         frame.render_widget(empty, area);
         return;
     };
@@ -2049,17 +2424,14 @@ fn draw_workspace(frame: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::from(String::new()));
         lines.push(Line::from(Span::styled(
             error.clone(),
-            Style::default().fg(Color::Red),
+            Style::default().fg(theme().error).bg(theme().panel_bg),
         )));
     }
     let content_length = preview_content_height(&lines, area.width.saturating_sub(2));
 
     let widget = Paragraph::new(Text::from(lines))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(agent.workspace.preview_title.clone()),
-        )
+        .block(panel_block().title(agent.workspace.preview_title.clone()))
+        .style(panel_style())
         .scroll((agent.workspace.content_scroll, 0))
         .wrap(Wrap { trim: false });
     frame.render_widget(widget, area);
@@ -2073,19 +2445,15 @@ fn draw_workspace_editor(frame: &mut Frame, editor: &WorkspaceEditorState, area:
         EditorMode::Command => "COMMAND",
     };
     let dirty = if editor.dirty { " [+]" } else { "" };
-    let block = Block::default().borders(Borders::ALL).title(format!(
-        "{}{} [{}]",
-        editor.path.display(),
-        dirty,
-        mode
-    ));
+    let block = editor_block().title(format!("{}{} [{}]", editor.path.display(), dirty, mode));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     let (code_area, status_area) = workspace_editor_panes(inner);
-    let lines = editor.rendered_lines();
+    let lines = editor.rendered_lines(code_area.height);
     let code = Paragraph::new(Text::from(lines))
-        .scroll((editor.vertical_scroll, editor.horizontal_scroll));
+        .style(editor_style())
+        .scroll((0, editor.horizontal_scroll));
     frame.render_widget(code, code_area);
     render_vertical_scrollbar_with_viewport(
         frame,
@@ -2096,7 +2464,8 @@ fn draw_workspace_editor(frame: &mut Frame, editor: &WorkspaceEditorState, area:
 
     if let Some(status_area) = status_area {
         let status = workspace_editor_status(editor);
-        let status_widget = Paragraph::new(status).style(Style::default().fg(Color::DarkGray));
+        let status_widget =
+            Paragraph::new(status).style(Style::default().bg(theme().app_bg).fg(theme().muted));
         frame.render_widget(status_widget, status_area);
     }
 
@@ -2143,7 +2512,8 @@ fn draw_workspace_editor(frame: &mut Frame, editor: &WorkspaceEditorState, area:
 fn draw_git_diff(frame: &mut Frame, app: &App, area: Rect) {
     let Some(agent) = app.active_agent() else {
         let empty = Paragraph::new("Select or create an agent in the Chat tab.")
-            .block(Block::default().borders(Borders::ALL).title("Git Diff"));
+            .block(panel_block().title("Git Diff"))
+            .style(panel_style());
         frame.render_widget(empty, area);
         return;
     };
@@ -2157,26 +2527,20 @@ fn draw_git_diff(frame: &mut Frame, app: &App, area: Rect) {
         DiffSection::Changes => 0,
         DiffSection::Staged => 1,
     })
-    .block(Block::default().borders(Borders::ALL).title(format!(
+    .block(rounded_block().style(tab_style()).title(format!(
         "Files · {}",
         compact_home(&agent.definition.workspace)
     )))
-    .highlight_style(
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-    );
+    .style(tab_style())
+    .highlight_style(tab_highlight_style());
     frame.render_widget(tabs, layout.sections);
 
     let preview_lines = agent.git_diff.preview.clone();
     let content_length =
         preview_content_height(&preview_lines, layout.preview.width.saturating_sub(2));
     let widget = Paragraph::new(Text::from(preview_lines))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(agent.git_diff.preview_title.clone()),
-        )
+        .block(editor_block().title(agent.git_diff.preview_title.clone()))
+        .style(editor_style())
         .scroll((agent.git_diff.content_scroll, 0))
         .wrap(Wrap { trim: false });
     frame.render_widget(widget, layout.preview);
@@ -2193,7 +2557,8 @@ fn draw_git_diff(frame: &mut Frame, app: &App, area: Rect) {
         layout.commit_input.width.saturating_sub(2),
     );
     let commit_input = Paragraph::new(commit_text.as_str())
-        .block(Block::default().borders(Borders::ALL).title(commit_title));
+        .block(panel_block().title(commit_title))
+        .style(panel_style());
     frame.render_widget(commit_input, layout.commit_input);
 
     let stage_label = match agent.git_diff.active_section {
@@ -2202,38 +2567,43 @@ fn draw_git_diff(frame: &mut Frame, app: &App, area: Rect) {
     };
     let stage_button = Paragraph::new(stage_label)
         .alignment(Alignment::Center)
-        .block(Block::default().borders(Borders::ALL).title("Action"));
+        .style(action_style(theme().foreground))
+        .block(panel_block().title("Action"));
     frame.render_widget(stage_button, layout.stage_button);
 
     let discard_style = match agent.git_diff.active_section {
-        DiffSection::Changes => Style::default().fg(Color::Red),
-        DiffSection::Staged => Style::default().fg(Color::DarkGray),
+        DiffSection::Changes => action_style(theme().error),
+        DiffSection::Staged => action_style(theme().muted),
     };
     let discard_button = Paragraph::new("Discard")
         .alignment(Alignment::Center)
         .style(discard_style)
-        .block(Block::default().borders(Borders::ALL).title("Action"));
+        .block(panel_block().title("Action"));
     frame.render_widget(discard_button, layout.discard_button);
 
     let push_button = Paragraph::new("Push")
         .alignment(Alignment::Center)
-        .block(Block::default().borders(Borders::ALL).title("Action"));
+        .style(action_style(theme().accent))
+        .block(panel_block().title("Action"));
     frame.render_widget(push_button, layout.push_button);
 
     let pull_button = Paragraph::new("Pull")
         .alignment(Alignment::Center)
-        .block(Block::default().borders(Borders::ALL).title("Action"));
+        .style(action_style(theme().foreground))
+        .block(panel_block().title("Action"));
     frame.render_widget(pull_button, layout.pull_button);
 
     let status = if let Some(error) = &agent.git_diff.error {
-        Paragraph::new(error.as_str()).style(Style::default().fg(Color::Red))
+        Paragraph::new(error.as_str())
+            .style(Style::default().bg(theme().panel_bg).fg(theme().error))
     } else if let Some(status) = &agent.git_diff.status {
-        Paragraph::new(status.as_str()).style(Style::default().fg(Color::Green))
+        Paragraph::new(status.as_str())
+            .style(Style::default().bg(theme().panel_bg).fg(theme().success))
     } else {
         Paragraph::new(
             "Tab/Left/Right switches sections. Ctrl+S stages, Ctrl+U unstages, Ctrl+D discards changes, Enter commits staged changes.",
         )
-            .style(Style::default().fg(Color::DarkGray))
+            .style(muted_panel_style())
     };
     frame.render_widget(status, layout.status);
 
@@ -2332,13 +2702,16 @@ fn render_vertical_scrollbar(frame: &mut Frame, area: Rect, content_length: usiz
     if inner_width == 0 || inner_height == 0 {
         return;
     }
+    if content_length <= inner_height as usize {
+        return;
+    }
 
     let mut state = ScrollbarState::new(content_length.max(1))
         .position(scroll as usize)
         .viewport_content_length(inner_height as usize);
 
     frame.render_stateful_widget(
-        Scrollbar::new(ScrollbarOrientation::VerticalRight),
+        scrollbar_widget(),
         area.inner(Margin {
             vertical: 1,
             horizontal: 0,
@@ -2356,6 +2729,9 @@ fn render_vertical_scrollbar_with_viewport(
     if viewport.width == 0 || viewport.height == 0 {
         return;
     }
+    if content_length <= viewport.height as usize {
+        return;
+    }
 
     let mut state = ScrollbarState::new(content_length.max(1))
         .position(scroll as usize)
@@ -2367,11 +2743,7 @@ fn render_vertical_scrollbar_with_viewport(
         1,
         viewport.height,
     );
-    frame.render_stateful_widget(
-        Scrollbar::new(ScrollbarOrientation::VerticalRight),
-        scrollbar_area,
-        &mut state,
-    );
+    frame.render_stateful_widget(scrollbar_widget(), scrollbar_area, &mut state);
 }
 
 fn workspace_editor_panes(inner: Rect) -> (Rect, Option<Rect>) {
@@ -2500,11 +2872,11 @@ fn chat_max_scroll(agent: &AgentState, area: Rect) -> u16 {
 
 fn render_chat_message_lines(message: &ChatMessage, agent_name: &str) -> Vec<Line<'static>> {
     let role = match message.role {
-        MessageRole::User => ("You", Color::Yellow),
-        MessageRole::Assistant => (agent_name, Color::Green),
-        MessageRole::Event => ("Event", Color::Cyan),
-        MessageRole::System => ("System", Color::Red),
-        MessageRole::Shell => ("Shell", Color::Magenta),
+        MessageRole::User => ("You", theme().yellow),
+        MessageRole::Assistant => (agent_name, theme().green),
+        MessageRole::Event => ("Event", theme().cyan),
+        MessageRole::System => ("System", theme().red),
+        MessageRole::Shell => ("Shell", theme().magenta),
     };
 
     let mut lines = vec![Line::from(vec![Span::styled(
@@ -2616,7 +2988,7 @@ impl MarkdownRenderer {
                         self.push_text(
                             &format!("```{language}"),
                             Style::default()
-                                .fg(Color::DarkGray)
+                                .fg(theme().muted)
                                 .add_modifier(Modifier::ITALIC),
                         );
                         self.push_line();
@@ -2651,7 +3023,7 @@ impl MarkdownRenderer {
             Tag::Image { dest_url, .. } => {
                 self.push_text(
                     &format!("[image: {}]", dest_url),
-                    Style::default().fg(Color::Magenta),
+                    Style::default().fg(theme().magenta),
                 );
             }
             _ => {}
@@ -2761,7 +3133,7 @@ impl MarkdownRenderer {
 
         for _ in 0..self.blockquote_depth {
             self.current_spans
-                .push(Span::styled("> ", Style::default().fg(Color::DarkGray)));
+                .push(Span::styled("> ", Style::default().fg(theme().muted)));
         }
     }
 
@@ -2778,7 +3150,7 @@ impl MarkdownRenderer {
             style = style.add_modifier(Modifier::CROSSED_OUT);
         }
         if self.heading_level.is_some() {
-            style = style.fg(Color::Cyan);
+            style = style.fg(theme().accent);
         }
 
         style
@@ -2791,25 +3163,25 @@ impl MarkdownRenderer {
 
 fn inline_code_style() -> Style {
     Style::default()
-        .fg(Color::Yellow)
-        .bg(Color::Rgb(40, 44, 52))
+        .fg(theme().inline_code_fg)
+        .bg(theme().inline_code_bg)
 }
 
 fn html_style() -> Style {
     Style::default()
-        .fg(Color::Magenta)
+        .fg(theme().magenta)
         .add_modifier(Modifier::ITALIC)
 }
 
 fn task_marker_style() -> Style {
     Style::default()
-        .fg(Color::DarkGray)
+        .fg(theme().muted)
         .add_modifier(Modifier::BOLD)
 }
 
 fn link_style() -> Style {
     Style::default()
-        .fg(Color::Blue)
+        .fg(theme().blue)
         .add_modifier(Modifier::UNDERLINED)
 }
 
