@@ -729,7 +729,7 @@ impl WorkspaceEditorState {
     }
 
     pub fn rendered_lines(&self, viewport_height: u16) -> Vec<Line<'static>> {
-        let start = self.vertical_scroll as usize;
+        let start = self.clamped_vertical_scroll(viewport_height) as usize;
         let end = start
             .saturating_add(usize::from(viewport_height.max(1)))
             .min(self.render_cache.lines.len());
@@ -746,6 +746,22 @@ impl WorkspaceEditorState {
 
     pub fn content_height(&self) -> usize {
         self.render_cache.lines.len().max(1)
+    }
+
+    pub fn clamped_vertical_scroll(&self, viewport_height: u16) -> u16 {
+        self.vertical_scroll
+            .min(self.max_vertical_scroll(viewport_height))
+    }
+
+    pub fn scroll_up(&mut self, lines: u16) {
+        self.vertical_scroll = self.vertical_scroll.saturating_sub(lines);
+    }
+
+    pub fn scroll_down(&mut self, lines: u16, viewport_height: u16) {
+        self.vertical_scroll = self
+            .vertical_scroll
+            .saturating_add(lines)
+            .min(self.max_vertical_scroll(viewport_height));
     }
 
     pub fn gutter_width(&self) -> usize {
@@ -1020,6 +1036,11 @@ impl WorkspaceEditorState {
 
     fn rebuild_render_cache(&mut self) {
         self.render_cache.lines = build_editor_render_lines(&self.path, &self.lines);
+    }
+
+    fn max_vertical_scroll(&self, viewport_height: u16) -> u16 {
+        self.content_height()
+            .saturating_sub(usize::from(viewport_height.max(1))) as u16
     }
 }
 
@@ -2447,6 +2468,24 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert_eq!(line_text(&lines[0]), "2 | two");
         assert_eq!(line_text(&lines[1]), "3 | three");
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn editor_rendered_lines_clamp_out_of_bounds_scroll() {
+        let path =
+            std::env::temp_dir().join(format!("cmdex-editor-scroll-{}.txt", std::process::id()));
+        fs::write(&path, "one\ntwo\nthree\nfour").unwrap();
+
+        let mut editor = WorkspaceEditorState::open(&path).unwrap();
+        editor.vertical_scroll = 99;
+
+        let lines = editor.rendered_lines(2);
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!(line_text(&lines[0]), "3 | three");
+        assert_eq!(line_text(&lines[1]), "4 | four");
 
         let _ = fs::remove_file(path);
     }

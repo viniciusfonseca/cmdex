@@ -384,16 +384,16 @@ impl App {
         }
     }
 
-    fn scroll_content_up(&mut self) {
-        self.scroll_content_up_by(CONTENT_SCROLL_STEP);
+    fn scroll_content_up(&mut self, area: Rect) {
+        self.scroll_content_up_by(area, CONTENT_SCROLL_STEP);
     }
 
-    fn scroll_content_up_by(&mut self, lines: u16) {
+    fn scroll_content_up_by(&mut self, _area: Rect, lines: u16) {
         match self.current_tab {
             AppTab::Workspace => {
                 if let Some(agent) = self.active_agent_mut() {
                     if let Some(editor) = agent.workspace.editor.as_mut() {
-                        editor.vertical_scroll = editor.vertical_scroll.saturating_sub(lines);
+                        editor.scroll_up(lines);
                         return;
                     }
                 }
@@ -425,16 +425,17 @@ impl App {
         }
     }
 
-    fn scroll_content_down(&mut self) {
-        self.scroll_content_down_by(CONTENT_SCROLL_STEP);
+    fn scroll_content_down(&mut self, area: Rect) {
+        self.scroll_content_down_by(area, CONTENT_SCROLL_STEP);
     }
 
-    fn scroll_content_down_by(&mut self, lines: u16) {
+    fn scroll_content_down_by(&mut self, area: Rect, lines: u16) {
         match self.current_tab {
             AppTab::Workspace => {
                 if let Some(agent) = self.active_agent_mut() {
                     if let Some(editor) = agent.workspace.editor.as_mut() {
-                        editor.vertical_scroll = editor.vertical_scroll.saturating_add(lines);
+                        let viewport = workspace_editor_viewport(area);
+                        editor.scroll_down(lines, viewport.height);
                         return;
                     }
                 }
@@ -521,14 +522,14 @@ impl App {
                 if self.current_tab == AppTab::Chat && !self.add_agent_selected() {
                     self.scroll_chat_up(self.compute_layout(area).body, CONTENT_SCROLL_STEP);
                 } else {
-                    self.scroll_content_up();
+                    self.scroll_content_up(self.compute_layout(area).body);
                 }
             }
             KeyCode::PageDown => {
                 if self.current_tab == AppTab::Chat && !self.add_agent_selected() {
                     self.scroll_chat_down(self.compute_layout(area).body, CONTENT_SCROLL_STEP);
                 } else {
-                    self.scroll_content_down();
+                    self.scroll_content_down(self.compute_layout(area).body);
                 }
             }
             KeyCode::F(5) => self.refresh_current_tab(),
@@ -1513,9 +1514,9 @@ impl App {
                     self.scroll_chat_down(layout.body, MOUSE_SCROLL_STEP);
                 }
             } else if up {
-                self.scroll_content_up_by(MOUSE_SCROLL_STEP);
+                self.scroll_content_up_by(layout.body, MOUSE_SCROLL_STEP);
             } else {
-                self.scroll_content_down_by(MOUSE_SCROLL_STEP);
+                self.scroll_content_down_by(layout.body, MOUSE_SCROLL_STEP);
             }
         }
     }
@@ -2450,6 +2451,7 @@ fn draw_workspace_editor(frame: &mut Frame, editor: &WorkspaceEditorState, area:
     frame.render_widget(block, area);
 
     let (code_area, status_area) = workspace_editor_panes(inner);
+    let vertical_scroll = editor.clamped_vertical_scroll(code_area.height);
     let lines = editor.rendered_lines(code_area.height);
     let code = Paragraph::new(Text::from(lines))
         .style(editor_style())
@@ -2459,7 +2461,7 @@ fn draw_workspace_editor(frame: &mut Frame, editor: &WorkspaceEditorState, area:
         frame,
         code_area,
         editor.content_height(),
-        editor.vertical_scroll,
+        vertical_scroll,
     );
 
     if let Some(status_area) = status_area {
@@ -2484,10 +2486,7 @@ fn draw_workspace_editor(frame: &mut Frame, editor: &WorkspaceEditorState, area:
                 return;
             }
 
-            let visible_row = editor
-                .cursor_row
-                .saturating_sub(editor.vertical_scroll as usize)
-                as u16;
+            let visible_row = editor.cursor_row.saturating_sub(vertical_scroll as usize) as u16;
             if visible_row >= code_area.height {
                 return;
             }
