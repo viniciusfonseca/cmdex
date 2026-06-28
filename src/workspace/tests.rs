@@ -382,6 +382,25 @@ R  src/old.rs -> src/new_name.rs
 }
 
 #[test]
+fn git_remote_action_state_blocks_concurrent_actions_and_clears_on_failure() {
+    let mut diff = DiffBrowserState::default();
+
+    diff.begin_remote_action(GitRemoteAction::Push).unwrap();
+    assert_eq!(diff.remote_action, Some(GitRemoteAction::Push));
+    assert!(diff.begin_remote_action(GitRemoteAction::Pull).is_err());
+
+    diff.complete_remote_action(
+        Path::new("/tmp"),
+        GitRemoteAction::Push,
+        false,
+        "push failed".to_string(),
+    );
+
+    assert_eq!(diff.remote_action, None);
+    assert_eq!(diff.error.as_deref(), Some("push failed"));
+}
+
+#[test]
 fn parses_unified_diff_hunks_and_removed_lines() {
     let diff = "\
 @@ -2,2 +2,3 @@

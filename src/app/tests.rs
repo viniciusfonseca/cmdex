@@ -6,9 +6,10 @@ use super::{
         resolve_chat_model_label, shell_command_from_input,
     },
     ui::{
-        chat_input_height_for_main_area, list_offset, scroll_position_from_row,
-        scrollable_preview_content_height, scrollable_text_height, scrollbar_thumb_bounds,
-        vertical_scrollbar_metrics, wrapped_chat_input_lines, wrapped_text_height,
+        chat_input_height_for_main_area, git_diff_remote_button_label, list_offset,
+        scroll_position_from_row, scrollable_preview_content_height, scrollable_text_height,
+        scrollbar_thumb_bounds, vertical_scrollbar_metrics, wrapped_chat_input_lines,
+        wrapped_text_height,
     },
     *,
 };
@@ -26,6 +27,28 @@ fn list_offset_scrolls_long_lists_to_keep_selection_visible() {
     assert_eq!(list_offset(3, 10, 4), 0);
     assert_eq!(list_offset(4, 10, 4), 1);
     assert_eq!(list_offset(9, 10, 4), 6);
+}
+
+#[test]
+fn git_diff_remote_button_label_shows_spinner_only_for_active_action() {
+    assert_eq!(
+        git_diff_remote_button_label(
+            "Push",
+            Some(GitRemoteAction::Push),
+            GitRemoteAction::Push,
+            2,
+        ),
+        format!("{} Push", SPINNER[2])
+    );
+    assert_eq!(
+        git_diff_remote_button_label(
+            "Pull",
+            Some(GitRemoteAction::Push),
+            GitRemoteAction::Pull,
+            2,
+        ),
+        "Pull"
+    );
 }
 
 #[test]

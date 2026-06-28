@@ -173,20 +173,41 @@ impl DiffBrowserState {
         Ok(())
     }
 
-    pub fn push(&mut self, root: &Path) -> Result<()> {
-        let output = run_git_command(root, &["push"])?;
-        self.status = Some(output);
+    pub fn begin_remote_action(&mut self, action: GitRemoteAction) -> Result<()> {
+        if let Some(active) = self.remote_action {
+            return Err(anyhow::anyhow!(format!(
+                "Wait for git {} to finish first.",
+                active.label().to_lowercase()
+            )));
+        }
+
+        self.remote_action = Some(action);
         self.error = None;
-        self.refresh(root);
+        self.status = Some(format!(
+            "Git {} in progress...",
+            action.label().to_lowercase()
+        ));
         Ok(())
     }
 
-    pub fn pull(&mut self, root: &Path) -> Result<()> {
-        let output = run_git_command(root, &["pull", "--ff-only"])?;
-        self.status = Some(output);
-        self.error = None;
-        self.refresh(root);
-        Ok(())
+    pub fn complete_remote_action(
+        &mut self,
+        root: &Path,
+        action: GitRemoteAction,
+        success: bool,
+        message: String,
+    ) {
+        if self.remote_action == Some(action) {
+            self.remote_action = None;
+        }
+
+        if success {
+            self.status = Some(message);
+            self.error = None;
+            self.refresh(root);
+        } else {
+            self.error = Some(message);
+        }
     }
 
     pub fn visible_entries(&self) -> &[DiffEntry] {
@@ -258,6 +279,22 @@ impl DiffBrowserState {
         };
         self.preview = read_diff_preview(root, &entry, self.active_section)?;
         Ok(())
+    }
+}
+
+impl GitRemoteAction {
+    pub fn label(self) -> &'static str {
+        match self {
+            GitRemoteAction::Push => "Push",
+            GitRemoteAction::Pull => "Pull",
+        }
+    }
+}
+
+pub(crate) fn run_git_remote_action(root: &Path, action: GitRemoteAction) -> Result<String> {
+    match action {
+        GitRemoteAction::Push => run_git_command(root, &["push"]),
+        GitRemoteAction::Pull => run_git_command(root, &["pull", "--ff-only"]),
     }
 }
 

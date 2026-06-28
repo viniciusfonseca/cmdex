@@ -46,8 +46,8 @@ use crate::config::{
 };
 use crate::theme::app_theme;
 use crate::workspace::{
-    DiffBrowserState, DiffSection, EditorMode, FileBrowserState, WorkspaceEditorState,
-    WorkspaceSidebarTab,
+    DiffBrowserState, DiffSection, EditorMode, FileBrowserState, GitRemoteAction,
+    WorkspaceEditorState, WorkspaceSidebarTab,
 };
 use tokio::process::Command;
 
@@ -105,6 +105,12 @@ enum UiEvent {
     },
     TurnInterruptFailed {
         agent_index: usize,
+        message: String,
+    },
+    GitDiffRemoteCompleted {
+        agent_index: usize,
+        action: GitRemoteAction,
+        success: bool,
         message: String,
     },
 }
@@ -472,7 +478,7 @@ pub async fn run(terminal: &mut DefaultTerminal) -> Result<()> {
                     }
                     Some(Ok(Event::Mouse(mouse))) => {
                         let (width, height) = terminal_size()?;
-                        app.handle_mouse(mouse, Rect::new(0, 0, width, height));
+                        app.handle_mouse(mouse, Rect::new(0, 0, width, height), &ui_tx);
                     }
                     Some(Ok(Event::Paste(text))) => {
                         for character in text.chars() {

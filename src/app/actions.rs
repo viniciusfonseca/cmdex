@@ -1,4 +1,6 @@
 use super::{chat::*, ui::*, *};
+use crate::workspace::run_git_remote_action;
+use tokio::task;
 
 impl App {
     pub(super) fn sidebar_labels(&self) -> Vec<String> {
@@ -173,7 +175,12 @@ impl App {
         }
     }
 
-    pub(super) fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) {
+    pub(super) fn handle_mouse(
+        &mut self,
+        mouse: MouseEvent,
+        area: Rect,
+        ui_tx: &mpsc::UnboundedSender<UiEvent>,
+    ) {
         let layout = self.compute_layout(area);
 
         match mouse.kind {
@@ -181,7 +188,7 @@ impl App {
                 if self.handle_scrollbar_press(mouse.column, mouse.row, layout) {
                     return;
                 }
-                self.handle_left_click(mouse.column, mouse.row, layout);
+                self.handle_left_click(mouse.column, mouse.row, layout, ui_tx);
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 if self.handle_scrollbar_drag(mouse.row, layout) {
@@ -425,7 +432,7 @@ impl App {
         if self.handle_workspace_key(key, area) {
             return;
         }
-        if self.handle_git_diff_key(key) {
+        if self.handle_git_diff_key(key, ui_tx) {
             return;
         }
 
@@ -835,7 +842,11 @@ impl App {
         handled || saved || close
     }
 
-    fn handle_git_diff_key(&mut self, key: KeyEvent) -> bool {
+    fn handle_git_diff_key(
+        &mut self,
+        key: KeyEvent,
+        _ui_tx: &mpsc::UnboundedSender<UiEvent>,
+    ) -> bool {
         if self.current_tab != AppTab::GitDiff {
             return false;
         }
@@ -895,6 +906,10 @@ impl App {
             self.status_message = Some("Add an agent before committing changes.".to_string());
             return;
         };
+        if agent.git_diff.remote_action.is_some() {
+            agent.git_diff.error = Some("Wait for git push/pull to finish.".to_string());
+            return;
+        }
 
         let root = agent.definition.workspace.clone();
         match agent.git_diff.commit(&root) {
@@ -908,6 +923,10 @@ impl App {
             self.status_message = Some("Add an agent before staging changes.".to_string());
             return;
         };
+        if agent.git_diff.remote_action.is_some() {
+            agent.git_diff.error = Some("Wait for git push/pull to finish.".to_string());
+            return;
+        }
 
         let root = agent.definition.workspace.clone();
         match agent.git_diff.stage_selected(&root) {
@@ -921,6 +940,10 @@ impl App {
             self.status_message = Some("Add an agent before unstaging changes.".to_string());
             return;
         };
+        if agent.git_diff.remote_action.is_some() {
+            agent.git_diff.error = Some("Wait for git push/pull to finish.".to_string());
+            return;
+        }
 
         let root = agent.definition.workspace.clone();
         match agent.git_diff.unstage_selected(&root) {
@@ -934,6 +957,10 @@ impl App {
             self.status_message = Some("Add an agent before discarding changes.".to_string());
             return;
         };
+        if agent.git_diff.remote_action.is_some() {
+            agent.git_diff.error = Some("Wait for git push/pull to finish.".to_string());
+            return;
+        }
 
         let root = agent.definition.workspace.clone();
         match agent.git_diff.discard_selected(&root) {
@@ -942,30 +969,78 @@ impl App {
         }
     }
 
-    fn push_git_diff_changes(&mut self) {
-        let Some(agent) = self.active_agent_mut() else {
+    fn push_git_diff_changes(&mut self, ui_tx: &mpsc::UnboundedSender<UiEvent>) {
+        let Some(agent_index) = self.current_agent else {
             self.status_message = Some("Add an agent before pushing changes.".to_string());
             return;
         };
 
-        let root = agent.definition.workspace.clone();
-        match agent.git_diff.push(&root) {
-            Ok(()) => agent.workspace.refresh(&root),
-            Err(error) => agent.git_diff.error = Some(error.to_string()),
+        let root = self.agents[agent_index].definition.workspace.clone();
+        match self.agents[agent_index]
+            .git_diff
+            .begin_remote_action(GitRemoteAction::Push)
+        {
+            Ok(()) => {}
+            Err(error) => {
+                self.agents[agent_index].git_diff.error = Some(error.to_string());
+                return;
+            }
         }
+
+        let ui_tx = ui_tx.clone();
+        task::spawn(async move {
+            let result =
+                task::spawn_blocking(move || run_git_remote_action(&root, GitRemoteAction::Push))
+                    .await;
+            let (success, message) = match result {
+                Ok(Ok(output)) => (true, output),
+                Ok(Err(error)) => (false, error.to_string()),
+                Err(error) => (false, format!("git push task failed: {error}")),
+            };
+            let _ = ui_tx.send(UiEvent::GitDiffRemoteCompleted {
+                agent_index,
+                action: GitRemoteAction::Push,
+                success,
+                message,
+            });
+        });
     }
 
-    fn pull_git_diff_changes(&mut self) {
-        let Some(agent) = self.active_agent_mut() else {
+    fn pull_git_diff_changes(&mut self, ui_tx: &mpsc::UnboundedSender<UiEvent>) {
+        let Some(agent_index) = self.current_agent else {
             self.status_message = Some("Add an agent before pulling changes.".to_string());
             return;
         };
 
-        let root = agent.definition.workspace.clone();
-        match agent.git_diff.pull(&root) {
-            Ok(()) => agent.workspace.refresh(&root),
-            Err(error) => agent.git_diff.error = Some(error.to_string()),
+        let root = self.agents[agent_index].definition.workspace.clone();
+        match self.agents[agent_index]
+            .git_diff
+            .begin_remote_action(GitRemoteAction::Pull)
+        {
+            Ok(()) => {}
+            Err(error) => {
+                self.agents[agent_index].git_diff.error = Some(error.to_string());
+                return;
+            }
         }
+
+        let ui_tx = ui_tx.clone();
+        task::spawn(async move {
+            let result =
+                task::spawn_blocking(move || run_git_remote_action(&root, GitRemoteAction::Pull))
+                    .await;
+            let (success, message) = match result {
+                Ok(Ok(output)) => (true, output),
+                Ok(Err(error)) => (false, error.to_string()),
+                Err(error) => (false, format!("git pull task failed: {error}")),
+            };
+            let _ = ui_tx.send(UiEvent::GitDiffRemoteCompleted {
+                agent_index,
+                action: GitRemoteAction::Pull,
+                success,
+                message,
+            });
+        });
     }
 
     fn select_chat_sidebar_index(&mut self, index: usize) {
@@ -1496,6 +1571,25 @@ impl App {
                 }
                 self.status_message = Some(message);
             }
+            UiEvent::GitDiffRemoteCompleted {
+                agent_index,
+                action,
+                success,
+                message,
+            } => {
+                if let Some(agent) = self.agents.get_mut(agent_index) {
+                    let root = agent.definition.workspace.clone();
+                    agent
+                        .git_diff
+                        .complete_remote_action(&root, action, success, message.clone());
+                    agent.workspace.refresh(&root);
+                }
+                self.status_message = Some(if success {
+                    format!("Git {} finished", action.label().to_lowercase())
+                } else {
+                    message
+                });
+            }
         }
     }
 
@@ -1589,7 +1683,13 @@ impl App {
         }
     }
 
-    fn handle_left_click(&mut self, column: u16, row: u16, layout: UiLayout) {
+    fn handle_left_click(
+        &mut self,
+        column: u16,
+        row: u16,
+        layout: UiLayout,
+        ui_tx: &mpsc::UnboundedSender<UiEvent>,
+    ) {
         if rect_contains(layout.tabs, column, row) {
             if let Some(tab) = tab_from_click(layout.tabs, column, row) {
                 self.set_tab(tab);
@@ -1603,7 +1703,7 @@ impl App {
         }
 
         if self.current_tab == AppTab::GitDiff
-            && self.handle_git_diff_click(column, row, layout.body)
+            && self.handle_git_diff_click(column, row, layout.body, ui_tx)
         {
             return;
         }
@@ -1791,7 +1891,13 @@ impl App {
         editor.ensure_visible(viewport.width, viewport.height);
     }
 
-    fn handle_git_diff_click(&mut self, column: u16, row: u16, area: Rect) -> bool {
+    fn handle_git_diff_click(
+        &mut self,
+        column: u16,
+        row: u16,
+        area: Rect,
+        ui_tx: &mpsc::UnboundedSender<UiEvent>,
+    ) -> bool {
         let layout = git_diff_layout(area);
         let Some(agent) = self.active_agent() else {
             return false;
@@ -1811,7 +1917,7 @@ impl App {
         }
 
         if rect_contains(layout.push_button, column, row) {
-            self.push_git_diff_changes();
+            self.push_git_diff_changes(ui_tx);
             return true;
         }
 
@@ -1829,7 +1935,7 @@ impl App {
         }
 
         if rect_contains(layout.pull_button, column, row) {
-            self.pull_git_diff_changes();
+            self.pull_git_diff_changes(ui_tx);
             return true;
         }
 

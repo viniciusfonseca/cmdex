@@ -751,16 +751,26 @@ fn draw_git_diff(frame: &mut Frame, app: &App, area: Rect) {
         .block(panel_block());
     frame.render_widget(discard_button, layout.discard_button);
 
-    let push_button = Paragraph::new("Push")
-        .alignment(Alignment::Center)
-        .style(action_style(theme().accent))
-        .block(panel_block());
+    let push_button = Paragraph::new(git_diff_remote_button_label(
+        "Push",
+        agent.git_diff.remote_action,
+        GitRemoteAction::Push,
+        app.spinner_index,
+    ))
+    .alignment(Alignment::Center)
+    .style(action_style(theme().accent))
+    .block(panel_block());
     frame.render_widget(push_button, layout.push_button);
 
-    let pull_button = Paragraph::new("Pull")
-        .alignment(Alignment::Center)
-        .style(action_style(theme().foreground))
-        .block(panel_block());
+    let pull_button = Paragraph::new(git_diff_remote_button_label(
+        "Pull",
+        agent.git_diff.remote_action,
+        GitRemoteAction::Pull,
+        app.spinner_index,
+    ))
+    .alignment(Alignment::Center)
+    .style(action_style(theme().foreground))
+    .block(panel_block());
     frame.render_widget(pull_button, layout.pull_button);
 
     let status = if let Some(error) = &agent.git_diff.error {
@@ -863,6 +873,19 @@ fn git_diff_commit_input_text(input: &str, max_width: u16) -> String {
         chars[chars.len().saturating_sub(max_width)..]
             .iter()
             .collect()
+    }
+}
+
+pub(super) fn git_diff_remote_button_label(
+    label: &str,
+    active_action: Option<GitRemoteAction>,
+    button_action: GitRemoteAction,
+    spinner_index: usize,
+) -> String {
+    if active_action == Some(button_action) {
+        format!("{} {}", SPINNER[spinner_index % SPINNER.len()], label)
+    } else {
+        label.to_string()
     }
 }
 

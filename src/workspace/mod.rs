@@ -5,6 +5,8 @@ mod render;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use diff::run_git_remote_action;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -99,6 +101,7 @@ pub struct DiffBrowserState {
     pub commit_message: String,
     pub status: Option<String>,
     pub error: Option<String>,
+    pub remote_action: Option<GitRemoteAction>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -106,6 +109,12 @@ pub enum DiffSection {
     #[default]
     Changes,
     Staged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitRemoteAction {
+    Push,
+    Pull,
 }
 
 #[derive(Debug, Clone)]
