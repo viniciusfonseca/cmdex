@@ -189,6 +189,7 @@ impl Default for AddAgentForm {
 struct ChatMessage {
     role: MessageRole,
     text: String,
+    rendered_lines: Vec<Line<'static>>,
     item_id: Option<String>,
 }
 
@@ -199,6 +200,28 @@ enum MessageRole {
     Event,
     System,
     Shell,
+}
+
+impl ChatMessage {
+    fn new(role: MessageRole, text: impl Into<String>, item_id: Option<String>) -> Self {
+        let text = text.into();
+        Self {
+            role,
+            rendered_lines: chat::render_chat_message_body(&text),
+            text,
+            item_id,
+        }
+    }
+
+    fn set_text(&mut self, text: String) {
+        self.text = text;
+        self.rendered_lines = chat::render_chat_message_body(&self.text);
+    }
+
+    fn append_text(&mut self, delta: &str) {
+        self.text.push_str(delta);
+        self.rendered_lines = chat::render_chat_message_body(&self.text);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -342,13 +365,9 @@ fn upsert_message(messages: &mut Vec<ChatMessage>, role: MessageRole, item_id: &
         .iter_mut()
         .find(|message| message.item_id.as_deref() == Some(item_id))
     {
-        message.text = text;
+        message.set_text(text);
     } else {
-        messages.push(ChatMessage {
-            role,
-            text,
-            item_id: Some(item_id.to_string()),
-        });
+        messages.push(ChatMessage::new(role, text, Some(item_id.to_string())));
     }
 }
 
@@ -356,14 +375,16 @@ fn session_messages(session: WorkspaceSession) -> (String, Vec<ChatMessage>) {
     let messages = session
         .entries
         .into_iter()
-        .map(|entry| ChatMessage {
-            role: match entry.kind {
-                HistoryEntryKind::User => MessageRole::User,
-                HistoryEntryKind::Assistant => MessageRole::Assistant,
-                HistoryEntryKind::Event => MessageRole::Event,
-            },
-            text: entry.text,
-            item_id: None,
+        .map(|entry| {
+            ChatMessage::new(
+                match entry.kind {
+                    HistoryEntryKind::User => MessageRole::User,
+                    HistoryEntryKind::Assistant => MessageRole::Assistant,
+                    HistoryEntryKind::Event => MessageRole::Event,
+                },
+                entry.text,
+                None,
+            )
         })
         .collect::<Vec<_>>();
 

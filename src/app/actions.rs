@@ -307,8 +307,7 @@ impl App {
 
         match target {
             ScrollbarDragTarget::Chat => {
-                let text = Text::from(chat_lines(agent));
-                let content_length = scrollable_text_height(&text, layout.body);
+                let content_length = chat_content_height(agent, layout.body);
                 vertical_scrollbar_metrics(layout.body, content_length)
             }
             ScrollbarDragTarget::WorkspacePreview => {
@@ -1034,11 +1033,9 @@ impl App {
             return;
         }
 
-        agent.messages.push(ChatMessage {
-            role: MessageRole::User,
-            text: text.clone(),
-            item_id: None,
-        });
+        agent
+            .messages
+            .push(ChatMessage::new(MessageRole::User, text.clone(), None));
         agent.thinking = true;
         agent.status = None;
         let existing_thread = agent.thread_id.clone();
@@ -1162,11 +1159,9 @@ impl App {
                 agent.chat_settings_explicit = false;
                 let message = format!("Model set to `{}`.", agent.chat_model_label);
                 agent.status = Some(message.clone());
-                agent.messages.push(ChatMessage {
-                    role: MessageRole::System,
-                    text: message,
-                    item_id: None,
-                });
+                agent
+                    .messages
+                    .push(ChatMessage::new(MessageRole::System, message, None));
                 self.status_message = Some("Model updated".to_string());
             }
             ModelCommand::Set { model, effort } => {
@@ -1188,11 +1183,9 @@ impl App {
                 );
                 let message = format!("Model set to `{}`.", agent.chat_model_label);
                 agent.status = Some(message.clone());
-                agent.messages.push(ChatMessage {
-                    role: MessageRole::System,
-                    text: message,
-                    item_id: None,
-                });
+                agent
+                    .messages
+                    .push(ChatMessage::new(MessageRole::System, message, None));
                 self.status_message = Some("Model updated".to_string());
             }
         }
@@ -1210,11 +1203,11 @@ impl App {
             return;
         }
 
-        agent.messages.push(ChatMessage {
-            role: MessageRole::Shell,
-            text: format!("> {command}"),
-            item_id: None,
-        });
+        agent.messages.push(ChatMessage::new(
+            MessageRole::Shell,
+            format!("> {command}"),
+            None,
+        ));
         agent.shell_running = true;
         agent.status = None;
         let workspace = agent.definition.workspace.clone();
@@ -1272,11 +1265,11 @@ impl App {
                 if let Some(agent) = self.find_agent_by_thread_mut(&thread_id) {
                     if let ThreadItem::AgentMessage { id, text } = item {
                         agent.streaming_item_id = Some(id.clone());
-                        agent.messages.push(ChatMessage {
-                            role: MessageRole::Assistant,
+                        agent.messages.push(ChatMessage::new(
+                            MessageRole::Assistant,
                             text,
-                            item_id: Some(id),
-                        });
+                            Some(id),
+                        ));
                     }
                 }
             }
@@ -1303,13 +1296,13 @@ impl App {
                         .iter_mut()
                         .find(|message| message.item_id.as_deref() == Some(item_id.as_str()))
                     {
-                        message.text.push_str(&delta);
+                        message.append_text(&delta);
                     } else {
-                        agent.messages.push(ChatMessage {
-                            role: MessageRole::Assistant,
-                            text: delta,
-                            item_id: Some(item_id),
-                        });
+                        agent.messages.push(ChatMessage::new(
+                            MessageRole::Assistant,
+                            delta,
+                            Some(item_id),
+                        ));
                     }
                 }
             }
@@ -1354,11 +1347,11 @@ impl App {
             } => {
                 if let Some(agent) = self.agents.get_mut(agent_index) {
                     agent.status = Some("Model command finished".to_string());
-                    agent.messages.push(ChatMessage {
-                        role: MessageRole::System,
-                        text: message.clone(),
-                        item_id: None,
-                    });
+                    agent.messages.push(ChatMessage::new(
+                        MessageRole::System,
+                        message.clone(),
+                        None,
+                    ));
                 }
                 self.status_message = Some("Model command finished".to_string());
             }
@@ -1384,11 +1377,11 @@ impl App {
                     agent.shell_running = false;
                     agent.streaming_item_id = None;
                     agent.status = Some(message.clone());
-                    agent.messages.push(ChatMessage {
-                        role: MessageRole::System,
-                        text: message.clone(),
-                        item_id: None,
-                    });
+                    agent.messages.push(ChatMessage::new(
+                        MessageRole::System,
+                        message.clone(),
+                        None,
+                    ));
                 }
                 self.status_message = Some(message);
             }
@@ -1399,11 +1392,9 @@ impl App {
             } => {
                 if let Some(agent) = self.agents.get_mut(agent_index) {
                     agent.shell_running = false;
-                    agent.messages.push(ChatMessage {
-                        role: MessageRole::Shell,
-                        text: output,
-                        item_id: None,
-                    });
+                    agent
+                        .messages
+                        .push(ChatMessage::new(MessageRole::Shell, output, None));
                     agent.status = Some(if success {
                         "Shell command finished".to_string()
                     } else {

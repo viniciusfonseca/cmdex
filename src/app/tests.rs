@@ -1,7 +1,7 @@
 use super::{
     chat::{
-        ChatCommand, ModelCommand, chat_command_from_input, chat_lines, chat_max_scroll,
-        format_chat_model_label, format_shell_output, padded_chat_lines,
+        ChatCommand, ModelCommand, chat_command_from_input, chat_content_height, chat_lines,
+        chat_max_scroll, format_chat_model_label, format_shell_output, padded_chat_lines,
         parse_codex_model_from_config, parse_codex_reasoning_effort_from_config,
         resolve_chat_model_label, shell_command_from_input,
     },
@@ -31,15 +31,44 @@ fn chat_max_scroll_uses_wrapped_height_for_last_message() {
         None,
         "default",
     );
-    agent.messages.push(ChatMessage {
-        role: MessageRole::Assistant,
-        text: "abc def ghi".to_string(),
-        item_id: None,
-    });
+    agent.messages.push(ChatMessage::new(
+        MessageRole::Assistant,
+        "abc def ghi",
+        None,
+    ));
 
     let area = Rect::new(0, 0, 8, 5);
 
     assert_eq!(chat_max_scroll(&agent, area), 2);
+}
+
+#[test]
+fn chat_scroll_height_matches_rendered_width_without_extra_tail_space() {
+    let mut agent = AgentState::new(
+        AgentDefinition {
+            name: "Test".to_string(),
+            workspace: PathBuf::from("/tmp"),
+        },
+        None,
+        None,
+        "default",
+    );
+    agent.messages.push(ChatMessage::new(
+        MessageRole::Assistant,
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        None,
+    ));
+
+    let area = Rect::new(0, 0, 10, 5);
+    let text = Text::from(chat_lines(&agent));
+    let expected_content_height = wrapped_text_height(&text, area.width.saturating_sub(2));
+
+    assert!(scrollable_text_height(&text, area) > expected_content_height);
+    assert_eq!(chat_content_height(&agent, area), expected_content_height);
+    assert_eq!(
+        chat_max_scroll(&agent, area),
+        expected_content_height.saturating_sub(area.height.saturating_sub(2) as usize) as u16
+    );
 }
 
 #[test]
@@ -53,11 +82,11 @@ fn chat_appends_single_blank_line_after_final_message() {
         None,
         "default",
     );
-    agent.messages.push(ChatMessage {
-        role: MessageRole::Assistant,
-        text: "final message".to_string(),
-        item_id: None,
-    });
+    agent.messages.push(ChatMessage::new(
+        MessageRole::Assistant,
+        "final message",
+        None,
+    ));
 
     let lines = chat_lines(&agent);
 
@@ -78,16 +107,12 @@ fn chat_keeps_a_single_blank_line_between_messages() {
         None,
         "default",
     );
-    agent.messages.push(ChatMessage {
-        role: MessageRole::User,
-        text: "one".to_string(),
-        item_id: None,
-    });
-    agent.messages.push(ChatMessage {
-        role: MessageRole::Assistant,
-        text: "two".to_string(),
-        item_id: None,
-    });
+    agent
+        .messages
+        .push(ChatMessage::new(MessageRole::User, "one", None));
+    agent
+        .messages
+        .push(ChatMessage::new(MessageRole::Assistant, "two", None));
 
     let lines = chat_lines(&agent);
 
@@ -110,11 +135,11 @@ fn chat_bottom_aligns_short_content_with_one_blank_line_after_last_message() {
         None,
         "default",
     );
-    agent.messages.push(ChatMessage {
-        role: MessageRole::Assistant,
-        text: "final message".to_string(),
-        item_id: None,
-    });
+    agent.messages.push(ChatMessage::new(
+        MessageRole::Assistant,
+        "final message",
+        None,
+    ));
 
     let area = Rect::new(0, 0, 20, 8);
     let lines = padded_chat_lines(&agent, area);
@@ -126,6 +151,24 @@ fn chat_bottom_aligns_short_content_with_one_blank_line_after_last_message() {
     assert_eq!(line_text(&lines[3]), "Test:");
     assert_eq!(line_text(&lines[4]), "final message");
     assert!(line_text(&lines[5]).is_empty());
+}
+
+#[test]
+fn cached_chat_message_lines_refresh_after_text_updates() {
+    let mut message = ChatMessage::new(MessageRole::Assistant, "one", Some("item".to_string()));
+
+    assert_eq!(line_text(&message.rendered_lines[0]), "one");
+
+    message.append_text("\n\ntwo");
+    assert_eq!(line_text(&message.rendered_lines[0]), "one");
+    assert_eq!(
+        line_text(message.rendered_lines.last().expect("rendered lines")),
+        "two"
+    );
+
+    message.set_text("three".to_string());
+    assert_eq!(message.rendered_lines.len(), 1);
+    assert_eq!(line_text(&message.rendered_lines[0]), "three");
 }
 
 #[test]
@@ -272,10 +315,42 @@ fn debounces_repeated_mouse_scroll_events() {
         !app.should_handle_mouse_scroll_at(ScrollDirection::Down, now + Duration::from_millis(10))
     );
     assert!(
-        app.should_handle_mouse_scroll_at(ScrollDirection::Up, now + Duration::from_millis(10))
+        app.should_handle_mouse_scroll_at(ScrollDirection::Down, now + Duration::from_millis(25))
+    );
+
+    let mut other_direction = App::new(PathBuf::new(), CmdexConfig::default());
+    assert!(other_direction.should_handle_mouse_scroll_at(ScrollDirection::Down, now));
+    assert!(
+        other_direction
+            .should_handle_mouse_scroll_at(ScrollDirection::Up, now + Duration::from_millis(10))
+    );
+}
+
+#[test]
+fn chat_and_workspace_share_same_mouse_scroll_debounce() {
+    let mut chat_app = App::new(PathBuf::new(), CmdexConfig::default());
+    let mut workspace_app = App::new(PathBuf::new(), CmdexConfig::default());
+    let now = Instant::now();
+    workspace_app.current_tab = AppTab::Workspace;
+
+    assert!(chat_app.should_handle_mouse_scroll_at(ScrollDirection::Down, now));
+    assert!(
+        !chat_app
+            .should_handle_mouse_scroll_at(ScrollDirection::Down, now + Duration::from_millis(10))
     );
     assert!(
-        app.should_handle_mouse_scroll_at(ScrollDirection::Down, now + Duration::from_millis(40))
+        chat_app
+            .should_handle_mouse_scroll_at(ScrollDirection::Down, now + Duration::from_millis(25))
+    );
+
+    assert!(workspace_app.should_handle_mouse_scroll_at(ScrollDirection::Down, now));
+    assert!(
+        !workspace_app
+            .should_handle_mouse_scroll_at(ScrollDirection::Down, now + Duration::from_millis(10))
+    );
+    assert!(
+        workspace_app
+            .should_handle_mouse_scroll_at(ScrollDirection::Down, now + Duration::from_millis(25))
     );
 }
 

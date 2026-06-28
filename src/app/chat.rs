@@ -1,5 +1,5 @@
 use super::{
-    ui::{scrollable_text_height, theme},
+    ui::{inner_rect, theme, wrapped_text_height},
     *,
 };
 
@@ -10,7 +10,7 @@ pub(super) fn chat_lines(agent: &AgentState) -> Vec<Line<'static>> {
         agent
             .messages
             .iter()
-            .flat_map(|message| render_chat_message_lines(message, &agent.definition.name))
+            .flat_map(|message| message_lines(message, &agent.definition.name))
             .collect()
     }
 }
@@ -18,9 +18,14 @@ pub(super) fn chat_lines(agent: &AgentState) -> Vec<Line<'static>> {
 pub(super) fn chat_max_scroll(agent: &AgentState, area: Rect) -> u16 {
     let lines = chat_lines(agent);
     let inner_height = area.height.saturating_sub(2) as usize;
-    let content_height = scrollable_text_height(&Text::from(lines), area);
+    let content_height = chat_text_height(&lines, area);
 
     content_height.saturating_sub(inner_height) as u16
+}
+
+pub(super) fn chat_content_height(agent: &AgentState, area: Rect) -> usize {
+    let lines = chat_lines(agent);
+    chat_text_height(&lines, area)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,7 +94,7 @@ pub(super) fn padded_chat_lines(agent: &AgentState, area: Rect) -> Vec<Line<'sta
         return lines;
     }
 
-    let content_height = scrollable_text_height(&Text::from(lines.clone()), area);
+    let content_height = chat_text_height(&lines, area);
     if content_height >= inner_height {
         return lines;
     }
@@ -99,7 +104,12 @@ pub(super) fn padded_chat_lines(agent: &AgentState, area: Rect) -> Vec<Line<'sta
     padded
 }
 
-fn render_chat_message_lines(message: &ChatMessage, agent_name: &str) -> Vec<Line<'static>> {
+fn chat_text_height(lines: &[Line<'_>], area: Rect) -> usize {
+    let viewport = inner_rect(area);
+    wrapped_text_height(&Text::from(lines.to_vec()), viewport.width)
+}
+
+fn message_lines(message: &ChatMessage, agent_name: &str) -> Vec<Line<'static>> {
     let role = match message.role {
         MessageRole::User => ("You", theme().yellow),
         MessageRole::Assistant => (agent_name, theme().green),
@@ -112,12 +122,12 @@ fn render_chat_message_lines(message: &ChatMessage, agent_name: &str) -> Vec<Lin
         format!("{}:", role.0),
         Style::default().fg(role.1).add_modifier(Modifier::BOLD),
     )])];
-    lines.extend(render_markdown_lines(&message.text));
+    lines.extend(message.rendered_lines.iter().cloned());
     lines.push(Line::default());
     lines
 }
 
-fn render_markdown_lines(source: &str) -> Vec<Line<'static>> {
+pub(super) fn render_chat_message_body(source: &str) -> Vec<Line<'static>> {
     if source.trim().is_empty() {
         return vec![Line::default()];
     }

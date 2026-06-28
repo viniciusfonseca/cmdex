@@ -1,5 +1,5 @@
 use super::{
-    chat::{chat_input_is_shell, padded_chat_lines},
+    chat::{chat_content_height, chat_input_is_shell, padded_chat_lines},
     *,
 };
 
@@ -427,7 +427,7 @@ fn draw_chat(frame: &mut Frame, app: &App, area: Rect) {
 
     let inner_height = area.height.saturating_sub(2);
     let text = Text::from(lines);
-    let content_height = scrollable_text_height(&text, area);
+    let content_height = chat_content_height(agent, area);
     let max_scroll = content_height.saturating_sub(inner_height as usize) as u16;
     let scroll = if agent.chat_follow_output {
         max_scroll
@@ -1042,6 +1042,7 @@ pub(super) fn scrollable_preview_content_height(lines: &[Line<'_>], area: Rect) 
     }
 }
 
+#[cfg(test)]
 pub(super) fn scrollable_text_height(text: &Text<'_>, area: Rect) -> usize {
     let viewport = inner_rect(area);
     let base_height = wrapped_text_height(text, viewport.width);
