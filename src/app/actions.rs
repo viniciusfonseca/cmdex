@@ -983,7 +983,12 @@ impl App {
                     return;
                 }
 
-                self.agents.push(AgentState::new(agent));
+                self.agents.push(AgentState::new(
+                    agent,
+                    self.default_chat_model.clone(),
+                    self.default_chat_reasoning_effort.clone(),
+                    &self.chat_model_label,
+                ));
                 let new_index = self.agents.len().saturating_sub(1);
                 self.current_agent = Some(new_index);
                 self.chat_sidebar_index = new_index + 1;
@@ -1003,6 +1008,11 @@ impl App {
     }
 
     fn submit_message(&mut self, codex: CodexAppServer, ui_tx: mpsc::UnboundedSender<UiEvent>) {
+        if let Some(command) = chat_command_from_input(&self.chat_input) {
+            self.submit_chat_command(command, codex, ui_tx);
+            return;
+        }
+
         if let Some(command) = shell_command_from_input(&self.chat_input) {
             self.submit_shell_command(command, ui_tx);
             return;
@@ -1033,6 +1043,8 @@ impl App {
         agent.status = None;
         let existing_thread = agent.thread_id.clone();
         let thread_loaded = agent.thread_loaded;
+        let selected_model = agent.chat_model.clone();
+        let selected_effort = agent.chat_reasoning_effort.clone();
         let workspace = agent.definition.workspace.clone();
         self.chat_input.clear();
 
@@ -1040,7 +1052,10 @@ impl App {
             let thread_id = match existing_thread {
                 Some(thread_id) => {
                     if !thread_loaded {
-                        match codex.resume_thread(&thread_id).await {
+                        match codex
+                            .resume_thread(&thread_id, selected_model.as_deref())
+                            .await
+                        {
                             Ok(thread) => {
                                 let id = thread.id.clone();
                                 let _ = ui_tx.send(UiEvent::ThreadReady {
@@ -1061,7 +1076,10 @@ impl App {
                         thread_id
                     }
                 }
-                None => match codex.start_thread(&workspace).await {
+                None => match codex
+                    .start_thread(&workspace, selected_model.as_deref())
+                    .await
+                {
                     Ok(thread) => {
                         let id = thread.id.clone();
                         let _ = ui_tx.send(UiEvent::ThreadReady {
@@ -1080,13 +1098,104 @@ impl App {
                 },
             };
 
-            if let Err(error) = codex.start_turn(&thread_id, &text).await {
+            if let Err(error) = codex
+                .start_turn(
+                    &thread_id,
+                    &text,
+                    selected_model.as_deref(),
+                    selected_effort.as_deref(),
+                )
+                .await
+            {
                 let _ = ui_tx.send(UiEvent::SubmissionFailed {
                     agent_index,
                     message: error.to_string(),
                 });
             }
         });
+    }
+
+    fn submit_chat_command(
+        &mut self,
+        command: ChatCommand,
+        codex: CodexAppServer,
+        ui_tx: mpsc::UnboundedSender<UiEvent>,
+    ) {
+        match command {
+            ChatCommand::Model(command) => self.submit_model_command(command, codex, ui_tx),
+        }
+    }
+
+    fn submit_model_command(
+        &mut self,
+        command: ModelCommand,
+        codex: CodexAppServer,
+        ui_tx: mpsc::UnboundedSender<UiEvent>,
+    ) {
+        let Some(agent_index) = self.current_agent else {
+            self.status_message = Some("Add an agent before changing the model.".to_string());
+            return;
+        };
+
+        self.chat_input.clear();
+
+        match command {
+            ModelCommand::List => {
+                let current_label = self.agents[agent_index].chat_model_label.clone();
+                self.agents[agent_index].status = Some("Loading available models...".to_string());
+                tokio::spawn(async move {
+                    let message = match codex.list_models().await {
+                        Ok(models) => format_model_list_message(&current_label, &models),
+                        Err(error) => format!("Unable to load available models.\n\n{error}"),
+                    };
+                    let _ = ui_tx.send(UiEvent::ModelCommandResult {
+                        agent_index,
+                        message,
+                    });
+                });
+            }
+            ModelCommand::ResetDefault => {
+                let agent = &mut self.agents[agent_index];
+                agent.chat_model = self.default_chat_model.clone();
+                agent.chat_reasoning_effort = self.default_chat_reasoning_effort.clone();
+                agent.chat_model_label = self.chat_model_label.clone();
+                agent.chat_settings_explicit = false;
+                let message = format!("Model set to `{}`.", agent.chat_model_label);
+                agent.status = Some(message.clone());
+                agent.messages.push(ChatMessage {
+                    role: MessageRole::System,
+                    text: message,
+                    item_id: None,
+                });
+                self.status_message = Some("Model updated".to_string());
+            }
+            ModelCommand::Set { model, effort } => {
+                let default_model = self.default_chat_model.clone();
+                let default_label = self.chat_model_label.clone();
+                let agent = &mut self.agents[agent_index];
+                if let Some(model) = model {
+                    agent.chat_model = Some(model);
+                }
+                if let Some(effort) = effort {
+                    agent.chat_reasoning_effort = Some(effort);
+                }
+                agent.chat_settings_explicit = true;
+                agent.chat_model_label = resolve_chat_model_label(
+                    agent.chat_model.as_deref(),
+                    agent.chat_reasoning_effort.as_deref(),
+                    default_model.as_deref(),
+                    &default_label,
+                );
+                let message = format!("Model set to `{}`.", agent.chat_model_label);
+                agent.status = Some(message.clone());
+                agent.messages.push(ChatMessage {
+                    role: MessageRole::System,
+                    text: message,
+                    item_id: None,
+                });
+                self.status_message = Some("Model updated".to_string());
+            }
+        }
     }
 
     fn submit_shell_command(&mut self, command: String, ui_tx: mpsc::UnboundedSender<UiEvent>) {
@@ -1227,7 +1336,31 @@ impl App {
                 if let Some(agent) = self.agents.get_mut(agent_index) {
                     agent.thread_id = Some(thread.id);
                     agent.thread_loaded = true;
+                    if !agent.chat_settings_explicit {
+                        agent.chat_model = thread.model;
+                        agent.chat_reasoning_effort = thread.reasoning_effort;
+                    }
+                    agent.chat_model_label = resolve_chat_model_label(
+                        agent.chat_model.as_deref(),
+                        agent.chat_reasoning_effort.as_deref(),
+                        self.default_chat_model.as_deref(),
+                        &self.chat_model_label,
+                    );
                 }
+            }
+            UiEvent::ModelCommandResult {
+                agent_index,
+                message,
+            } => {
+                if let Some(agent) = self.agents.get_mut(agent_index) {
+                    agent.status = Some("Model command finished".to_string());
+                    agent.messages.push(ChatMessage {
+                        role: MessageRole::System,
+                        text: message.clone(),
+                        item_id: None,
+                    });
+                }
+                self.status_message = Some("Model command finished".to_string());
             }
             UiEvent::SessionLoaded {
                 agent_index,
@@ -1621,4 +1754,39 @@ impl App {
         rect_contains(layout.commit_input, column, row)
             || rect_contains(layout.preview, column, row)
     }
+}
+
+fn format_model_list_message(current_label: &str, models: &[ModelInfo]) -> String {
+    if models.is_empty() {
+        return format!(
+            "Current model: `{current_label}`\n\nNo visible models were returned by the app server."
+        );
+    }
+
+    let mut lines = vec![
+        format!("Current model: `{current_label}`"),
+        String::new(),
+        "Available models:".to_string(),
+    ];
+
+    for model in models {
+        let mut line = format!("- `{}`", model.model);
+        if model.id != model.model {
+            line.push_str(&format!(" [{}]", model.id));
+        }
+        if model.display_name != model.model {
+            line.push_str(&format!(" - {}", model.display_name));
+        }
+        if model.is_default {
+            line.push_str(" (default)");
+        }
+        lines.push(line);
+    }
+
+    lines.push(String::new());
+    lines.push("Use `/model <id>` to switch models.".to_string());
+    lines.push("Use `/model <id> <effort>` to switch model and effort together.".to_string());
+    lines.push("Use `/model <effort>` to change only the effort.".to_string());
+    lines.push("Use `/model default` to go back to the configured default.".to_string());
+    lines.join("\n")
 }

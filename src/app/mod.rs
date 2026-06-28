@@ -37,7 +37,8 @@ use tokio::{
 };
 
 use crate::codex::{
-    CodexAppServer, HistoryEntryKind, ServerEvent, ThreadInfo, ThreadItem, WorkspaceSession,
+    CodexAppServer, HistoryEntryKind, ModelInfo, ServerEvent, ThreadInfo, ThreadItem,
+    WorkspaceSession,
 };
 use crate::config::{
     AgentDefinition, CmdexConfig, compact_home, default_config_path, load_config, save_config,
@@ -80,6 +81,10 @@ enum UiEvent {
     ThreadReady {
         agent_index: usize,
         thread: ThreadInfo,
+    },
+    ModelCommandResult {
+        agent_index: usize,
+        message: String,
     },
     SessionLoaded {
         agent_index: usize,
@@ -202,6 +207,10 @@ struct AgentState {
     thread_id: Option<String>,
     thread_loaded: bool,
     messages: Vec<ChatMessage>,
+    chat_model: Option<String>,
+    chat_reasoning_effort: Option<String>,
+    chat_model_label: String,
+    chat_settings_explicit: bool,
     chat_follow_output: bool,
     chat_scroll: u16,
     thinking: bool,
@@ -213,12 +222,21 @@ struct AgentState {
 }
 
 impl AgentState {
-    fn new(definition: AgentDefinition) -> Self {
+    fn new(
+        definition: AgentDefinition,
+        default_chat_model: Option<String>,
+        default_chat_reasoning_effort: Option<String>,
+        default_chat_model_label: &str,
+    ) -> Self {
         Self {
             definition,
             thread_id: None,
             thread_loaded: false,
             messages: Vec::new(),
+            chat_model: default_chat_model,
+            chat_reasoning_effort: default_chat_reasoning_effort,
+            chat_model_label: default_chat_model_label.to_string(),
+            chat_settings_explicit: false,
             chat_follow_output: true,
             chat_scroll: 0,
             thinking: false,
@@ -235,6 +253,8 @@ pub struct App {
     config_path: PathBuf,
     config: CmdexConfig,
     agents: Vec<AgentState>,
+    default_chat_model: Option<String>,
+    default_chat_reasoning_effort: Option<String>,
     chat_model_label: String,
     current_tab: AppTab,
     current_agent: Option<usize>,
@@ -251,11 +271,22 @@ pub struct App {
 
 impl App {
     fn new(config_path: PathBuf, config: CmdexConfig) -> Self {
+        let default_chat_model = chat::load_codex_chat_model();
+        let default_chat_reasoning_effort = chat::load_codex_chat_reasoning_effort();
+        let default_chat_model_label =
+            chat::load_codex_chat_model_label().unwrap_or_else(|| "default".to_string());
         let agents = config
             .agents
             .iter()
             .cloned()
-            .map(AgentState::new)
+            .map(|definition| {
+                AgentState::new(
+                    definition,
+                    default_chat_model.clone(),
+                    default_chat_reasoning_effort.clone(),
+                    &default_chat_model_label,
+                )
+            })
             .collect::<Vec<_>>();
 
         let current_agent = if agents.is_empty() { None } else { Some(0) };
@@ -269,8 +300,9 @@ impl App {
             config_path,
             config,
             agents,
-            chat_model_label: chat::load_codex_chat_model_label()
-                .unwrap_or_else(|| "default".to_string()),
+            default_chat_model,
+            default_chat_reasoning_effort,
+            chat_model_label: default_chat_model_label,
             current_tab: AppTab::Chat,
             current_agent,
             chat_sidebar_index,
@@ -287,6 +319,12 @@ impl App {
 
     fn active_agent(&self) -> Option<&AgentState> {
         self.current_agent.and_then(|index| self.agents.get(index))
+    }
+
+    fn active_chat_model_label(&self) -> &str {
+        self.active_agent()
+            .map(|agent| agent.chat_model_label.as_str())
+            .unwrap_or(self.chat_model_label.as_str())
     }
 
     fn active_agent_mut(&mut self) -> Option<&mut AgentState> {

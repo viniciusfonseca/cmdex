@@ -1,8 +1,9 @@
 use super::{
     chat::{
-        chat_lines, chat_max_scroll, format_shell_output, padded_chat_lines,
+        ChatCommand, ModelCommand, chat_command_from_input, chat_lines, chat_max_scroll,
+        format_chat_model_label, format_shell_output, padded_chat_lines,
         parse_codex_model_from_config, parse_codex_reasoning_effort_from_config,
-        shell_command_from_input,
+        resolve_chat_model_label, shell_command_from_input,
     },
     ui::{
         chat_input_height_for_main_area, scroll_position_from_row,
@@ -21,10 +22,15 @@ fn wrapped_text_height_matches_paragraph_word_wrapping() {
 
 #[test]
 fn chat_max_scroll_uses_wrapped_height_for_last_message() {
-    let mut agent = AgentState::new(AgentDefinition {
-        name: "Test".to_string(),
-        workspace: PathBuf::from("/tmp"),
-    });
+    let mut agent = AgentState::new(
+        AgentDefinition {
+            name: "Test".to_string(),
+            workspace: PathBuf::from("/tmp"),
+        },
+        None,
+        None,
+        "default",
+    );
     agent.messages.push(ChatMessage {
         role: MessageRole::Assistant,
         text: "abc def ghi".to_string(),
@@ -38,10 +44,15 @@ fn chat_max_scroll_uses_wrapped_height_for_last_message() {
 
 #[test]
 fn chat_appends_single_blank_line_after_final_message() {
-    let mut agent = AgentState::new(AgentDefinition {
-        name: "Test".to_string(),
-        workspace: PathBuf::from("/tmp"),
-    });
+    let mut agent = AgentState::new(
+        AgentDefinition {
+            name: "Test".to_string(),
+            workspace: PathBuf::from("/tmp"),
+        },
+        None,
+        None,
+        "default",
+    );
     agent.messages.push(ChatMessage {
         role: MessageRole::Assistant,
         text: "final message".to_string(),
@@ -58,10 +69,15 @@ fn chat_appends_single_blank_line_after_final_message() {
 
 #[test]
 fn chat_keeps_a_single_blank_line_between_messages() {
-    let mut agent = AgentState::new(AgentDefinition {
-        name: "Test".to_string(),
-        workspace: PathBuf::from("/tmp"),
-    });
+    let mut agent = AgentState::new(
+        AgentDefinition {
+            name: "Test".to_string(),
+            workspace: PathBuf::from("/tmp"),
+        },
+        None,
+        None,
+        "default",
+    );
     agent.messages.push(ChatMessage {
         role: MessageRole::User,
         text: "one".to_string(),
@@ -85,10 +101,15 @@ fn chat_keeps_a_single_blank_line_between_messages() {
 
 #[test]
 fn chat_bottom_aligns_short_content_with_one_blank_line_after_last_message() {
-    let mut agent = AgentState::new(AgentDefinition {
-        name: "Test".to_string(),
-        workspace: PathBuf::from("/tmp"),
-    });
+    let mut agent = AgentState::new(
+        AgentDefinition {
+            name: "Test".to_string(),
+            workspace: PathBuf::from("/tmp"),
+        },
+        None,
+        None,
+        "default",
+    );
     agent.messages.push(ChatMessage {
         role: MessageRole::Assistant,
         text: "final message".to_string(),
@@ -119,6 +140,40 @@ fn shell_command_is_detected_from_chat_input() {
     );
     assert_eq!(shell_command_from_input("hello > world"), None);
     assert_eq!(shell_command_from_input(">"), None);
+}
+
+#[test]
+fn model_command_is_detected_from_chat_input() {
+    assert_eq!(
+        chat_command_from_input("/model"),
+        Some(ChatCommand::Model(ModelCommand::List))
+    );
+    assert_eq!(
+        chat_command_from_input("/model gpt-5.5"),
+        Some(ChatCommand::Model(ModelCommand::Set {
+            model: Some("gpt-5.5".to_string()),
+            effort: None,
+        }))
+    );
+    assert_eq!(
+        chat_command_from_input("/model gpt-5.5 xhigh"),
+        Some(ChatCommand::Model(ModelCommand::Set {
+            model: Some("gpt-5.5".to_string()),
+            effort: Some("xhigh".to_string()),
+        }))
+    );
+    assert_eq!(
+        chat_command_from_input("/model high"),
+        Some(ChatCommand::Model(ModelCommand::Set {
+            model: None,
+            effort: Some("high".to_string()),
+        }))
+    );
+    assert_eq!(
+        chat_command_from_input("  /model default  "),
+        Some(ChatCommand::Model(ModelCommand::ResetDefault))
+    );
+    assert_eq!(chat_command_from_input("/modelx"), None);
 }
 
 #[test]
@@ -192,7 +247,19 @@ model_reasoning_effort = "xhigh"
     let model = parse_codex_model_from_config(config).unwrap();
     let effort = parse_codex_reasoning_effort_from_config(config).unwrap();
 
-    assert_eq!(format!("{model} · {effort}"), "gpt-5.4 · xhigh");
+    assert_eq!(
+        format_chat_model_label(&model, Some(&effort)),
+        "gpt-5.4 · xhigh"
+    );
+    assert_eq!(format_chat_model_label(&model, None), "gpt-5.4");
+    assert_eq!(
+        resolve_chat_model_label(None, Some("high"), Some(&model), "default"),
+        "gpt-5.4 · high"
+    );
+    assert_eq!(
+        resolve_chat_model_label(None, None, Some(&model), "gpt-5.4 · xhigh"),
+        "gpt-5.4 · xhigh"
+    );
 }
 
 #[test]

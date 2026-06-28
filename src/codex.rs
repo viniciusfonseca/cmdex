@@ -20,6 +20,8 @@ use tokio::{
 #[derive(Debug, Clone)]
 pub struct ThreadInfo {
     pub id: String,
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -73,6 +75,14 @@ pub enum ServerEvent {
     Warning(String),
     Error(String),
     TransportError(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelInfo {
+    pub id: String,
+    pub model: String,
+    pub display_name: String,
+    pub is_default: bool,
 }
 
 #[derive(Clone)]
@@ -173,7 +183,7 @@ impl CodexAppServer {
         Ok(client)
     }
 
-    pub async fn start_thread(&self, cwd: &Path) -> Result<ThreadInfo> {
+    pub async fn start_thread(&self, cwd: &Path, model: Option<&str>) -> Result<ThreadInfo> {
         let response: ThreadStartResponse = self
             .request(
                 "thread/start",
@@ -181,22 +191,33 @@ impl CodexAppServer {
                     cwd: Some(cwd.to_string_lossy().to_string()),
                     ephemeral: Some(false),
                     service_name: Some("cmdex".to_string()),
+                    model: model.map(ToString::to_string),
                 },
             )
             .await?;
 
         Ok(ThreadInfo {
             id: response.thread.id,
+            model: Some(response.model),
+            reasoning_effort: response.reasoning_effort,
         })
     }
 
-    pub async fn start_turn(&self, thread_id: &str, text: &str) -> Result<()> {
+    pub async fn start_turn(
+        &self,
+        thread_id: &str,
+        text: &str,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> Result<()> {
         let _: TurnStartResponse = self
             .request(
                 "turn/start",
                 TurnStartParams {
                     thread_id: thread_id.to_string(),
                     input: vec![UserInput::text(text)],
+                    model: model.map(ToString::to_string),
+                    effort: effort.map(ToString::to_string),
                 },
             )
             .await?;
@@ -204,18 +225,21 @@ impl CodexAppServer {
         Ok(())
     }
 
-    pub async fn resume_thread(&self, thread_id: &str) -> Result<ThreadInfo> {
+    pub async fn resume_thread(&self, thread_id: &str, model: Option<&str>) -> Result<ThreadInfo> {
         let response: ThreadResumeResponse = self
             .request(
                 "thread/resume",
                 ThreadResumeParams {
                     thread_id: thread_id.to_string(),
+                    model: model.map(ToString::to_string),
                 },
             )
             .await?;
 
         Ok(ThreadInfo {
             id: response.thread.id,
+            model: Some(response.model),
+            reasoning_effort: response.reasoning_effort,
         })
     }
 
@@ -252,9 +276,43 @@ impl CodexAppServer {
         Ok(Some(WorkspaceSession {
             thread: ThreadInfo {
                 id: response.thread.id,
+                model: None,
+                reasoning_effort: None,
             },
             entries: history_entries_from_turns(&response.thread.turns),
         }))
+    }
+
+    pub async fn list_models(&self) -> Result<Vec<ModelInfo>> {
+        let mut models = Vec::new();
+        let mut cursor = None;
+
+        loop {
+            let response: ModelListResponse = self
+                .request(
+                    "model/list",
+                    ModelListParams {
+                        cursor: cursor.clone(),
+                        include_hidden: Some(false),
+                        limit: Some(100),
+                    },
+                )
+                .await?;
+
+            models.extend(response.data.into_iter().map(|model| ModelInfo {
+                id: model.id,
+                model: model.model,
+                display_name: model.display_name,
+                is_default: model.is_default,
+            }));
+
+            let Some(next_cursor) = response.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+
+        Ok(models)
     }
 
     async fn request<T>(&self, method: &str, params: impl Serialize) -> Result<T>
@@ -350,11 +408,15 @@ struct ThreadStartParams {
     ephemeral: Option<bool>,
     #[serde(rename = "serviceName")]
     service_name: Option<String>,
+    model: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ThreadStartResponse {
     thread: ThreadResponse,
+    model: String,
+    #[serde(rename = "reasoningEffort")]
+    reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -367,6 +429,8 @@ struct TurnStartParams {
     #[serde(rename = "threadId")]
     thread_id: String,
     input: Vec<UserInput>,
+    model: Option<String>,
+    effort: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -379,11 +443,15 @@ struct TurnStartResponse {
 struct ThreadResumeParams {
     #[serde(rename = "threadId")]
     thread_id: String,
+    model: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ThreadResumeResponse {
     thread: ThreadResponse,
+    model: String,
+    #[serde(rename = "reasoningEffort")]
+    reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -430,6 +498,31 @@ struct ThreadReadThread {
     id: String,
     #[serde(default)]
     turns: Vec<ThreadTurn>,
+}
+
+#[derive(Debug, Serialize)]
+struct ModelListParams {
+    cursor: Option<String>,
+    #[serde(rename = "includeHidden")]
+    include_hidden: Option<bool>,
+    limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelListResponse {
+    data: Vec<ModelListItem>,
+    #[serde(rename = "nextCursor")]
+    next_cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelListItem {
+    id: String,
+    model: String,
+    #[serde(rename = "displayName")]
+    display_name: String,
+    #[serde(rename = "isDefault")]
+    is_default: bool,
 }
 
 #[derive(Debug, Deserialize)]

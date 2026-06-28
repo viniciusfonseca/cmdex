@@ -451,17 +451,19 @@ fn draw_chat_input(frame: &mut Frame, app: &App, area: Rect) {
     let title = if shell_running {
         format!(
             "Shell · {}  {} Running...",
-            app.chat_model_label, SPINNER[app.spinner_index]
+            app.active_chat_model_label(),
+            SPINNER[app.spinner_index]
         )
     } else if shell_mode {
-        format!("Shell · {}", app.chat_model_label)
+        format!("Shell · {}", app.active_chat_model_label())
     } else if thinking {
         format!(
             "Message · {}  {} Thinking...",
-            app.chat_model_label, SPINNER[app.spinner_index]
+            app.active_chat_model_label(),
+            SPINNER[app.spinner_index]
         )
     } else {
-        format!("Message · {}", app.chat_model_label)
+        format!("Message · {}", app.active_chat_model_label())
     };
 
     let wrapped_lines = wrapped_chat_input_lines(&app.chat_input, area.width.saturating_sub(2));

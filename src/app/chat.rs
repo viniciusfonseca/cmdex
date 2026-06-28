@@ -23,6 +23,65 @@ pub(super) fn chat_max_scroll(agent: &AgentState, area: Rect) -> u16 {
     content_height.saturating_sub(inner_height) as u16
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ChatCommand {
+    Model(ModelCommand),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ModelCommand {
+    List,
+    ResetDefault,
+    Set {
+        model: Option<String>,
+        effort: Option<String>,
+    },
+}
+
+pub(super) fn chat_command_from_input(input: &str) -> Option<ChatCommand> {
+    let trimmed = input.trim();
+    let remainder = trimmed.strip_prefix("/model")?;
+    if !remainder.is_empty() && !remainder.starts_with(char::is_whitespace) {
+        return None;
+    }
+
+    Some(ChatCommand::Model(parse_model_command(remainder.trim())))
+}
+
+fn parse_model_command(input: &str) -> ModelCommand {
+    let input = input.trim();
+    if input.is_empty() {
+        return ModelCommand::List;
+    }
+
+    let parts = input.split_whitespace().collect::<Vec<_>>();
+    let first = parts[0];
+
+    if parts.len() == 1 && first.eq_ignore_ascii_case("default") {
+        return ModelCommand::ResetDefault;
+    }
+
+    if parts.len() == 1 && is_reasoning_effort_value(first) {
+        return ModelCommand::Set {
+            model: None,
+            effort: Some(first.to_string()),
+        };
+    }
+
+    let effort = (parts.len() > 1).then(|| parts[1..].join(" "));
+    ModelCommand::Set {
+        model: Some(first.to_string()),
+        effort,
+    }
+}
+
+fn is_reasoning_effort_value(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "minimal" | "low" | "medium" | "high" | "xhigh" | "none"
+    )
+}
+
 pub(super) fn padded_chat_lines(agent: &AgentState, area: Rect) -> Vec<Line<'static>> {
     let mut lines = chat_lines(agent);
     let inner_height = area.height.saturating_sub(2) as usize;
@@ -417,14 +476,54 @@ pub(super) fn format_shell_output(
 }
 
 pub(super) fn load_codex_chat_model_label() -> Option<String> {
+    let (model, reasoning_effort) = load_codex_chat_model_config()?;
+    Some(format_chat_model_label(&model, reasoning_effort.as_deref()))
+}
+
+pub(super) fn load_codex_chat_model() -> Option<String> {
+    let (model, _) = load_codex_chat_model_config()?;
+    Some(model)
+}
+
+pub(super) fn load_codex_chat_reasoning_effort() -> Option<String> {
+    let (_, reasoning_effort) = load_codex_chat_model_config()?;
+    reasoning_effort
+}
+
+pub(super) fn format_chat_model_label(model: &str, reasoning_effort: Option<&str>) -> String {
+    match reasoning_effort {
+        Some(effort) if !effort.trim().is_empty() => format!("{model} · {effort}"),
+        _ => model.to_string(),
+    }
+}
+
+pub(super) fn resolve_chat_model_label(
+    selected_model: Option<&str>,
+    selected_effort: Option<&str>,
+    default_model: Option<&str>,
+    default_label: &str,
+) -> String {
+    match selected_model {
+        Some(model) => format_chat_model_label(model, selected_effort),
+        None => match selected_effort
+            .map(str::trim)
+            .filter(|effort| !effort.is_empty())
+        {
+            Some(effort) => default_model
+                .map(|model| format_chat_model_label(model, Some(effort)))
+                .unwrap_or_else(|| format!("default · {effort}")),
+            None => default_label.to_string(),
+        },
+    }
+}
+
+fn load_codex_chat_model_config() -> Option<(String, Option<String>)> {
     let config_path = codex_config_path()?;
     let contents = fs::read_to_string(config_path).ok()?;
 
     let model = parse_codex_top_level_string(&contents, "model")?;
-    match parse_codex_top_level_string(&contents, "model_reasoning_effort") {
-        Some(effort) => Some(format!("{model} · {effort}")),
-        None => Some(model),
-    }
+    let reasoning_effort = parse_codex_top_level_string(&contents, "model_reasoning_effort");
+    Some((model, reasoning_effort))
 }
 
 fn codex_config_path() -> Option<PathBuf> {
