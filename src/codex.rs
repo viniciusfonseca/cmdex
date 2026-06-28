@@ -56,6 +56,10 @@ pub enum ServerEvent {
         thread_id: String,
         active: bool,
     },
+    TurnStarted {
+        thread_id: String,
+        turn_id: String,
+    },
     ItemStarted {
         thread_id: String,
         item: ThreadItem,
@@ -71,6 +75,8 @@ pub enum ServerEvent {
     },
     TurnCompleted {
         thread_id: String,
+        turn_id: String,
+        interrupted: bool,
     },
     Warning(String),
     Error(String),
@@ -209,8 +215,8 @@ impl CodexAppServer {
         text: &str,
         model: Option<&str>,
         effort: Option<&str>,
-    ) -> Result<()> {
-        let _: TurnStartResponse = self
+    ) -> Result<String> {
+        let response: TurnStartResponse = self
             .request(
                 "turn/start",
                 TurnStartParams {
@@ -218,6 +224,20 @@ impl CodexAppServer {
                     input: vec![UserInput::text(text)],
                     model: model.map(ToString::to_string),
                     effort: effort.map(ToString::to_string),
+                },
+            )
+            .await?;
+
+        Ok(response.turn.id)
+    }
+
+    pub async fn interrupt_turn(&self, thread_id: &str, turn_id: &str) -> Result<()> {
+        let _: TurnInterruptResponse = self
+            .request(
+                "turn/interrupt",
+                TurnInterruptParams {
+                    thread_id: thread_id.to_string(),
+                    turn_id: turn_id.to_string(),
                 },
             )
             .await?;
@@ -440,6 +460,17 @@ struct TurnStartResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct TurnInterruptParams {
+    #[serde(rename = "threadId")]
+    thread_id: String,
+    #[serde(rename = "turnId")]
+    turn_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TurnInterruptResponse {}
+
+#[derive(Debug, Serialize)]
 struct ThreadResumeParams {
     #[serde(rename = "threadId")]
     thread_id: String,
@@ -593,6 +624,20 @@ struct AgentMessageDeltaParams {
 struct TurnCompletedParams {
     #[serde(rename = "threadId")]
     thread_id: String,
+    turn: TurnCompletedTurn,
+}
+
+#[derive(Debug, Deserialize)]
+struct TurnStartedParams {
+    #[serde(rename = "threadId")]
+    thread_id: String,
+    turn: TurnResponse,
+}
+
+#[derive(Debug, Deserialize)]
+struct TurnCompletedTurn {
+    id: String,
+    status: String,
 }
 
 fn parse_server_event(value: Value) -> Option<ServerEvent> {
@@ -605,6 +650,13 @@ fn parse_server_event(value: Value) -> Option<ServerEvent> {
             Some(ServerEvent::ThreadStatusChanged {
                 thread_id: params.thread_id,
                 active: params.status.kind == "active",
+            })
+        }
+        "turn/started" => {
+            let params: TurnStartedParams = serde_json::from_value(params).ok()?;
+            Some(ServerEvent::TurnStarted {
+                thread_id: params.thread_id,
+                turn_id: params.turn.id,
             })
         }
         "item/started" => {
@@ -633,6 +685,8 @@ fn parse_server_event(value: Value) -> Option<ServerEvent> {
             let params: TurnCompletedParams = serde_json::from_value(params).ok()?;
             Some(ServerEvent::TurnCompleted {
                 thread_id: params.thread_id,
+                turn_id: params.turn.id,
+                interrupted: params.turn.status == "interrupted",
             })
         }
         "warning" => Some(ServerEvent::Warning(extract_message(&params))),
@@ -967,5 +1021,47 @@ mod tests {
         assert!(entries[1].text.contains("cargo check"));
         assert_eq!(entries[2].kind, HistoryEntryKind::Assistant);
         assert_eq!(entries[2].text, "done");
+    }
+
+    #[test]
+    fn parses_turn_started_and_completed_notifications() {
+        let started = parse_server_event(json!({
+            "method": "turn/started",
+            "params": {
+                "threadId": "thread-1",
+                "turn": {
+                    "id": "turn-1",
+                    "items": [],
+                    "status": "inProgress"
+                }
+            }
+        }));
+        assert!(matches!(
+            started,
+            Some(ServerEvent::TurnStarted {
+                thread_id,
+                turn_id
+            }) if thread_id == "thread-1" && turn_id == "turn-1"
+        ));
+
+        let completed = parse_server_event(json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turn": {
+                    "id": "turn-1",
+                    "items": [],
+                    "status": "interrupted"
+                }
+            }
+        }));
+        assert!(matches!(
+            completed,
+            Some(ServerEvent::TurnCompleted {
+                thread_id,
+                turn_id,
+                interrupted
+            }) if thread_id == "thread-1" && turn_id == "turn-1" && interrupted
+        ));
     }
 }

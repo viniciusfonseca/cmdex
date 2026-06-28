@@ -250,6 +250,38 @@ fn chat_input_height_grows_with_wrapped_content() {
 }
 
 #[test]
+fn turn_events_track_active_turn_and_interruption_status() {
+    let config = CmdexConfig {
+        agents: vec![AgentDefinition {
+            name: "Test".to_string(),
+            workspace: PathBuf::from("/tmp"),
+        }],
+    };
+    let mut app = App::new(PathBuf::new(), config);
+    app.current_agent = Some(0);
+    app.chat_sidebar_index = 1;
+    app.agents[0].thread_id = Some("thread-1".to_string());
+
+    app.handle_server_event(ServerEvent::TurnStarted {
+        thread_id: "thread-1".to_string(),
+        turn_id: "turn-1".to_string(),
+    });
+
+    assert_eq!(app.agents[0].active_turn_id.as_deref(), Some("turn-1"));
+    assert!(app.agents[0].thinking);
+
+    app.handle_server_event(ServerEvent::TurnCompleted {
+        thread_id: "thread-1".to_string(),
+        turn_id: "turn-1".to_string(),
+        interrupted: true,
+    });
+
+    assert_eq!(app.agents[0].active_turn_id, None);
+    assert!(!app.agents[0].thinking);
+    assert_eq!(app.agents[0].status.as_deref(), Some("Response canceled"));
+}
+
+#[test]
 fn parses_codex_model_from_top_level_config() {
     let config = r#"
 model = "gpt-5.4"

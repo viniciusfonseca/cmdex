@@ -94,10 +94,18 @@ enum UiEvent {
         agent_index: usize,
         message: String,
     },
+    TurnStartedLocal {
+        agent_index: usize,
+        turn_id: String,
+    },
     ShellCompleted {
         agent_index: usize,
         output: String,
         success: bool,
+    },
+    TurnInterruptFailed {
+        agent_index: usize,
+        message: String,
     },
 }
 
@@ -229,6 +237,7 @@ struct AgentState {
     definition: AgentDefinition,
     thread_id: Option<String>,
     thread_loaded: bool,
+    active_turn_id: Option<String>,
     messages: Vec<ChatMessage>,
     chat_model: Option<String>,
     chat_reasoning_effort: Option<String>,
@@ -255,6 +264,7 @@ impl AgentState {
             definition,
             thread_id: None,
             thread_loaded: false,
+            active_turn_id: None,
             messages: Vec::new(),
             chat_model: default_chat_model,
             chat_reasoning_effort: default_chat_reasoning_effort,

@@ -469,6 +469,9 @@ impl App {
                         self.current_agent.map(|index| index + 1).unwrap_or(0);
                 }
             }
+            KeyCode::Esc if self.current_tab == AppTab::Chat => {
+                self.interrupt_active_chat_turn(codex.clone(), ui_tx.clone());
+            }
             KeyCode::Tab if self.add_agent_selected() => {
                 self.add_form.active_field = match self.add_form.active_field {
                     AddAgentField::Name => AddAgentField::Workspace,
@@ -1095,7 +1098,7 @@ impl App {
                 },
             };
 
-            if let Err(error) = codex
+            match codex
                 .start_turn(
                     &thread_id,
                     &text,
@@ -1104,10 +1107,18 @@ impl App {
                 )
                 .await
             {
-                let _ = ui_tx.send(UiEvent::SubmissionFailed {
-                    agent_index,
-                    message: error.to_string(),
-                });
+                Ok(turn_id) => {
+                    let _ = ui_tx.send(UiEvent::TurnStartedLocal {
+                        agent_index,
+                        turn_id,
+                    });
+                }
+                Err(error) => {
+                    let _ = ui_tx.send(UiEvent::SubmissionFailed {
+                        agent_index,
+                        message: error.to_string(),
+                    });
+                }
             }
         });
     }
@@ -1254,11 +1265,54 @@ impl App {
         });
     }
 
+    fn interrupt_active_chat_turn(
+        &mut self,
+        codex: CodexAppServer,
+        ui_tx: mpsc::UnboundedSender<UiEvent>,
+    ) {
+        if self.add_agent_selected() {
+            return;
+        }
+
+        let Some(agent_index) = self.current_agent else {
+            return;
+        };
+        let agent = &mut self.agents[agent_index];
+
+        if !agent.thinking || agent.shell_running {
+            return;
+        }
+
+        let (Some(thread_id), Some(turn_id)) =
+            (agent.thread_id.clone(), agent.active_turn_id.clone())
+        else {
+            return;
+        };
+
+        agent.status = Some("Canceling response...".to_string());
+        self.status_message = Some("Canceling response...".to_string());
+
+        tokio::spawn(async move {
+            if let Err(error) = codex.interrupt_turn(&thread_id, &turn_id).await {
+                let _ = ui_tx.send(UiEvent::TurnInterruptFailed {
+                    agent_index,
+                    message: format!("Failed to cancel response: {error}"),
+                });
+            }
+        });
+    }
+
     pub(super) fn handle_server_event(&mut self, event: ServerEvent) {
         match event {
             ServerEvent::ThreadStatusChanged { thread_id, active } => {
                 if let Some(agent) = self.find_agent_by_thread_mut(&thread_id) {
                     agent.thinking = active;
+                }
+            }
+            ServerEvent::TurnStarted { thread_id, turn_id } => {
+                if let Some(agent) = self.find_agent_by_thread_mut(&thread_id) {
+                    agent.active_turn_id = Some(turn_id);
+                    agent.thinking = true;
                 }
             }
             ServerEvent::ItemStarted { thread_id, item } => {
@@ -1306,10 +1360,23 @@ impl App {
                     }
                 }
             }
-            ServerEvent::TurnCompleted { thread_id } => {
+            ServerEvent::TurnCompleted {
+                thread_id,
+                turn_id,
+                interrupted,
+            } => {
                 if let Some(agent) = self.find_agent_by_thread_mut(&thread_id) {
+                    if agent.active_turn_id.as_deref() == Some(turn_id.as_str()) {
+                        agent.active_turn_id = None;
+                    }
                     agent.thinking = false;
                     agent.streaming_item_id = None;
+                    if interrupted {
+                        agent.status = Some("Response canceled".to_string());
+                    }
+                }
+                if interrupted {
+                    self.status_message = Some("Response canceled".to_string());
                 }
             }
             ServerEvent::Warning(message)
@@ -1375,6 +1442,7 @@ impl App {
                 if let Some(agent) = self.agents.get_mut(agent_index) {
                     agent.thinking = false;
                     agent.shell_running = false;
+                    agent.active_turn_id = None;
                     agent.streaming_item_id = None;
                     agent.status = Some(message.clone());
                     agent.messages.push(ChatMessage::new(
@@ -1384,6 +1452,15 @@ impl App {
                     ));
                 }
                 self.status_message = Some(message);
+            }
+            UiEvent::TurnStartedLocal {
+                agent_index,
+                turn_id,
+            } => {
+                if let Some(agent) = self.agents.get_mut(agent_index) {
+                    agent.active_turn_id = Some(turn_id);
+                    agent.thinking = true;
+                }
             }
             UiEvent::ShellCompleted {
                 agent_index,
@@ -1404,6 +1481,20 @@ impl App {
                     agent.workspace.refresh(&root);
                     agent.git_diff.refresh(&root);
                 }
+            }
+            UiEvent::TurnInterruptFailed {
+                agent_index,
+                message,
+            } => {
+                if let Some(agent) = self.agents.get_mut(agent_index) {
+                    agent.status = Some(message.clone());
+                    agent.messages.push(ChatMessage::new(
+                        MessageRole::System,
+                        message.clone(),
+                        None,
+                    ));
+                }
+                self.status_message = Some(message);
             }
         }
     }
