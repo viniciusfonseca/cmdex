@@ -189,13 +189,15 @@ fn draw_workspace_sidebar(frame: &mut Frame, app: &App, area: Rect) {
                 .into_iter()
                 .map(ListItem::new)
                 .collect::<Vec<_>>();
-            let mut state = ListState::default();
-            state.select(Some(
-                agent
-                    .workspace
-                    .sidebar_selected_row()
-                    .min(items.len().saturating_sub(1)),
-            ));
+            let selected = agent
+                .workspace
+                .sidebar_selected_row()
+                .min(items.len().saturating_sub(1));
+            let visible_rows = inner_rect(layout.content).height as usize;
+            let offset = list_offset(selected, items.len(), visible_rows);
+            let mut state = ListState::default()
+                .with_offset(offset)
+                .with_selected(Some(selected));
 
             let list = List::new(items)
                 .block(sidebar_block().title("Files"))
@@ -203,6 +205,12 @@ fn draw_workspace_sidebar(frame: &mut Frame, app: &App, area: Rect) {
                 .highlight_style(selection_style())
                 .highlight_symbol("› ");
             frame.render_stateful_widget(list, layout.content, &mut state);
+            render_vertical_scrollbar(
+                frame,
+                layout.content,
+                agent.workspace.sidebar_len(),
+                offset as u16,
+            );
         }
         WorkspaceSidebarTab::Search => {
             let input = Paragraph::new(agent.workspace.search_query.as_str())

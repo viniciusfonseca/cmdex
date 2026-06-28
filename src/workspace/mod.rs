@@ -10,7 +10,6 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::LazyLock,
 };
 
 use anyhow::{Context, Result};
@@ -19,16 +18,11 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
 };
-use syntect::{
-    easy::HighlightLines,
-    highlighting::FontStyle,
-    parsing::{SyntaxReference, SyntaxSet},
-};
+use syntect::{easy::HighlightLines, highlighting::FontStyle, parsing::SyntaxReference};
 
 use crate::theme::{app_theme, syntax_theme};
 
 const PREVIEW_LIMIT: usize = 200_000;
-static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
 
 #[derive(Debug, Clone, Default)]
 pub struct FileBrowserState {

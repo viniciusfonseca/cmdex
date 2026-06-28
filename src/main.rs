@@ -1,6 +1,7 @@
 mod app;
 mod codex;
 mod config;
+mod syntax;
 mod theme;
 mod workspace;
 

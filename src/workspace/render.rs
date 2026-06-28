@@ -1,4 +1,5 @@
 use super::*;
+use crate::syntax::syntax_set;
 
 pub(super) fn read_text_preview(path: &Path) -> Result<Vec<Line<'static>>> {
     let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
@@ -32,11 +33,11 @@ fn syntax_for_editor_lines(
 ) -> Option<&'static SyntaxReference> {
     path.extension()
         .and_then(|extension| extension.to_str())
-        .and_then(|extension| SYNTAX_SET.find_syntax_by_extension(extension))
+        .and_then(|extension| syntax_set().find_syntax_by_extension(extension))
         .or_else(|| {
             source_lines
                 .first()
-                .and_then(|line| SYNTAX_SET.find_syntax_by_first_line(line))
+                .and_then(|line| syntax_set().find_syntax_by_first_line(line))
         })
 }
 
@@ -46,12 +47,12 @@ pub(super) fn syntax_for_path<'a>(
 ) -> Option<&'static SyntaxReference> {
     path.extension()
         .and_then(|extension| extension.to_str())
-        .and_then(|extension| SYNTAX_SET.find_syntax_by_extension(extension))
+        .and_then(|extension| syntax_set().find_syntax_by_extension(extension))
         .or_else(|| {
             source
                 .lines()
                 .next()
-                .and_then(|line| SYNTAX_SET.find_syntax_by_first_line(line))
+                .and_then(|line| syntax_set().find_syntax_by_first_line(line))
         })
 }
 
@@ -69,7 +70,7 @@ pub(super) fn highlighted_preview_lines(
                         return Line::default();
                     }
 
-                    match highlighter.highlight_line(&line, &SYNTAX_SET) {
+                    match highlighter.highlight_line(&line, syntax_set()) {
                         Ok(ranges) => Line::from(
                             ranges
                                 .into_iter()
@@ -102,7 +103,7 @@ pub(super) fn build_editor_render_lines(
                         return Line::default();
                     }
 
-                    match highlighter.highlight_line(line, &SYNTAX_SET) {
+                    match highlighter.highlight_line(line, syntax_set()) {
                         Ok(ranges) => Line::from(
                             ranges
                                 .into_iter()

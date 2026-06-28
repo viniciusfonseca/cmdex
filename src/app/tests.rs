@@ -6,7 +6,7 @@ use super::{
         resolve_chat_model_label, shell_command_from_input,
     },
     ui::{
-        chat_input_height_for_main_area, scroll_position_from_row,
+        chat_input_height_for_main_area, list_offset, scroll_position_from_row,
         scrollable_preview_content_height, scrollable_text_height, scrollbar_thumb_bounds,
         vertical_scrollbar_metrics, wrapped_chat_input_lines, wrapped_text_height,
     },
@@ -18,6 +18,14 @@ fn wrapped_text_height_matches_paragraph_word_wrapping() {
     let text = Text::from(vec![Line::from("abc def ghi")]);
 
     assert_eq!(wrapped_text_height(&text, 6), 3);
+}
+
+#[test]
+fn list_offset_scrolls_long_lists_to_keep_selection_visible() {
+    assert_eq!(list_offset(0, 10, 4), 0);
+    assert_eq!(list_offset(3, 10, 4), 0);
+    assert_eq!(list_offset(4, 10, 4), 1);
+    assert_eq!(list_offset(9, 10, 4), 6);
 }
 
 #[test]
