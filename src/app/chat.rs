@@ -1,5 +1,5 @@
 use super::{
-    ui::{theme, wrapped_text_height},
+    ui::{scrollable_text_height, theme},
     *,
 };
 
@@ -18,9 +18,26 @@ pub(super) fn chat_lines(agent: &AgentState) -> Vec<Line<'static>> {
 pub(super) fn chat_max_scroll(agent: &AgentState, area: Rect) -> u16 {
     let lines = chat_lines(agent);
     let inner_height = area.height.saturating_sub(2) as usize;
-    let content_height = wrapped_text_height(&Text::from(lines), area.width.saturating_sub(2));
+    let content_height = scrollable_text_height(&Text::from(lines), area);
 
     content_height.saturating_sub(inner_height) as u16
+}
+
+pub(super) fn padded_chat_lines(agent: &AgentState, area: Rect) -> Vec<Line<'static>> {
+    let mut lines = chat_lines(agent);
+    let inner_height = area.height.saturating_sub(2) as usize;
+    if inner_height == 0 {
+        return lines;
+    }
+
+    let content_height = scrollable_text_height(&Text::from(lines.clone()), area);
+    if content_height >= inner_height {
+        return lines;
+    }
+
+    let mut padded = vec![Line::default(); inner_height - content_height];
+    padded.append(&mut lines);
+    padded
 }
 
 fn render_chat_message_lines(message: &ChatMessage, agent_name: &str) -> Vec<Line<'static>> {

@@ -308,15 +308,12 @@ impl App {
         match target {
             ScrollbarDragTarget::Chat => {
                 let text = Text::from(chat_lines(agent));
-                let content_length =
-                    wrapped_text_height(&text, layout.body.width.saturating_sub(2));
+                let content_length = scrollable_text_height(&text, layout.body);
                 vertical_scrollbar_metrics(layout.body, content_length)
             }
             ScrollbarDragTarget::WorkspacePreview => {
-                let content_length = preview_content_height(
-                    &agent.workspace.preview,
-                    layout.body.width.saturating_sub(2),
-                );
+                let content_length =
+                    scrollable_preview_content_height(&agent.workspace.preview, layout.body);
                 vertical_scrollbar_metrics(layout.body, content_length)
             }
             ScrollbarDragTarget::WorkspaceEditor => {
@@ -326,10 +323,8 @@ impl App {
             }
             ScrollbarDragTarget::GitDiffPreview => {
                 let diff_layout = git_diff_layout(layout.body);
-                let content_length = preview_content_height(
-                    &agent.git_diff.preview,
-                    diff_layout.preview.width.saturating_sub(2),
-                );
+                let content_length =
+                    scrollable_preview_content_height(&agent.git_diff.preview, diff_layout.preview);
                 vertical_scrollbar_metrics(diff_layout.preview, content_length)
             }
         }

@@ -1,11 +1,13 @@
 use super::{
     chat::{
-        chat_max_scroll, format_shell_output, parse_codex_model_from_config,
-        parse_codex_reasoning_effort_from_config, shell_command_from_input,
+        chat_lines, chat_max_scroll, format_shell_output, padded_chat_lines,
+        parse_codex_model_from_config, parse_codex_reasoning_effort_from_config,
+        shell_command_from_input,
     },
     ui::{
-        chat_input_height_for_main_area, scroll_position_from_row, vertical_scrollbar_metrics,
-        wrapped_chat_input_lines, wrapped_text_height,
+        chat_input_height_for_main_area, scroll_position_from_row,
+        scrollable_preview_content_height, scrollable_text_height, scrollbar_thumb_bounds,
+        vertical_scrollbar_metrics, wrapped_chat_input_lines, wrapped_text_height,
     },
     *,
 };
@@ -32,6 +34,77 @@ fn chat_max_scroll_uses_wrapped_height_for_last_message() {
     let area = Rect::new(0, 0, 8, 5);
 
     assert_eq!(chat_max_scroll(&agent, area), 2);
+}
+
+#[test]
+fn chat_appends_single_blank_line_after_final_message() {
+    let mut agent = AgentState::new(AgentDefinition {
+        name: "Test".to_string(),
+        workspace: PathBuf::from("/tmp"),
+    });
+    agent.messages.push(ChatMessage {
+        role: MessageRole::Assistant,
+        text: "final message".to_string(),
+        item_id: None,
+    });
+
+    let lines = chat_lines(&agent);
+
+    assert_eq!(lines.len(), 3);
+    assert_eq!(line_text(&lines[0]), "Test:");
+    assert_eq!(line_text(&lines[1]), "final message");
+    assert!(line_text(&lines[2]).is_empty());
+}
+
+#[test]
+fn chat_keeps_a_single_blank_line_between_messages() {
+    let mut agent = AgentState::new(AgentDefinition {
+        name: "Test".to_string(),
+        workspace: PathBuf::from("/tmp"),
+    });
+    agent.messages.push(ChatMessage {
+        role: MessageRole::User,
+        text: "one".to_string(),
+        item_id: None,
+    });
+    agent.messages.push(ChatMessage {
+        role: MessageRole::Assistant,
+        text: "two".to_string(),
+        item_id: None,
+    });
+
+    let lines = chat_lines(&agent);
+
+    assert_eq!(line_text(&lines[0]), "You:");
+    assert_eq!(line_text(&lines[1]), "one");
+    assert!(line_text(&lines[2]).is_empty());
+    assert_eq!(line_text(&lines[3]), "Test:");
+    assert_eq!(line_text(&lines[4]), "two");
+    assert!(line_text(&lines[5]).is_empty());
+}
+
+#[test]
+fn chat_bottom_aligns_short_content_with_one_blank_line_after_last_message() {
+    let mut agent = AgentState::new(AgentDefinition {
+        name: "Test".to_string(),
+        workspace: PathBuf::from("/tmp"),
+    });
+    agent.messages.push(ChatMessage {
+        role: MessageRole::Assistant,
+        text: "final message".to_string(),
+        item_id: None,
+    });
+
+    let area = Rect::new(0, 0, 20, 8);
+    let lines = padded_chat_lines(&agent, area);
+
+    assert_eq!(lines.len(), 6);
+    assert!(line_text(&lines[0]).is_empty());
+    assert!(line_text(&lines[1]).is_empty());
+    assert!(line_text(&lines[2]).is_empty());
+    assert_eq!(line_text(&lines[3]), "Test:");
+    assert_eq!(line_text(&lines[4]), "final message");
+    assert!(line_text(&lines[5]).is_empty());
 }
 
 #[test]
@@ -164,6 +237,43 @@ fn scrollbar_drag_maps_mouse_row_to_scroll_position() {
 }
 
 #[test]
+fn scrollbar_drag_keeps_cursor_at_thumb_center() {
+    let metrics = ScrollbarMetrics {
+        track: Rect::new(0, 10, 1, 6),
+        content_length: 8,
+        viewport_length: 4,
+    };
+
+    let (thumb_top, thumb_height) = scrollbar_thumb_bounds(metrics, 3).expect("thumb bounds");
+    let cursor_row = metrics.track.y + thumb_top + thumb_height / 2;
+
+    assert_eq!(scroll_position_from_row(metrics, cursor_row), 3);
+}
+
+#[test]
+fn scrollbar_thumb_reaches_bottom_of_track_at_max_scroll() {
+    let metrics = ScrollbarMetrics {
+        track: Rect::new(0, 10, 1, 6),
+        content_length: 8,
+        viewport_length: 4,
+    };
+
+    let (thumb_top, thumb_height) = scrollbar_thumb_bounds(metrics, 4).expect("thumb bounds");
+
+    assert_eq!(thumb_top + thumb_height, metrics.track.height);
+}
+
+#[test]
+fn scrollable_content_height_accounts_for_scrollbar_width() {
+    let area = Rect::new(0, 0, 6, 3);
+    let lines = vec![Line::from("1234567")];
+    let text = Text::from(lines.clone());
+
+    assert_eq!(scrollable_preview_content_height(&lines, area), 3);
+    assert_eq!(scrollable_text_height(&text, area), 3);
+}
+
+#[test]
 fn workspace_tree_refreshes_on_tick_after_filesystem_changes() {
     let root = std::env::temp_dir().join(format!(
         "cmdex-app-workspace-refresh-{}-{}",
@@ -204,4 +314,11 @@ fn workspace_tree_refreshes_on_tick_after_filesystem_changes() {
     );
 
     let _ = fs::remove_dir_all(root);
+}
+
+fn line_text(line: &Line<'_>) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>()
 }

@@ -1,5 +1,5 @@
 use super::{
-    chat::{chat_input_is_shell, chat_lines},
+    chat::{chat_input_is_shell, padded_chat_lines},
     *,
 };
 
@@ -98,15 +98,6 @@ fn editor_block() -> Block<'static> {
 
 fn action_style(color: ratatui::style::Color) -> Style {
     Style::default().bg(theme().panel_bg).fg(color)
-}
-
-fn scrollbar_widget() -> Scrollbar<'static> {
-    Scrollbar::new(ScrollbarOrientation::VerticalRight)
-        .begin_symbol(None)
-        .end_symbol(None)
-        .track_symbol(None)
-        .thumb_symbol("█")
-        .thumb_style(Style::default().fg(theme().scrollbar_thumb))
 }
 
 fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
@@ -426,7 +417,7 @@ fn draw_chat(frame: &mut Frame, app: &App, area: Rect) {
         return;
     };
 
-    let lines = chat_lines(agent);
+    let lines = padded_chat_lines(agent, area);
 
     let title = if let Some(status) = &agent.status {
         format!("Chat - {} ({status})", agent.definition.name)
@@ -436,7 +427,7 @@ fn draw_chat(frame: &mut Frame, app: &App, area: Rect) {
 
     let inner_height = area.height.saturating_sub(2);
     let text = Text::from(lines);
-    let content_height = wrapped_text_height(&text, area.width.saturating_sub(2));
+    let content_height = scrollable_text_height(&text, area);
     let max_scroll = content_height.saturating_sub(inner_height as usize) as u16;
     let scroll = if agent.chat_follow_output {
         max_scroll
@@ -599,7 +590,7 @@ fn draw_workspace(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(theme().error).bg(theme().panel_bg),
         )));
     }
-    let content_length = preview_content_height(&lines, area.width.saturating_sub(2));
+    let content_length = scrollable_preview_content_height(&lines, area);
 
     let widget = Paragraph::new(Text::from(lines))
         .block(panel_block().title(agent.workspace.preview_title.clone()))
@@ -706,8 +697,7 @@ fn draw_git_diff(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(tabs, layout.sections);
 
     let preview_lines = agent.git_diff.preview.clone();
-    let content_length =
-        preview_content_height(&preview_lines, layout.preview.width.saturating_sub(2));
+    let content_length = scrollable_preview_content_height(&preview_lines, layout.preview);
     let widget = Paragraph::new(Text::from(preview_lines))
         .block(editor_block().title(agent.git_diff.preview_title.clone()))
         .style(editor_style())
@@ -870,12 +860,7 @@ fn render_vertical_scrollbar(frame: &mut Frame, area: Rect, content_length: usiz
     let Some(metrics) = vertical_scrollbar_metrics(area, content_length) else {
         return;
     };
-
-    let mut state = ScrollbarState::new(content_length.max(1))
-        .position(scroll as usize)
-        .viewport_content_length(metrics.viewport_length);
-
-    frame.render_stateful_widget(scrollbar_widget(), metrics.track, &mut state);
+    render_scrollbar_thumb(frame, metrics, scroll);
 }
 
 fn render_vertical_scrollbar_with_viewport(
@@ -887,12 +872,7 @@ fn render_vertical_scrollbar_with_viewport(
     let Some(metrics) = vertical_scrollbar_metrics_for_viewport(viewport, content_length) else {
         return;
     };
-
-    let mut state = ScrollbarState::new(content_length.max(1))
-        .position(scroll as usize)
-        .viewport_content_length(metrics.viewport_length);
-
-    frame.render_stateful_widget(scrollbar_widget(), metrics.track, &mut state);
+    render_scrollbar_thumb(frame, metrics, scroll);
 }
 
 pub(super) fn vertical_scrollbar_metrics(
@@ -934,14 +914,70 @@ pub(super) fn scroll_position_from_row(metrics: ScrollbarMetrics, row: u16) -> u
         return 0;
     }
 
+    let (_, thumb_height) = scrollbar_thumb_bounds(metrics, 0).unwrap_or((0, 1));
+    let track_travel = metrics.track.height.saturating_sub(thumb_height);
+    if track_travel == 0 {
+        return 0;
+    }
+
+    let thumb_half = thumb_height / 2;
     let row_offset = row
         .saturating_sub(metrics.track.y)
-        .min(metrics.track.height.saturating_sub(1)) as usize;
-    let track_height = usize::from(metrics.track.height.saturating_sub(1).max(1));
+        .saturating_sub(thumb_half)
+        .min(track_travel) as usize;
+    let track_travel = usize::from(track_travel);
 
-    ((row_offset * max_scroll) + track_height / 2)
-        .checked_div(track_height)
+    ((row_offset * max_scroll) + track_travel / 2)
+        .checked_div(track_travel)
         .unwrap_or(0) as u16
+}
+
+fn render_scrollbar_thumb(frame: &mut Frame, metrics: ScrollbarMetrics, scroll: u16) {
+    let Some((thumb_top, thumb_height)) = scrollbar_thumb_bounds(metrics, scroll) else {
+        return;
+    };
+
+    let lines = (0..metrics.track.height)
+        .map(|row| {
+            if row >= thumb_top && row < thumb_top.saturating_add(thumb_height) {
+                Line::from(Span::styled(
+                    "█",
+                    Style::default().fg(theme().scrollbar_thumb),
+                ))
+            } else {
+                Line::from(" ")
+            }
+        })
+        .collect::<Vec<_>>();
+
+    frame.render_widget(Paragraph::new(Text::from(lines)), metrics.track);
+}
+
+pub(super) fn scrollbar_thumb_bounds(metrics: ScrollbarMetrics, scroll: u16) -> Option<(u16, u16)> {
+    if metrics.track.height == 0 || metrics.content_length == 0 || metrics.viewport_length == 0 {
+        return None;
+    }
+
+    let track_height = usize::from(metrics.track.height);
+    let proportional_height = ((metrics.viewport_length * track_height)
+        + metrics.content_length / 2)
+        / metrics.content_length;
+    let thumb_height = proportional_height.clamp(1, track_height) as u16;
+
+    let max_scroll = metrics
+        .content_length
+        .saturating_sub(metrics.viewport_length)
+        .min(u16::MAX as usize) as u16;
+    let track_travel = metrics.track.height.saturating_sub(thumb_height);
+    let thumb_top = if max_scroll == 0 || track_travel == 0 {
+        0
+    } else {
+        let scroll = scroll.min(max_scroll) as usize;
+        let track_travel = usize::from(track_travel);
+        (((scroll * track_travel) + usize::from(max_scroll) / 2) / usize::from(max_scroll)) as u16
+    };
+
+    Some((thumb_top, thumb_height))
 }
 
 fn workspace_editor_panes(inner: Rect) -> (Rect, Option<Rect>) {
@@ -992,6 +1028,26 @@ pub(super) fn wrapped_text_height(text: &Text<'_>, width: u16) -> usize {
     Paragraph::new(text.clone())
         .wrap(Wrap { trim: false })
         .line_count(width.max(1))
+}
+
+pub(super) fn scrollable_preview_content_height(lines: &[Line<'_>], area: Rect) -> usize {
+    let viewport = inner_rect(area);
+    let base_height = preview_content_height(lines, viewport.width);
+    if base_height > viewport.height as usize && viewport.width > 1 {
+        preview_content_height(lines, viewport.width.saturating_sub(1))
+    } else {
+        base_height
+    }
+}
+
+pub(super) fn scrollable_text_height(text: &Text<'_>, area: Rect) -> usize {
+    let viewport = inner_rect(area);
+    let base_height = wrapped_text_height(text, viewport.width);
+    if base_height > viewport.height as usize && viewport.width > 1 {
+        wrapped_text_height(text, viewport.width.saturating_sub(1))
+    } else {
+        base_height
+    }
 }
 
 pub(super) fn chat_input_height_for_main_area(input: &str, main_area: Rect) -> u16 {
