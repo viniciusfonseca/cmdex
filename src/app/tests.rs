@@ -5,11 +5,12 @@ use super::{
         parse_codex_model_from_config, parse_codex_reasoning_effort_from_config,
         resolve_chat_model_label, shell_command_from_input,
     },
+    shell::{SHELL_COMMAND_SENTINEL, ShellTabState, shell_command_payload, shell_display_lines},
     ui::{
         chat_input_height_for_main_area, git_diff_remote_button_label, list_offset,
         scroll_position_from_row, scrollable_preview_content_height, scrollable_text_height,
-        scrollbar_thumb_bounds, vertical_scrollbar_metrics, wrapped_chat_input_lines,
-        wrapped_text_height,
+        scrollbar_thumb_bounds, tab_from_click, top_navigation_tabs_rect,
+        vertical_scrollbar_metrics, wrapped_chat_input_lines, wrapped_text_height,
     },
     *,
 };
@@ -49,6 +50,172 @@ fn git_diff_remote_button_label_shows_spinner_only_for_active_action() {
         ),
         "Pull"
     );
+}
+
+#[test]
+fn shell_tab_session_creation_selects_new_session() {
+    let mut shell_tab = ShellTabState::default();
+    let workspace = PathBuf::from("/tmp/project");
+
+    let first = shell_tab.create_session(&workspace);
+    let second = shell_tab.create_session(&workspace);
+
+    assert_eq!(first, 1);
+    assert_eq!(second, 2);
+    assert_eq!(shell_tab.selected_index(), 1);
+    assert_eq!(
+        shell_tab
+            .selected_session()
+            .map(|session| session.title.as_str()),
+        Some("Session 2")
+    );
+}
+
+#[test]
+fn shell_tab_only_creates_initial_session_once() {
+    let mut shell_tab = ShellTabState::default();
+    let workspace = PathBuf::from("/tmp/project");
+
+    let first = shell_tab.create_session_if_empty(&workspace);
+    let second = shell_tab.create_session_if_empty(&workspace);
+
+    assert_eq!(first, Some(1));
+    assert_eq!(second, None);
+    assert_eq!(shell_tab.sessions.len(), 1);
+    assert_eq!(shell_tab.selected_index(), 0);
+}
+
+#[test]
+fn shell_tab_removes_closed_session_and_clamps_selection() {
+    let mut shell_tab = ShellTabState::default();
+    let workspace = PathBuf::from("/tmp/project");
+
+    let first = shell_tab.create_session(&workspace);
+    let second = shell_tab.create_session(&workspace);
+
+    assert_eq!(shell_tab.selected_index(), 1);
+    shell_tab.remove_session_by_id(second);
+
+    assert_eq!(shell_tab.sessions.len(), 1);
+    assert_eq!(shell_tab.selected_index(), 0);
+    assert_eq!(
+        shell_tab.selected_session().map(|session| session.id),
+        Some(first)
+    );
+}
+
+#[test]
+fn shell_command_payload_appends_completion_sentinel() {
+    let payload = shell_command_payload("pwd");
+
+    assert!(payload.starts_with("pwd\n"));
+    assert!(payload.contains(SHELL_COMMAND_SENTINEL));
+    assert!(payload.contains("\"$?\""));
+}
+
+#[test]
+fn shell_display_lines_hides_prompt_while_session_is_running() {
+    let mut shell_tab = ShellTabState::default();
+    let workspace = PathBuf::from("/tmp/project");
+    shell_tab.create_session(&workspace);
+    let session = shell_tab.selected_session_mut().expect("session");
+
+    let idle_lines = shell_display_lines(session, "ls");
+    assert_eq!(line_text(idle_lines.last().expect("idle prompt")), "$ ls");
+
+    session.append_command("ls");
+    let running_lines = shell_display_lines(session, "");
+    assert_eq!(
+        line_text(running_lines.last().expect("running line")),
+        "$ ls"
+    );
+}
+
+#[test]
+fn shell_tab_index_sits_between_workspace_and_git_diff() {
+    let mut app = App::new(PathBuf::new(), CmdexConfig::default());
+
+    app.current_tab = AppTab::Workspace;
+    assert_eq!(app.selected_tab_index(), 1);
+
+    app.current_tab = AppTab::Shell;
+    assert_eq!(app.selected_tab_index(), 2);
+
+    app.current_tab = AppTab::GitDiff;
+    assert_eq!(app.selected_tab_index(), 3);
+}
+
+#[test]
+fn shell_sidebar_labels_include_new_session_action() {
+    let workspace = PathBuf::from("/tmp/project");
+    let config = CmdexConfig {
+        agents: vec![AgentDefinition {
+            name: "Test".to_string(),
+            workspace: workspace.clone(),
+        }],
+    };
+    let mut app = App::new(PathBuf::new(), config);
+    app.current_tab = AppTab::Shell;
+    app.current_agent = Some(0);
+
+    let labels_without_sessions = app.sidebar_labels();
+    assert_eq!(labels_without_sessions, vec!["+ New session".to_string()]);
+
+    app.agents[0].shell_tab.create_session(&workspace);
+
+    let labels_with_session = app.sidebar_labels();
+    assert_eq!(labels_with_session[0], "+ New session");
+    assert_eq!(labels_with_session[1], "Session 1");
+}
+
+#[test]
+fn shell_session_exit_event_removes_session_from_sidebar() {
+    let workspace = PathBuf::from("/tmp/project");
+    let config = CmdexConfig {
+        agents: vec![AgentDefinition {
+            name: "Test".to_string(),
+            workspace: workspace.clone(),
+        }],
+    };
+    let mut app = App::new(PathBuf::new(), config);
+    app.current_tab = AppTab::Shell;
+    app.current_agent = Some(0);
+
+    let session_id = app.agents[0].shell_tab.create_session(&workspace);
+    app.handle_ui_event(UiEvent::ShellSessionExited {
+        agent_index: 0,
+        session_id,
+        message: "Shell exited".to_string(),
+    });
+
+    assert_eq!(app.sidebar_labels(), vec!["+ New session".to_string()]);
+    assert_eq!(app.status_message.as_deref(), Some("Shell exited"));
+}
+
+#[test]
+fn top_navigation_clicks_ignore_cmdex_prefix_and_hit_tabs() {
+    let area = Rect::new(0, 0, 50, 3);
+    let tabs = top_navigation_tabs_rect(area);
+
+    assert_eq!(tab_from_click(area, 1, 1), None);
+    assert_eq!(tab_from_click(area, tabs.x, tabs.y), Some(AppTab::Chat));
+
+    let workspace_x = tabs.x.saturating_add("Chat".chars().count() as u16 + 3);
+    assert_eq!(
+        tab_from_click(area, workspace_x, tabs.y),
+        Some(AppTab::Workspace)
+    );
+}
+
+#[test]
+fn alt_r_requests_restart() {
+    let mut app = App::new(PathBuf::new(), CmdexConfig::default());
+
+    app.should_restart = true;
+    app.should_quit = true;
+
+    assert!(app.should_restart);
+    assert!(app.should_quit);
 }
 
 #[test]

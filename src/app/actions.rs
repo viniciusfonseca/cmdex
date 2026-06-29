@@ -1,5 +1,7 @@
 use super::{chat::*, ui::*, *};
 use crate::workspace::run_git_remote_action;
+use std::process::Stdio;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::task;
 
 impl App {
@@ -20,6 +22,14 @@ impl App {
                 .active_agent()
                 .map(|agent| agent.workspace.sidebar_labels())
                 .unwrap_or_default(),
+            AppTab::Shell => self
+                .active_agent()
+                .map(|agent| {
+                    let mut items = vec!["+ New session".to_string()];
+                    items.extend(agent.shell_tab.labels(self.spinner_index));
+                    items
+                })
+                .unwrap_or_default(),
             AppTab::GitDiff => self
                 .active_agent()
                 .map(|agent| {
@@ -39,28 +49,33 @@ impl App {
         self.maybe_refresh_workspace();
     }
 
-    fn previous_tab(&mut self) {
-        self.current_tab = match self.current_tab {
-            AppTab::Chat => AppTab::GitDiff,
-            AppTab::Workspace => AppTab::Chat,
-            AppTab::GitDiff => AppTab::Workspace,
-        };
-        self.refresh_current_tab();
-    }
+    pub(super) fn shutdown_shell_sessions(&mut self) {
+        let pids = self
+            .shell_runtimes
+            .drain()
+            .map(|(_, runtime)| runtime.pid)
+            .filter(|pid| *pid != 0)
+            .collect::<Vec<_>>();
 
-    fn next_tab(&mut self) {
-        self.current_tab = match self.current_tab {
-            AppTab::Chat => AppTab::Workspace,
-            AppTab::Workspace => AppTab::GitDiff,
-            AppTab::GitDiff => AppTab::Chat,
-        };
-        self.refresh_current_tab();
+        for pid in pids {
+            let _ = std::process::Command::new("kill")
+                .args(["-TERM", &pid.to_string()])
+                .status();
+        }
     }
 
     fn set_tab(&mut self, tab: AppTab) {
         if self.current_tab != tab {
             self.current_tab = tab;
             self.refresh_current_tab();
+        }
+    }
+
+    fn activate_tab(&mut self, tab: AppTab, ui_tx: mpsc::UnboundedSender<UiEvent>) {
+        if tab == AppTab::Shell && self.current_tab != AppTab::Shell {
+            self.open_shell_tab(ui_tx);
+        } else {
+            self.set_tab(tab);
         }
     }
 
@@ -73,6 +88,7 @@ impl App {
                 }
                 self.last_workspace_refresh_at = Some(Instant::now());
             }
+            AppTab::Shell => {}
             AppTab::GitDiff => {
                 if let Some(agent) = self.active_agent_mut() {
                     agent.git_diff.refresh(&agent.definition.workspace);
@@ -116,6 +132,11 @@ impl App {
                     }
                 }
             }
+            AppTab::Shell => {
+                if let Some(agent) = self.active_agent_mut() {
+                    agent.shell_tab.move_up();
+                }
+            }
             AppTab::GitDiff => {
                 if let Some(agent) = self.active_agent_mut() {
                     let root = agent.definition.workspace.clone();
@@ -138,6 +159,11 @@ impl App {
                     } else {
                         agent.workspace.move_down();
                     }
+                }
+            }
+            AppTab::Shell => {
+                if let Some(agent) = self.active_agent_mut() {
+                    agent.shell_tab.move_down();
                 }
             }
             AppTab::GitDiff => {
@@ -164,6 +190,13 @@ impl App {
                 }
                 if let Some(agent) = self.active_agent_mut() {
                     agent.workspace.scroll_up(lines);
+                }
+            }
+            AppTab::Shell => {
+                if let Some(agent) = self.active_agent_mut() {
+                    if let Some(session) = agent.shell_tab.selected_session_mut() {
+                        session.scroll = session.scroll.saturating_sub(lines);
+                    }
                 }
             }
             AppTab::GitDiff => {
@@ -252,6 +285,7 @@ impl App {
                     ScrollbarDragTarget::WorkspacePreview
                 }
             }
+            AppTab::Shell => ScrollbarDragTarget::ShellOutput,
             AppTab::GitDiff => ScrollbarDragTarget::GitDiffPreview,
             AppTab::Chat => return None,
         };
@@ -294,6 +328,15 @@ impl App {
                 };
                 editor.set_vertical_scroll(scroll, metrics.viewport_length as u16);
             }
+            ScrollbarDragTarget::ShellOutput => {
+                let Some(agent) = self.active_agent_mut() else {
+                    return false;
+                };
+                let Some(session) = agent.shell_tab.selected_session_mut() else {
+                    return false;
+                };
+                session.scroll = scroll;
+            }
             ScrollbarDragTarget::GitDiffPreview => {
                 let Some(agent) = self.active_agent_mut() else {
                     return false;
@@ -326,6 +369,12 @@ impl App {
                 let editor = agent.workspace.editor.as_ref()?;
                 let viewport = workspace_editor_viewport(layout.body);
                 vertical_scrollbar_metrics_for_viewport(viewport, editor.content_height())
+            }
+            ScrollbarDragTarget::ShellOutput => {
+                let session = agent.shell_tab.selected_session()?;
+                let lines = shell::shell_display_lines(session, &agent.shell_tab.input);
+                let content_length = scrollable_preview_content_height(&lines, layout.body);
+                vertical_scrollbar_metrics(layout.body, content_length)
             }
             ScrollbarDragTarget::GitDiffPreview => {
                 let diff_layout = git_diff_layout(layout.body);
@@ -377,6 +426,13 @@ impl App {
                 }
                 if let Some(agent) = self.active_agent_mut() {
                     agent.workspace.scroll_down(lines);
+                }
+            }
+            AppTab::Shell => {
+                if let Some(agent) = self.active_agent_mut() {
+                    if let Some(session) = agent.shell_tab.selected_session_mut() {
+                        session.scroll = session.scroll.saturating_add(lines);
+                    }
                 }
             }
             AppTab::GitDiff => {
@@ -440,11 +496,34 @@ impl App {
             KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.should_quit = true;
             }
+            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.should_restart = true;
+                self.should_quit = true;
+            }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.should_quit = true;
             }
-            KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => self.previous_tab(),
-            KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => self.next_tab(),
+            KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.open_shell_tab_and_create_session(ui_tx.clone());
+            }
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let tab = match self.current_tab {
+                    AppTab::Chat => AppTab::GitDiff,
+                    AppTab::Workspace => AppTab::Chat,
+                    AppTab::Shell => AppTab::Workspace,
+                    AppTab::GitDiff => AppTab::Shell,
+                };
+                self.activate_tab(tab, ui_tx.clone());
+            }
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let tab = match self.current_tab {
+                    AppTab::Chat => AppTab::Workspace,
+                    AppTab::Workspace => AppTab::Shell,
+                    AppTab::Shell => AppTab::GitDiff,
+                    AppTab::GitDiff => AppTab::Chat,
+                };
+                self.activate_tab(tab, ui_tx.clone());
+            }
             KeyCode::Enter
                 if self.current_tab == AppTab::Chat
                     && !self.add_agent_selected()
@@ -491,6 +570,9 @@ impl App {
             KeyCode::Enter if self.current_tab == AppTab::Chat => {
                 self.submit_message(codex.clone(), ui_tx.clone());
             }
+            KeyCode::Enter if self.current_tab == AppTab::Shell => {
+                self.submit_shell_session_command(ui_tx.clone());
+            }
             KeyCode::Backspace => self.handle_backspace(),
             KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.handle_text_input(character);
@@ -518,6 +600,13 @@ impl App {
                         EditorMode::Command => editor.command.push(character),
                         EditorMode::Normal => {}
                     }
+                }
+            }
+        } else if self.current_tab == AppTab::Shell {
+            if let Some(agent) = self.active_agent_mut() {
+                agent.shell_tab.input.push(character);
+                if let Some(session) = agent.shell_tab.selected_session_mut() {
+                    session.scroll = u16::MAX;
                 }
             }
         } else if self.current_tab == AppTab::GitDiff {
@@ -554,6 +643,13 @@ impl App {
                         }
                         EditorMode::Normal => {}
                     }
+                }
+            }
+        } else if self.current_tab == AppTab::Shell {
+            if let Some(agent) = self.active_agent_mut() {
+                agent.shell_tab.input.pop();
+                if let Some(session) = agent.shell_tab.selected_session_mut() {
+                    session.scroll = u16::MAX;
                 }
             }
         } else if self.current_tab == AppTab::GitDiff {
@@ -1340,6 +1436,254 @@ impl App {
         });
     }
 
+    fn open_shell_tab(&mut self, ui_tx: mpsc::UnboundedSender<UiEvent>) {
+        let Some(agent_index) = self.current_agent else {
+            self.status_message = Some("Add an agent before creating a shell session.".to_string());
+            return;
+        };
+
+        self.current_tab = AppTab::Shell;
+        self.refresh_current_tab();
+        let workspace = self.agents[agent_index].definition.workspace.clone();
+        let Some(session_id) = self.agents[agent_index]
+            .shell_tab
+            .create_session_if_empty(&workspace)
+        else {
+            return;
+        };
+        self.start_shell_session(agent_index, session_id, workspace, ui_tx);
+    }
+
+    fn open_shell_tab_and_create_session(&mut self, ui_tx: mpsc::UnboundedSender<UiEvent>) {
+        let Some(agent_index) = self.current_agent else {
+            self.status_message = Some("Add an agent before creating a shell session.".to_string());
+            return;
+        };
+
+        self.current_tab = AppTab::Shell;
+        self.refresh_current_tab();
+        let workspace = self.agents[agent_index].definition.workspace.clone();
+        let session_id = self.agents[agent_index]
+            .shell_tab
+            .create_session(&workspace);
+        self.start_shell_session(agent_index, session_id, workspace, ui_tx);
+    }
+
+    fn start_shell_session(
+        &mut self,
+        agent_index: usize,
+        session_id: usize,
+        workspace: PathBuf,
+        ui_tx: mpsc::UnboundedSender<UiEvent>,
+    ) {
+        if let Err(error) =
+            self.spawn_shell_session_runtime(agent_index, session_id, workspace, ui_tx)
+        {
+            self.agents[agent_index]
+                .shell_tab
+                .remove_session_by_id(session_id);
+            self.status_message = Some(error.to_string());
+        }
+    }
+
+    fn submit_shell_session_command(&mut self, _ui_tx: mpsc::UnboundedSender<UiEvent>) {
+        let Some(agent_index) = self.current_agent else {
+            self.status_message = Some("Add an agent before running shell commands.".to_string());
+            return;
+        };
+
+        let Some(session_id) = self.agents[agent_index]
+            .shell_tab
+            .selected_session()
+            .map(|session| session.id)
+        else {
+            self.status_message = Some("Click + New session or press Ctrl+T.".to_string());
+            return;
+        };
+
+        let command = self.agents[agent_index].shell_tab.input.trim().to_string();
+        if command.is_empty() {
+            return;
+        }
+
+        let key = ShellSessionKey {
+            agent_index,
+            session_id,
+        };
+        let Some(runtime) = self.shell_runtimes.get(&key) else {
+            self.status_message =
+                Some("The selected shell session is no longer available.".to_string());
+            self.agents[agent_index]
+                .shell_tab
+                .remove_session_by_id(session_id);
+            return;
+        };
+
+        let Some(session) = self.agents[agent_index]
+            .shell_tab
+            .session_by_id_mut(session_id)
+        else {
+            return;
+        };
+        if session.running {
+            self.status_message = Some("Wait for the current shell command to finish.".to_string());
+            return;
+        }
+
+        session.append_command(&command);
+        self.agents[agent_index].shell_tab.input.clear();
+
+        if runtime
+            .command_tx
+            .send(shell::shell_command_payload(&command))
+            .is_err()
+        {
+            self.agents[agent_index]
+                .shell_tab
+                .remove_session_by_id(session_id);
+            self.shell_runtimes.remove(&key);
+            self.status_message = Some("Failed to send command to shell.".to_string());
+        }
+    }
+
+    fn spawn_shell_session_runtime(
+        &mut self,
+        agent_index: usize,
+        session_id: usize,
+        workspace: PathBuf,
+        ui_tx: mpsc::UnboundedSender<UiEvent>,
+    ) -> Result<()> {
+        let shell_path = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        let mut child = Command::new(&shell_path)
+            .current_dir(&workspace)
+            .env("PS1", "")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("failed to open shell stdin"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("failed to open shell stdout"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("failed to open shell stderr"))?;
+        let pid = child.id().unwrap_or_default();
+
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel::<String>();
+        let writer_tx = ui_tx.clone();
+        tokio::spawn(async move {
+            let mut stdin = stdin;
+            while let Some(command) = command_rx.recv().await {
+                if let Err(error) = stdin.write_all(command.as_bytes()).await {
+                    let _ = writer_tx.send(UiEvent::ShellSessionExited {
+                        agent_index,
+                        session_id,
+                        message: format!("Shell stdin write failed: {error}"),
+                    });
+                    break;
+                }
+                if let Err(error) = stdin.flush().await {
+                    let _ = writer_tx.send(UiEvent::ShellSessionExited {
+                        agent_index,
+                        session_id,
+                        message: format!("Shell stdin flush failed: {error}"),
+                    });
+                    break;
+                }
+            }
+        });
+
+        let stdout_tx = ui_tx.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stdout).lines();
+            loop {
+                match lines.next_line().await {
+                    Ok(Some(line)) => {
+                        if let Some(code) = line.strip_prefix(shell::SHELL_COMMAND_SENTINEL) {
+                            let exit_code = code.parse::<i32>().unwrap_or(-1);
+                            let _ = stdout_tx.send(UiEvent::ShellSessionCommandFinished {
+                                agent_index,
+                                session_id,
+                                exit_code,
+                            });
+                        } else {
+                            let _ = stdout_tx.send(UiEvent::ShellSessionOutput {
+                                agent_index,
+                                session_id,
+                                line,
+                                stderr: false,
+                            });
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        let _ = stdout_tx.send(UiEvent::ShellSessionExited {
+                            agent_index,
+                            session_id,
+                            message: format!("Shell stdout read failed: {error}"),
+                        });
+                        break;
+                    }
+                }
+            }
+        });
+
+        let stderr_tx = ui_tx.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            loop {
+                match lines.next_line().await {
+                    Ok(Some(line)) => {
+                        let _ = stderr_tx.send(UiEvent::ShellSessionOutput {
+                            agent_index,
+                            session_id,
+                            line,
+                            stderr: true,
+                        });
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        let _ = stderr_tx.send(UiEvent::ShellSessionExited {
+                            agent_index,
+                            session_id,
+                            message: format!("Shell stderr read failed: {error}"),
+                        });
+                        break;
+                    }
+                }
+            }
+        });
+
+        let exit_tx = ui_tx.clone();
+        tokio::spawn(async move {
+            let message = match child.wait().await {
+                Ok(status) => format!("Shell exited with status {}", status),
+                Err(error) => format!("Shell wait failed: {error}"),
+            };
+            let _ = exit_tx.send(UiEvent::ShellSessionExited {
+                agent_index,
+                session_id,
+                message,
+            });
+        });
+
+        self.shell_runtimes.insert(
+            ShellSessionKey {
+                agent_index,
+                session_id,
+            },
+            ShellSessionRuntime { command_tx, pid },
+        );
+        Ok(())
+    }
+
     fn interrupt_active_chat_turn(
         &mut self,
         codex: CodexAppServer,
@@ -1590,6 +1934,53 @@ impl App {
                     message
                 });
             }
+            UiEvent::ShellSessionOutput {
+                agent_index,
+                session_id,
+                line,
+                stderr,
+            } => {
+                if let Some(agent) = self.agents.get_mut(agent_index) {
+                    if let Some(session) = agent.shell_tab.session_by_id_mut(session_id) {
+                        if stderr {
+                            session.append_stderr_line(&line);
+                        } else {
+                            session.append_stdout_line(&line);
+                        }
+                    }
+                }
+            }
+            UiEvent::ShellSessionCommandFinished {
+                agent_index,
+                session_id,
+                exit_code,
+            } => {
+                if let Some(agent) = self.agents.get_mut(agent_index) {
+                    if let Some(session) = agent.shell_tab.session_by_id_mut(session_id) {
+                        session.finish_command(exit_code);
+                    }
+                    let root = agent.definition.workspace.clone();
+                    agent.workspace.refresh(&root);
+                    agent.git_diff.refresh(&root);
+                }
+            }
+            UiEvent::ShellSessionExited {
+                agent_index,
+                session_id,
+                message,
+            } => {
+                self.shell_runtimes.remove(&ShellSessionKey {
+                    agent_index,
+                    session_id,
+                });
+                if let Some(agent) = self.agents.get_mut(agent_index) {
+                    agent.shell_tab.remove_session_by_id(session_id);
+                    if agent.shell_tab.sessions.is_empty() {
+                        agent.shell_tab.input.clear();
+                    }
+                }
+                self.status_message = Some(message);
+            }
         }
     }
 
@@ -1603,54 +1994,54 @@ impl App {
         match self.current_tab {
             AppTab::Chat => 0,
             AppTab::Workspace => 1,
-            AppTab::GitDiff => 2,
+            AppTab::Shell => 2,
+            AppTab::GitDiff => 3,
         }
     }
 
     fn compute_layout(&self, area: Rect) -> UiLayout {
         let frame = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
             .split(area);
 
         let root = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(40)])
-            .split(frame[0]);
-
-        let sidebar = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(LOGO_PANEL_HEIGHT), Constraint::Min(10)])
-            .split(root[0]);
+            .split(frame[1]);
 
         if self.current_tab == AppTab::Chat && !self.add_agent_selected() {
             let input_height = chat_input_height_for_main_area(&self.chat_input, root[1]);
             let main = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(3),
-                    Constraint::Min(10),
-                    Constraint::Length(input_height),
-                ])
+                .constraints([Constraint::Min(10), Constraint::Length(input_height)])
                 .split(root[1]);
 
             UiLayout {
-                sidebar_list: sidebar[1],
-                tabs: main[0],
-                body: main[1],
-                footer: Some(main[2]),
+                sidebar_list: root[0],
+                tabs: frame[0],
+                body: main[0],
+                footer: Some(main[1]),
+                add_name: None,
+                add_workspace: None,
+            }
+        } else if self.current_tab == AppTab::Shell {
+            UiLayout {
+                sidebar_list: root[0],
+                tabs: frame[0],
+                body: root[1],
+                footer: None,
                 add_name: None,
                 add_workspace: None,
             }
         } else {
-            let main = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Length(3), Constraint::Min(10)])
-                .split(root[1]);
-
             if self.current_tab == AppTab::Chat {
                 let outer = rounded_block().title("New Agent");
-                let inner = outer.inner(main[1]);
+                let inner = outer.inner(root[1]);
                 let fields = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
@@ -1663,18 +2054,18 @@ impl App {
                     .split(inner);
 
                 UiLayout {
-                    sidebar_list: sidebar[1],
-                    tabs: main[0],
-                    body: main[1],
+                    sidebar_list: root[0],
+                    tabs: frame[0],
+                    body: root[1],
                     footer: None,
                     add_name: Some(fields[1]),
                     add_workspace: Some(fields[2]),
                 }
             } else {
                 UiLayout {
-                    sidebar_list: sidebar[1],
-                    tabs: main[0],
-                    body: main[1],
+                    sidebar_list: root[0],
+                    tabs: frame[0],
+                    body: root[1],
                     footer: None,
                     add_name: None,
                     add_workspace: None,
@@ -1692,13 +2083,13 @@ impl App {
     ) {
         if rect_contains(layout.tabs, column, row) {
             if let Some(tab) = tab_from_click(layout.tabs, column, row) {
-                self.set_tab(tab);
+                self.activate_tab(tab, ui_tx.clone());
             }
             return;
         }
 
         if rect_contains(layout.sidebar_list, column, row) {
-            self.handle_sidebar_click(column, row, layout.sidebar_list);
+            self.handle_sidebar_click(column, row, layout.sidebar_list, ui_tx);
             return;
         }
 
@@ -1763,7 +2154,13 @@ impl App {
         }
     }
 
-    fn handle_sidebar_click(&mut self, column: u16, row: u16, sidebar_list: Rect) {
+    fn handle_sidebar_click(
+        &mut self,
+        column: u16,
+        row: u16,
+        sidebar_list: Rect,
+        ui_tx: &mpsc::UnboundedSender<UiEvent>,
+    ) {
         match self.current_tab {
             AppTab::Chat => {
                 let inner = inner_rect(sidebar_list);
@@ -1836,6 +2233,34 @@ impl App {
                             }
                         }
                     }
+                }
+            }
+            AppTab::Shell => {
+                let inner = inner_rect(sidebar_list);
+                if inner.height == 0 || !rect_contains(inner, column, row) {
+                    return;
+                }
+
+                let visible_row = row.saturating_sub(inner.y) as usize;
+                let clicked_index = self.active_agent().map(|agent| {
+                    let total = agent.shell_tab.sessions.len() + 1;
+                    let selected = if agent.shell_tab.sessions.is_empty() {
+                        0
+                    } else {
+                        agent.shell_tab.selected_index() + 1
+                    };
+                    let offset = list_offset(selected, total, inner.height as usize);
+                    (offset + visible_row).min(total.saturating_sub(1))
+                });
+
+                match clicked_index {
+                    Some(0) => self.open_shell_tab_and_create_session(ui_tx.clone()),
+                    Some(index) => {
+                        if let Some(agent) = self.active_agent_mut() {
+                            agent.shell_tab.select(index - 1);
+                        }
+                    }
+                    None => {}
                 }
             }
             AppTab::GitDiff => {

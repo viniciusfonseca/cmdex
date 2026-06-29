@@ -3,21 +3,28 @@ use super::{
     *,
 };
 
+const TOP_NAV_PREFIX: &str = "CMDEX ·";
+
 pub(super) fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
     frame.render_widget(Block::default().style(app_background_style()), area);
     let frame_layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
         .split(area);
     let root = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(40)])
-        .split(frame_layout[0]);
+        .split(frame_layout[1]);
 
+    draw_top_navigation(frame, app, frame_layout[0]);
     draw_main(frame, app, root[1]);
     draw_sidebar(frame, app, root[0]);
-    draw_help_line(frame, frame_layout[1]);
+    draw_help_line(frame, frame_layout[2]);
 }
 
 pub(super) fn rounded_block() -> Block<'static> {
@@ -100,24 +107,33 @@ fn action_style(color: ratatui::style::Color) -> Style {
     Style::default().bg(theme().panel_bg).fg(color)
 }
 
+fn draw_top_navigation(frame: &mut Frame, app: &App, area: Rect) {
+    frame.render_widget(rounded_block().style(tab_style()), area);
+
+    let label = Paragraph::new(TOP_NAV_PREFIX).style(
+        Style::default()
+            .fg(theme().yellow)
+            .bg(theme().tab_bg)
+            .add_modifier(Modifier::BOLD),
+    );
+    frame.render_widget(label, top_navigation_label_rect(area));
+
+    let tabs = Tabs::new(TAB_LABELS.map(|(label, _)| label))
+        .select(app.selected_tab_index())
+        .style(tab_style())
+        .highlight_style(tab_highlight_style());
+    frame.render_widget(tabs, top_navigation_tabs_rect(area));
+}
+
 fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(LOGO_PANEL_HEIGHT), Constraint::Min(10)])
-        .split(area);
-
-    let logo = Paragraph::new(format!("\n{}\n", LOGO.join("\n")))
-        .block(sidebar_block())
-        .style(Style::default().fg(theme().accent).bg(theme().sidebar_bg));
-    frame.render_widget(logo, chunks[0]);
-
     if app.current_tab == AppTab::Workspace {
-        draw_workspace_sidebar(frame, app, chunks[1]);
+        draw_workspace_sidebar(frame, app, area);
         return;
     }
 
     let title = match app.current_tab {
         AppTab::Chat => "Agents",
+        AppTab::Shell => "Shell Sessions",
         AppTab::GitDiff => "Git Diff",
         AppTab::Workspace => unreachable!("workspace sidebar is rendered separately"),
     };
@@ -139,6 +155,13 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
                 .sidebar_selected_row()
                 .min(items.len().saturating_sub(1))
         })),
+        AppTab::Shell => state.select(app.active_agent().map(|agent| {
+            if agent.shell_tab.sessions.is_empty() {
+                0
+            } else {
+                (agent.shell_tab.selected_index() + 1).min(items.len().saturating_sub(1))
+            }
+        })),
         AppTab::GitDiff => state.select(app.active_agent().map(|agent| {
             agent
                 .git_diff
@@ -152,12 +175,12 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
         .style(sidebar_style())
         .highlight_style(selection_style())
         .highlight_symbol("› ");
-    frame.render_stateful_widget(list, chunks[1], &mut state);
+    frame.render_stateful_widget(list, area, &mut state);
 }
 
 fn draw_help_line(frame: &mut Frame, area: Rect) {
-    let help =
-        Paragraph::new("Quit: Ctrl+Q").style(Style::default().bg(theme().app_bg).fg(theme().muted));
+    let help = Paragraph::new("Quit: Ctrl+Q  Restart: Alt+R")
+        .style(Style::default().bg(theme().app_bg).fg(theme().muted));
     frame.render_widget(help, area);
 }
 
@@ -352,7 +375,7 @@ pub(super) fn list_offset(selected: usize, len: usize, visible_rows: usize) -> u
 }
 
 pub(super) fn tab_from_click(tabs: Rect, column: u16, row: u16) -> Option<AppTab> {
-    let inner = inner_rect(tabs);
+    let inner = top_navigation_tabs_rect(tabs);
     if inner.width == 0 || inner.height == 0 {
         return None;
     }
@@ -381,39 +404,123 @@ pub(super) fn tab_from_click(tabs: Rect, column: u16, row: u16) -> Option<AppTab
     None
 }
 
-fn draw_main(frame: &mut Frame, app: &App, area: Rect) {
-    let tabs = Tabs::new(TAB_LABELS.map(|(label, _)| label))
-        .select(app.selected_tab_index())
-        .block(rounded_block().style(tab_style()))
-        .style(tab_style())
-        .highlight_style(tab_highlight_style());
+pub(super) fn top_navigation_label_rect(area: Rect) -> Rect {
+    let inner = inner_rect(area);
+    if inner.width == 0 || inner.height == 0 {
+        return inner;
+    }
 
+    Rect::new(
+        inner.x,
+        inner.y,
+        (TOP_NAV_PREFIX.chars().count() as u16).min(inner.width),
+        1,
+    )
+}
+
+pub(super) fn top_navigation_tabs_rect(area: Rect) -> Rect {
+    let inner = inner_rect(area);
+    if inner.width == 0 || inner.height == 0 {
+        return inner;
+    }
+
+    let label = top_navigation_label_rect(area);
+    let x = label.x.saturating_add(label.width);
+    Rect::new(
+        x,
+        inner.y,
+        inner.x.saturating_add(inner.width).saturating_sub(x),
+        1,
+    )
+}
+
+fn draw_main(frame: &mut Frame, app: &App, area: Rect) {
     if app.current_tab == AppTab::Chat && !app.add_agent_selected() {
         let input_height = chat_input_height_for_main_area(&app.chat_input, area);
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3),
-                Constraint::Min(10),
-                Constraint::Length(input_height),
-            ])
+            .constraints([Constraint::Min(10), Constraint::Length(input_height)])
             .split(area);
-        frame.render_widget(tabs, chunks[0]);
-        draw_chat(frame, app, chunks[1]);
-        draw_chat_input(frame, app, chunks[2]);
+        draw_chat(frame, app, chunks[0]);
+        draw_chat_input(frame, app, chunks[1]);
+    } else if app.current_tab == AppTab::Shell {
+        draw_shell(frame, app, area);
     } else {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(3), Constraint::Min(10)])
-            .split(area);
-        frame.render_widget(tabs, chunks[0]);
-
         match app.current_tab {
-            AppTab::Chat => draw_add_agent_form(frame, app, chunks[1]),
-            AppTab::Workspace => draw_workspace(frame, app, chunks[1]),
-            AppTab::GitDiff => draw_git_diff(frame, app, chunks[1]),
+            AppTab::Chat => draw_add_agent_form(frame, app, area),
+            AppTab::Workspace => draw_workspace(frame, app, area),
+            AppTab::Shell => unreachable!("shell with input is rendered separately"),
+            AppTab::GitDiff => draw_git_diff(frame, app, area),
         }
     }
+}
+
+fn draw_shell(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(agent) = app.active_agent() else {
+        let empty = Paragraph::new("Add an agent from the sidebar to start a shell session.")
+            .block(panel_block().title("Shell"))
+            .style(panel_style());
+        frame.render_widget(empty, area);
+        return;
+    };
+
+    let Some(session) = agent.shell_tab.selected_session() else {
+        let empty = Paragraph::new("Click + New session or press Ctrl+T to start a shell session.")
+            .block(panel_block().title("Shell"))
+            .style(panel_style());
+        frame.render_widget(empty, area);
+        return;
+    };
+
+    let title = if session.running {
+        format!(
+            "{} · {} Running...",
+            session.title, SPINNER[app.spinner_index]
+        )
+    } else {
+        session.title.clone()
+    };
+    let lines = shell::shell_display_lines(session, &agent.shell_tab.input);
+    let content_length = scrollable_preview_content_height(&lines, area);
+    let max_scroll = content_length.saturating_sub(area.height.saturating_sub(2) as usize) as u16;
+    let scroll = session.scroll.min(max_scroll);
+    let shell = Paragraph::new(Text::from(lines))
+        .block(panel_block().title(title))
+        .style(panel_style())
+        .scroll((scroll, 0))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(shell, area);
+    render_vertical_scrollbar(frame, area, content_length, scroll);
+
+    let inner = inner_rect(area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    if session.running {
+        return;
+    }
+
+    let prompt_text = shell::shell_prompt_text(&agent.shell_tab.input);
+    let prompt_lines = wrapped_chat_input_lines(&prompt_text, inner.width);
+    let prompt_last_line = prompt_lines
+        .last()
+        .map(|line| line.chars().count())
+        .unwrap_or(0) as u16;
+    let content_before_prompt = scrollable_preview_content_height(&session.lines, area);
+    let prompt_row = content_before_prompt
+        .saturating_add(prompt_lines.len().saturating_sub(1))
+        .saturating_sub(scroll as usize) as u16;
+    if prompt_row >= inner.height {
+        return;
+    }
+
+    let x = inner
+        .x
+        .saturating_add(prompt_last_line)
+        .min(inner.x + inner.width.saturating_sub(1));
+    let y = inner.y.saturating_add(prompt_row);
+    frame.set_cursor_position((x, y));
 }
 
 fn draw_chat(frame: &mut Frame, app: &App, area: Rect) {

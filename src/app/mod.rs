@@ -1,10 +1,12 @@
 mod actions;
 mod chat;
+mod shell;
 #[cfg(test)]
 mod tests;
 mod ui;
 
 use std::{
+    collections::HashMap,
     env, fs,
     path::PathBuf,
     time::{Duration, Instant},
@@ -51,22 +53,11 @@ use crate::workspace::{
 };
 use tokio::process::Command;
 
-const LOGO: [&str; 7] = [
-    " ██████╗███╗   ███╗██████╗ ███████╗██╗  ██╗",
-    "██╔════╝████╗ ████║██╔══██╗██╔════╝╚██╗██╔╝",
-    "██║     ██╔████╔██║██║  ██║█████╗   ╚███╔╝ ",
-    "██║     ██║╚██╔╝██║██║  ██║██╔══╝   ██╔██╗ ",
-    "╚██████╗██║ ╚═╝ ██║██████╔╝███████╗██╔╝ ██╗",
-    " ╚═════╝╚═╝     ╚═╝╚═════╝ ╚══════╝╚═╝  ╚═╝",
-    "                                           ",
-];
-
-const LOGO_WIDTH: u16 = 43;
-const LOGO_PANEL_HEIGHT: u16 = LOGO.len() as u16 + 4;
-const SIDEBAR_WIDTH: u16 = LOGO_WIDTH + 2;
-const TAB_LABELS: [(&str, AppTab); 3] = [
+const SIDEBAR_WIDTH: u16 = 45;
+const TAB_LABELS: [(&str, AppTab); 4] = [
     ("Chat", AppTab::Chat),
     ("Workspace", AppTab::Workspace),
+    ("Shell", AppTab::Shell),
     ("Git Diff", AppTab::GitDiff),
 ];
 const SPINNER: [&str; 8] = ["⠏", "⠛", "⠹", "⢸", "⣰", "⣤", "⣆", "⡇"];
@@ -113,12 +104,29 @@ enum UiEvent {
         success: bool,
         message: String,
     },
+    ShellSessionOutput {
+        agent_index: usize,
+        session_id: usize,
+        line: String,
+        stderr: bool,
+    },
+    ShellSessionCommandFinished {
+        agent_index: usize,
+        session_id: usize,
+        exit_code: i32,
+    },
+    ShellSessionExited {
+        agent_index: usize,
+        session_id: usize,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AppTab {
     Chat,
     Workspace,
+    Shell,
     GitDiff,
 }
 
@@ -133,6 +141,7 @@ enum ScrollbarDragTarget {
     Chat,
     WorkspacePreview,
     WorkspaceEditor,
+    ShellOutput,
     GitDiffPreview,
 }
 
@@ -170,6 +179,17 @@ struct WorkspaceSidebarLayout {
     tabs: Rect,
     input: Option<Rect>,
     content: Rect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ShellSessionKey {
+    agent_index: usize,
+    session_id: usize,
+}
+
+struct ShellSessionRuntime {
+    command_tx: mpsc::UnboundedSender<String>,
+    pid: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -238,6 +258,12 @@ impl ChatMessage {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppExit {
+    Quit,
+    Restart,
+}
+
 #[derive(Debug, Clone)]
 struct AgentState {
     definition: AgentDefinition,
@@ -255,6 +281,7 @@ struct AgentState {
     shell_running: bool,
     streaming_item_id: Option<String>,
     workspace: FileBrowserState,
+    shell_tab: shell::ShellTabState,
     git_diff: DiffBrowserState,
     status: Option<String>,
 }
@@ -282,6 +309,7 @@ impl AgentState {
             shell_running: false,
             streaming_item_id: None,
             workspace: FileBrowserState::default(),
+            shell_tab: shell::ShellTabState::default(),
             git_diff: DiffBrowserState::default(),
             status: None,
         }
@@ -303,9 +331,11 @@ pub struct App {
     spinner_index: usize,
     status_message: Option<String>,
     should_quit: bool,
+    should_restart: bool,
     last_mouse_scroll: Option<(ScrollDirection, Instant)>,
     active_scrollbar_drag: Option<ScrollbarDragTarget>,
     last_workspace_refresh_at: Option<Instant>,
+    shell_runtimes: HashMap<ShellSessionKey, ShellSessionRuntime>,
 }
 
 impl App {
@@ -350,9 +380,11 @@ impl App {
             spinner_index: 0,
             status_message: None,
             should_quit: false,
+            should_restart: false,
             last_mouse_scroll: None,
             active_scrollbar_drag: None,
             last_workspace_refresh_at: None,
+            shell_runtimes: HashMap::new(),
         }
     }
 
@@ -446,7 +478,7 @@ async fn hydrate_latest_sessions(app: &mut App, codex: &CodexAppServer) -> Resul
     Ok(())
 }
 
-pub async fn run(terminal: &mut DefaultTerminal) -> Result<()> {
+pub async fn run(terminal: &mut DefaultTerminal) -> Result<AppExit> {
     let config_path = default_config_path()?;
     let config = load_config(&config_path)?;
 
@@ -462,11 +494,15 @@ pub async fn run(terminal: &mut DefaultTerminal) -> Result<()> {
 
     app.refresh_current_tab();
 
-    loop {
+    let exit = loop {
         terminal.draw(|frame| ui::draw(frame, &app))?;
 
         if app.should_quit {
-            break;
+            break if app.should_restart {
+                AppExit::Restart
+            } else {
+                AppExit::Quit
+            };
         }
 
         tokio::select! {
@@ -489,7 +525,7 @@ pub async fn run(terminal: &mut DefaultTerminal) -> Result<()> {
                     Some(Err(error)) => {
                         app.status_message = Some(error.to_string());
                     }
-                    None => break,
+                    None => break AppExit::Quit,
                 }
             }
             Some(server_event) = server_rx.recv() => {
@@ -502,7 +538,9 @@ pub async fn run(terminal: &mut DefaultTerminal) -> Result<()> {
                 app.on_tick();
             }
         }
-    }
+    };
 
-    Ok(())
+    app.shutdown_shell_sessions();
+
+    Ok(exit)
 }
