@@ -82,6 +82,13 @@ impl FileBrowserState {
             .collect::<Vec<_>>()
     }
 
+    pub fn sidebar_items(&self) -> Vec<Line<'static>> {
+        self.tree_rows
+            .iter()
+            .map(FileTreeRow::styled_label)
+            .collect::<Vec<_>>()
+    }
+
     pub fn sidebar_len(&self) -> usize {
         self.tree_rows.len()
     }
@@ -551,6 +558,21 @@ impl FileBrowserState {
 }
 
 impl FileTreeRow {
+    pub(super) fn styled_label(&self) -> Line<'static> {
+        if self.branch_prefix_len == 0 || self.branch_prefix_len >= self.label.len() {
+            return Line::from(self.label.clone());
+        }
+
+        let (branch, label) = self.label.split_at(self.branch_prefix_len);
+        Line::from(vec![
+            Span::styled(
+                branch.to_string(),
+                Style::default().fg(ThemeRegistry::app().line_number),
+            ),
+            Span::raw(label.to_string()),
+        ])
+    }
+
     pub(super) fn file_index(&self) -> Option<usize> {
         match self.kind {
             FileTreeRowKind::Directory { .. } => None,
@@ -723,6 +745,7 @@ impl WorkspaceBrowserSupport {
             let is_last = position + 1 == children.len();
             let mut label = Self::tree_row_prefix(ancestor_has_more);
             label.push_str(if is_last { "└── " } else { "├── " });
+            let mut branch_prefix_len = label.len();
 
             match child {
                 TreeChild::Directory(name) => {
@@ -733,9 +756,11 @@ impl WorkspaceBrowserSupport {
                     };
                     let expanded = !collapsed_dirs.contains(&relative_path);
                     label.push_str(if expanded { "▾ " } else { "▸ " });
+                    branch_prefix_len = label.len();
                     label.push_str(name);
                     rows.push(FileTreeRow {
                         label,
+                        branch_prefix_len,
                         kind: FileTreeRowKind::Directory {
                             relative_path: relative_path.clone(),
                             expanded,
@@ -760,6 +785,7 @@ impl WorkspaceBrowserSupport {
                     file_rows[*file_index] = Some(rows.len());
                     rows.push(FileTreeRow {
                         label,
+                        branch_prefix_len,
                         kind: FileTreeRowKind::File {
                             file_index: *file_index,
                         },

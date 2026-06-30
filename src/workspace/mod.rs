@@ -55,6 +55,7 @@ pub struct FileEntry {
 #[derive(Debug, Clone)]
 pub struct FileTreeRow {
     pub label: String,
+    branch_prefix_len: usize,
     kind: FileTreeRowKind,
 }
 

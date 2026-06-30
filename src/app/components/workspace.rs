@@ -25,7 +25,7 @@ pub(in crate::app) fn draw_workspace_sidebar(frame: &mut Frame, app: &App, area:
         WorkspaceSidebarTab::Files => {
             let items = agent
                 .workspace
-                .sidebar_labels()
+                .sidebar_items()
                 .into_iter()
                 .map(ListItem::new)
                 .collect::<Vec<_>>();
