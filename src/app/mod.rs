@@ -1,5 +1,6 @@
 mod actions;
 mod chat;
+mod components;
 mod shell;
 #[cfg(test)]
 mod tests;
@@ -42,11 +43,8 @@ use crate::codex::{
     CodexAppServer, HistoryEntryKind, ModelInfo, ServerEvent, ThreadInfo, ThreadItem,
     WorkspaceSession,
 };
-use crate::config::{
-    AgentDefinition, CmdexConfig, compact_home, default_config_path, load_config, save_config,
-    validate_agent_input,
-};
-use crate::theme::app_theme;
+use crate::config::{AgentDefinition, CmdexConfig, ConfigStore};
+use crate::theme::ThemeRegistry;
 use crate::workspace::{
     DiffBrowserState, DiffSection, EditorMode, FileBrowserState, GitRemoteAction,
     WorkspaceEditorState, WorkspaceSidebarTab,
@@ -241,7 +239,7 @@ impl ChatMessage {
         let text = text.into();
         Self {
             role,
-            rendered_lines: chat::render_chat_message_body(&text),
+            rendered_lines: chat::ChatSupport::render_message_body(&text),
             text,
             item_id,
         }
@@ -249,12 +247,12 @@ impl ChatMessage {
 
     fn set_text(&mut self, text: String) {
         self.text = text;
-        self.rendered_lines = chat::render_chat_message_body(&self.text);
+        self.rendered_lines = chat::ChatSupport::render_message_body(&self.text);
     }
 
     fn append_text(&mut self, delta: &str) {
         self.text.push_str(delta);
-        self.rendered_lines = chat::render_chat_message_body(&self.text);
+        self.rendered_lines = chat::ChatSupport::render_message_body(&self.text);
     }
 }
 
@@ -340,10 +338,10 @@ pub struct App {
 
 impl App {
     fn new(config_path: PathBuf, config: CmdexConfig) -> Self {
-        let default_chat_model = chat::load_codex_chat_model();
-        let default_chat_reasoning_effort = chat::load_codex_chat_reasoning_effort();
-        let default_chat_model_label =
-            chat::load_codex_chat_model_label().unwrap_or_else(|| "default".to_string());
+        let default_chat_model = chat::ChatSupport::load_codex_chat_model();
+        let default_chat_reasoning_effort = chat::ChatSupport::load_codex_chat_reasoning_effort();
+        let default_chat_model_label = chat::ChatSupport::load_codex_chat_model_label()
+            .unwrap_or_else(|| "default".to_string());
         let agents = config
             .agents
             .iter()
@@ -408,139 +406,151 @@ impl App {
     }
 }
 
-fn upsert_message(messages: &mut Vec<ChatMessage>, role: MessageRole, item_id: &str, text: String) {
-    if let Some(message) = messages
-        .iter_mut()
-        .find(|message| message.item_id.as_deref() == Some(item_id))
-    {
-        message.set_text(text);
-    } else {
-        messages.push(ChatMessage::new(role, text, Some(item_id.to_string())));
-    }
-}
+struct MessageStore;
 
-fn session_messages(session: WorkspaceSession) -> (String, Vec<ChatMessage>) {
-    let messages = session
-        .entries
-        .into_iter()
-        .map(|entry| {
-            ChatMessage::new(
-                match entry.kind {
-                    HistoryEntryKind::User => MessageRole::User,
-                    HistoryEntryKind::Assistant => MessageRole::Assistant,
-                    HistoryEntryKind::Event => MessageRole::Event,
-                },
-                entry.text,
-                None,
-            )
-        })
-        .collect::<Vec<_>>();
-
-    (session.thread.id, messages)
-}
-
-fn spawn_session_load(
-    codex: CodexAppServer,
-    ui_tx: mpsc::UnboundedSender<UiEvent>,
-    agent_index: usize,
-    workspace: PathBuf,
-) {
-    tokio::spawn(async move {
-        match codex.load_latest_workspace_session(&workspace).await {
-            Ok(session) => {
-                let _ = ui_tx.send(UiEvent::SessionLoaded {
-                    agent_index,
-                    session,
-                });
-            }
-            Err(error) => {
-                let _ = ui_tx.send(UiEvent::SubmissionFailed {
-                    agent_index,
-                    message: format!("Failed to load the latest workspace session: {error}"),
-                });
-            }
-        }
-    });
-}
-
-async fn hydrate_latest_sessions(app: &mut App, codex: &CodexAppServer) -> Result<()> {
-    for agent in &mut app.agents {
-        if let Some(session) = codex
-            .load_latest_workspace_session(&agent.definition.workspace)
-            .await?
+impl MessageStore {
+    fn upsert(messages: &mut Vec<ChatMessage>, role: MessageRole, item_id: &str, text: String) {
+        if let Some(message) = messages
+            .iter_mut()
+            .find(|message| message.item_id.as_deref() == Some(item_id))
         {
-            let (thread_id, messages) = session_messages(session);
-            agent.thread_id = Some(thread_id);
-            agent.messages = messages;
+            message.set_text(text);
+        } else {
+            messages.push(ChatMessage::new(role, text, Some(item_id.to_string())));
         }
     }
-
-    Ok(())
 }
 
-pub async fn run(terminal: &mut DefaultTerminal) -> Result<AppExit> {
-    let config_path = default_config_path()?;
-    let config = load_config(&config_path)?;
+struct SessionLoader;
 
-    let (server_tx, mut server_rx) = mpsc::unbounded_channel();
-    let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
-    let codex = CodexAppServer::spawn(server_tx).await?;
-    let mut app = App::new(config_path, config);
-    hydrate_latest_sessions(&mut app, &codex).await?;
+impl SessionLoader {
+    fn session_messages(session: WorkspaceSession) -> (String, Vec<ChatMessage>) {
+        let messages = session
+            .entries
+            .into_iter()
+            .map(|entry| {
+                ChatMessage::new(
+                    match entry.kind {
+                        HistoryEntryKind::User => MessageRole::User,
+                        HistoryEntryKind::Assistant => MessageRole::Assistant,
+                        HistoryEntryKind::Event => MessageRole::Event,
+                    },
+                    entry.text,
+                    None,
+                )
+            })
+            .collect::<Vec<_>>();
 
-    let mut events = EventStream::new();
-    let mut ticker = interval(Duration::from_millis(80));
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        (session.thread.id, messages)
+    }
 
-    app.refresh_current_tab();
-
-    let exit = loop {
-        terminal.draw(|frame| ui::draw(frame, &app))?;
-
-        if app.should_quit {
-            break if app.should_restart {
-                AppExit::Restart
-            } else {
-                AppExit::Quit
-            };
-        }
-
-        tokio::select! {
-            maybe_event = events.next() => {
-                match maybe_event {
-                    Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
-                        let (width, height) = terminal_size()?;
-                        app.handle_key(key, &codex, &ui_tx, Rect::new(0, 0, width, height));
-                    }
-                    Some(Ok(Event::Mouse(mouse))) => {
-                        let (width, height) = terminal_size()?;
-                        app.handle_mouse(mouse, Rect::new(0, 0, width, height), &ui_tx);
-                    }
-                    Some(Ok(Event::Paste(text))) => {
-                        for character in text.chars() {
-                            app.handle_text_input(character);
-                        }
-                    }
-                    Some(Ok(_)) => {}
-                    Some(Err(error)) => {
-                        app.status_message = Some(error.to_string());
-                    }
-                    None => break AppExit::Quit,
+    fn spawn(
+        codex: CodexAppServer,
+        ui_tx: mpsc::UnboundedSender<UiEvent>,
+        agent_index: usize,
+        workspace: PathBuf,
+    ) {
+        tokio::spawn(async move {
+            match codex.load_latest_workspace_session(&workspace).await {
+                Ok(session) => {
+                    let _ = ui_tx.send(UiEvent::SessionLoaded {
+                        agent_index,
+                        session,
+                    });
+                }
+                Err(error) => {
+                    let _ = ui_tx.send(UiEvent::SubmissionFailed {
+                        agent_index,
+                        message: format!("Failed to load the latest workspace session: {error}"),
+                    });
                 }
             }
-            Some(server_event) = server_rx.recv() => {
-                app.handle_server_event(server_event);
-            }
-            Some(ui_event) = ui_rx.recv() => {
-                app.handle_ui_event(ui_event);
-            }
-            _ = ticker.tick() => {
-                app.on_tick();
+        });
+    }
+
+    async fn hydrate_latest_sessions(app: &mut App, codex: &CodexAppServer) -> Result<()> {
+        for agent in &mut app.agents {
+            if let Some(session) = codex
+                .load_latest_workspace_session(&agent.definition.workspace)
+                .await?
+            {
+                let (thread_id, messages) = Self::session_messages(session);
+                agent.thread_id = Some(thread_id);
+                agent.messages = messages;
             }
         }
-    };
 
-    app.shutdown_shell_sessions();
+        Ok(())
+    }
+}
 
-    Ok(exit)
+pub struct AppRuntime;
+
+impl AppRuntime {
+    pub async fn run(terminal: &mut DefaultTerminal) -> Result<AppExit> {
+        let config_path = ConfigStore::default_path()?;
+        let config = ConfigStore::load(&config_path)?;
+
+        let (server_tx, mut server_rx) = mpsc::unbounded_channel();
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+        let codex = CodexAppServer::spawn(server_tx).await?;
+        let mut app = App::new(config_path, config);
+        SessionLoader::hydrate_latest_sessions(&mut app, &codex).await?;
+
+        let mut events = EventStream::new();
+        let mut ticker = interval(Duration::from_millis(80));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+        app.refresh_current_tab();
+
+        let exit = loop {
+            terminal.draw(|frame| ui::draw(frame, &app))?;
+
+            if app.should_quit {
+                break if app.should_restart {
+                    AppExit::Restart
+                } else {
+                    AppExit::Quit
+                };
+            }
+
+            tokio::select! {
+                maybe_event = events.next() => {
+                    match maybe_event {
+                        Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
+                            let (width, height) = terminal_size()?;
+                            app.handle_key(key, &codex, &ui_tx, Rect::new(0, 0, width, height));
+                        }
+                        Some(Ok(Event::Mouse(mouse))) => {
+                            let (width, height) = terminal_size()?;
+                            app.handle_mouse(mouse, Rect::new(0, 0, width, height), &ui_tx);
+                        }
+                        Some(Ok(Event::Paste(text))) => {
+                            for character in text.chars() {
+                                app.handle_text_input(character);
+                            }
+                        }
+                        Some(Ok(_)) => {}
+                        Some(Err(error)) => {
+                            app.status_message = Some(error.to_string());
+                        }
+                        None => break AppExit::Quit,
+                    }
+                }
+                Some(server_event) = server_rx.recv() => {
+                    app.handle_server_event(server_event);
+                }
+                Some(ui_event) = ui_rx.recv() => {
+                    app.handle_ui_event(ui_event);
+                }
+                _ = ticker.tick() => {
+                    app.on_tick();
+                }
+            }
+        };
+
+        app.shutdown_shell_sessions();
+
+        Ok(exit)
+    }
 }

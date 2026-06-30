@@ -1,32 +1,6 @@
-use super::{
-    ui::{inner_rect, theme, wrapped_text_height},
-    *,
-};
+use super::{ui::UiSupport, *};
 
-pub(super) fn chat_lines(agent: &AgentState) -> Vec<Line<'static>> {
-    if agent.messages.is_empty() {
-        vec![Line::from("No messages yet.")]
-    } else {
-        agent
-            .messages
-            .iter()
-            .flat_map(|message| message_lines(message, &agent.definition.name))
-            .collect()
-    }
-}
-
-pub(super) fn chat_max_scroll(agent: &AgentState, area: Rect) -> u16 {
-    let lines = chat_lines(agent);
-    let inner_height = area.height.saturating_sub(2) as usize;
-    let content_height = chat_text_height(&lines, area);
-
-    content_height.saturating_sub(inner_height) as u16
-}
-
-pub(super) fn chat_content_height(agent: &AgentState, area: Rect) -> usize {
-    let lines = chat_lines(agent);
-    chat_text_height(&lines, area)
-}
+pub(super) struct ChatSupport;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum ChatCommand {
@@ -43,105 +17,299 @@ pub(super) enum ModelCommand {
     },
 }
 
-pub(super) fn chat_command_from_input(input: &str) -> Option<ChatCommand> {
-    let trimmed = input.trim();
-    let remainder = trimmed.strip_prefix("/model")?;
-    if !remainder.is_empty() && !remainder.starts_with(char::is_whitespace) {
-        return None;
+impl ChatSupport {
+    pub(super) fn lines(agent: &AgentState) -> Vec<Line<'static>> {
+        if agent.messages.is_empty() {
+            vec![Line::from("No messages yet.")]
+        } else {
+            agent
+                .messages
+                .iter()
+                .flat_map(|message| Self::message_lines(message, &agent.definition.name))
+                .collect()
+        }
     }
 
-    Some(ChatCommand::Model(parse_model_command(remainder.trim())))
-}
+    pub(super) fn max_scroll(agent: &AgentState, area: Rect) -> u16 {
+        let lines = Self::lines(agent);
+        let inner_height = area.height.saturating_sub(2) as usize;
+        let content_height = Self::text_height(&lines, area);
 
-fn parse_model_command(input: &str) -> ModelCommand {
-    let input = input.trim();
-    if input.is_empty() {
-        return ModelCommand::List;
+        content_height.saturating_sub(inner_height) as u16
     }
 
-    let parts = input.split_whitespace().collect::<Vec<_>>();
-    let first = parts[0];
-
-    if parts.len() == 1 && first.eq_ignore_ascii_case("default") {
-        return ModelCommand::ResetDefault;
+    pub(super) fn content_height(agent: &AgentState, area: Rect) -> usize {
+        let lines = Self::lines(agent);
+        Self::text_height(&lines, area)
     }
 
-    if parts.len() == 1 && is_reasoning_effort_value(first) {
-        return ModelCommand::Set {
-            model: None,
-            effort: Some(first.to_string()),
+    pub(super) fn command_from_input(input: &str) -> Option<ChatCommand> {
+        let trimmed = input.trim();
+        let remainder = trimmed.strip_prefix("/model")?;
+        if !remainder.is_empty() && !remainder.starts_with(char::is_whitespace) {
+            return None;
+        }
+
+        Some(ChatCommand::Model(Self::parse_model_command(
+            remainder.trim(),
+        )))
+    }
+
+    fn parse_model_command(input: &str) -> ModelCommand {
+        let input = input.trim();
+        if input.is_empty() {
+            return ModelCommand::List;
+        }
+
+        let parts = input.split_whitespace().collect::<Vec<_>>();
+        let first = parts[0];
+
+        if parts.len() == 1 && first.eq_ignore_ascii_case("default") {
+            return ModelCommand::ResetDefault;
+        }
+
+        if parts.len() == 1 && Self::is_reasoning_effort_value(first) {
+            return ModelCommand::Set {
+                model: None,
+                effort: Some(first.to_string()),
+            };
+        }
+
+        let effort = (parts.len() > 1).then(|| parts[1..].join(" "));
+        ModelCommand::Set {
+            model: Some(first.to_string()),
+            effort,
+        }
+    }
+
+    fn is_reasoning_effort_value(value: &str) -> bool {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "minimal" | "low" | "medium" | "high" | "xhigh" | "none"
+        )
+    }
+
+    pub(super) fn padded_lines(agent: &AgentState, area: Rect) -> Vec<Line<'static>> {
+        let mut lines = Self::lines(agent);
+        let inner_height = area.height.saturating_sub(2) as usize;
+        if inner_height == 0 {
+            return lines;
+        }
+
+        let content_height = Self::text_height(&lines, area);
+        if content_height >= inner_height {
+            return lines;
+        }
+
+        let mut padded = vec![Line::default(); inner_height - content_height];
+        padded.append(&mut lines);
+        padded
+    }
+
+    fn text_height(lines: &[Line<'_>], area: Rect) -> usize {
+        let viewport = UiSupport::inner_rect(area);
+        UiSupport::wrapped_text_height(&Text::from(lines.to_vec()), viewport.width)
+    }
+
+    fn message_lines(message: &ChatMessage, agent_name: &str) -> Vec<Line<'static>> {
+        let role = match message.role {
+            MessageRole::User => ("You", UiSupport::theme().yellow),
+            MessageRole::Assistant => (agent_name, UiSupport::theme().green),
+            MessageRole::Event => ("Event", UiSupport::theme().cyan),
+            MessageRole::System => ("System", UiSupport::theme().red),
+            MessageRole::Shell => ("Shell", UiSupport::theme().magenta),
         };
+
+        let mut lines = vec![Line::from(vec![Span::styled(
+            format!("{}:", role.0),
+            Style::default().fg(role.1).add_modifier(Modifier::BOLD),
+        )])];
+        lines.extend(message.rendered_lines.iter().cloned());
+        lines.push(Line::default());
+        lines
     }
 
-    let effort = (parts.len() > 1).then(|| parts[1..].join(" "));
-    ModelCommand::Set {
-        model: Some(first.to_string()),
-        effort,
-    }
-}
+    pub(super) fn render_message_body(source: &str) -> Vec<Line<'static>> {
+        if source.trim().is_empty() {
+            return vec![Line::default()];
+        }
 
-fn is_reasoning_effort_value(value: &str) -> bool {
-    matches!(
-        value.to_ascii_lowercase().as_str(),
-        "minimal" | "low" | "medium" | "high" | "xhigh" | "none"
-    )
-}
+        let mut options = MarkdownOptions::empty();
+        options.insert(MarkdownOptions::ENABLE_STRIKETHROUGH);
+        let parser = MarkdownParser::new_ext(source, options);
+        let mut renderer = MarkdownRenderer::default();
 
-pub(super) fn padded_chat_lines(agent: &AgentState, area: Rect) -> Vec<Line<'static>> {
-    let mut lines = chat_lines(agent);
-    let inner_height = area.height.saturating_sub(2) as usize;
-    if inner_height == 0 {
-        return lines;
+        for event in parser {
+            renderer.handle(event);
+        }
+
+        renderer.finish()
     }
 
-    let content_height = chat_text_height(&lines, area);
-    if content_height >= inner_height {
-        return lines;
+    pub(super) fn input_is_shell(input: &str) -> bool {
+        input.starts_with('>')
     }
 
-    let mut padded = vec![Line::default(); inner_height - content_height];
-    padded.append(&mut lines);
-    padded
-}
+    pub(super) fn shell_command_from_input(input: &str) -> Option<String> {
+        if !Self::input_is_shell(input) {
+            return None;
+        }
 
-fn chat_text_height(lines: &[Line<'_>], area: Rect) -> usize {
-    let viewport = inner_rect(area);
-    wrapped_text_height(&Text::from(lines.to_vec()), viewport.width)
-}
-
-fn message_lines(message: &ChatMessage, agent_name: &str) -> Vec<Line<'static>> {
-    let role = match message.role {
-        MessageRole::User => ("You", theme().yellow),
-        MessageRole::Assistant => (agent_name, theme().green),
-        MessageRole::Event => ("Event", theme().cyan),
-        MessageRole::System => ("System", theme().red),
-        MessageRole::Shell => ("Shell", theme().magenta),
-    };
-
-    let mut lines = vec![Line::from(vec![Span::styled(
-        format!("{}:", role.0),
-        Style::default().fg(role.1).add_modifier(Modifier::BOLD),
-    )])];
-    lines.extend(message.rendered_lines.iter().cloned());
-    lines.push(Line::default());
-    lines
-}
-
-pub(super) fn render_chat_message_body(source: &str) -> Vec<Line<'static>> {
-    if source.trim().is_empty() {
-        return vec![Line::default()];
+        let command = input.strip_prefix('>').unwrap_or(input).trim().to_string();
+        if command.is_empty() {
+            None
+        } else {
+            Some(command)
+        }
     }
 
-    let mut options = MarkdownOptions::empty();
-    options.insert(MarkdownOptions::ENABLE_STRIKETHROUGH);
-    let parser = MarkdownParser::new_ext(source, options);
-    let mut renderer = MarkdownRenderer::default();
+    pub(super) fn truncate_shell_text(text: &str) -> String {
+        if text.chars().count() <= SHELL_OUTPUT_LIMIT {
+            return text.trim_end_matches('\n').to_string();
+        }
 
-    for event in parser {
-        renderer.handle(event);
+        let truncated = text.chars().take(SHELL_OUTPUT_LIMIT).collect::<String>();
+        format!("{}\n[truncated]", truncated.trim_end_matches('\n'))
     }
 
-    renderer.finish()
+    pub(super) fn format_shell_output(
+        command: &str,
+        stdout: &str,
+        stderr: &str,
+        exit_code: Option<i32>,
+        success: bool,
+    ) -> String {
+        let mut body = String::new();
+        let stdout = Self::truncate_shell_text(stdout);
+        let stderr = Self::truncate_shell_text(stderr);
+
+        if !stdout.is_empty() {
+            body.push_str(&stdout);
+        }
+        if !stderr.is_empty() {
+            if !body.is_empty() {
+                body.push('\n');
+            }
+            if !stdout.is_empty() {
+                body.push_str("[stderr]\n");
+            }
+            body.push_str(&stderr);
+        }
+        if body.is_empty() {
+            body.push_str("[no output]");
+        }
+
+        let exit_code = exit_code
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "unavailable".to_string());
+        let status = if success { "ok" } else { "failed" };
+
+        format!("Command: `{command}`\n\n```text\n{body}\n```\n\nExit code: {exit_code} ({status})")
+    }
+
+    pub(super) fn load_codex_chat_model_label() -> Option<String> {
+        let (model, reasoning_effort) = Self::load_codex_chat_model_config()?;
+        Some(Self::format_chat_model_label(
+            &model,
+            reasoning_effort.as_deref(),
+        ))
+    }
+
+    pub(super) fn load_codex_chat_model() -> Option<String> {
+        let (model, _) = Self::load_codex_chat_model_config()?;
+        Some(model)
+    }
+
+    pub(super) fn load_codex_chat_reasoning_effort() -> Option<String> {
+        let (_, reasoning_effort) = Self::load_codex_chat_model_config()?;
+        reasoning_effort
+    }
+
+    pub(super) fn format_chat_model_label(model: &str, reasoning_effort: Option<&str>) -> String {
+        match reasoning_effort {
+            Some(effort) if !effort.trim().is_empty() => format!("{model} · {effort}"),
+            _ => model.to_string(),
+        }
+    }
+
+    pub(super) fn resolve_chat_model_label(
+        selected_model: Option<&str>,
+        selected_effort: Option<&str>,
+        default_model: Option<&str>,
+        default_label: &str,
+    ) -> String {
+        match selected_model {
+            Some(model) => Self::format_chat_model_label(model, selected_effort),
+            None => match selected_effort
+                .map(str::trim)
+                .filter(|effort| !effort.is_empty())
+            {
+                Some(effort) => default_model
+                    .map(|model| Self::format_chat_model_label(model, Some(effort)))
+                    .unwrap_or_else(|| format!("default · {effort}")),
+                None => default_label.to_string(),
+            },
+        }
+    }
+
+    fn load_codex_chat_model_config() -> Option<(String, Option<String>)> {
+        let config_path = Self::codex_config_path()?;
+        let contents = fs::read_to_string(config_path).ok()?;
+
+        let model = Self::parse_codex_top_level_string(&contents, "model")?;
+        let reasoning_effort =
+            Self::parse_codex_top_level_string(&contents, "model_reasoning_effort");
+        Some((model, reasoning_effort))
+    }
+
+    fn codex_config_path() -> Option<PathBuf> {
+        env::var_os("CODEX_HOME")
+            .map(PathBuf::from)
+            .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
+            .map(|dir| dir.join("config.toml"))
+    }
+
+    #[cfg(test)]
+    pub(super) fn parse_codex_model_from_config(contents: &str) -> Option<String> {
+        Self::parse_codex_top_level_string(contents, "model")
+    }
+
+    #[cfg(test)]
+    pub(super) fn parse_codex_reasoning_effort_from_config(contents: &str) -> Option<String> {
+        Self::parse_codex_top_level_string(contents, "model_reasoning_effort")
+    }
+
+    fn parse_codex_top_level_string(contents: &str, wanted_key: &str) -> Option<String> {
+        let mut at_top_level = true;
+
+        for line in contents.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            if trimmed.starts_with('[') {
+                at_top_level = false;
+                continue;
+            }
+            if !at_top_level {
+                continue;
+            }
+
+            let Some((key, value)) = trimmed.split_once('=') else {
+                continue;
+            };
+            if key.trim() != wanted_key {
+                continue;
+            }
+
+            let parsed = value.trim().trim_matches('"').trim_matches('\'').trim();
+            if !parsed.is_empty() {
+                return Some(parsed.to_string());
+            }
+        }
+
+        None
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -172,12 +340,12 @@ impl MarkdownRenderer {
             MarkdownEvent::Text(text) => self.push_text(
                 text.as_ref(),
                 if self.in_code_block() {
-                    inline_code_style()
+                    Self::inline_code_style()
                 } else {
                     self.current_style()
                 },
             ),
-            MarkdownEvent::Code(text) => self.push_text(text.as_ref(), inline_code_style()),
+            MarkdownEvent::Code(text) => self.push_text(text.as_ref(), Self::inline_code_style()),
             MarkdownEvent::SoftBreak => {
                 if self.in_code_block() {
                     self.push_line();
@@ -192,17 +360,17 @@ impl MarkdownRenderer {
                 self.lines.push(Line::default());
             }
             MarkdownEvent::Html(text) | MarkdownEvent::InlineHtml(text) => {
-                self.push_text(text.as_ref(), html_style())
+                self.push_text(text.as_ref(), Self::html_style())
             }
             MarkdownEvent::TaskListMarker(checked) => {
                 let marker = if checked { "[x] " } else { "[ ] " };
-                self.push_text(marker, task_marker_style());
+                self.push_text(marker, Self::task_marker_style());
             }
             MarkdownEvent::InlineMath(text) | MarkdownEvent::DisplayMath(text) => {
-                self.push_text(text.as_ref(), inline_code_style())
+                self.push_text(text.as_ref(), Self::inline_code_style())
             }
             MarkdownEvent::FootnoteReference(text) => {
-                self.push_text(text.as_ref(), link_style());
+                self.push_text(text.as_ref(), Self::link_style());
             }
         }
     }
@@ -227,7 +395,7 @@ impl MarkdownRenderer {
                         self.push_text(
                             &format!("```{language}"),
                             Style::default()
-                                .fg(theme().muted)
+                                .fg(UiSupport::theme().muted)
                                 .add_modifier(Modifier::ITALIC),
                         );
                         self.push_line();
@@ -253,7 +421,7 @@ impl MarkdownRenderer {
                     _ => "- ".to_string(),
                 };
                 self.current_spans
-                    .push(Span::styled(prefix, task_marker_style()));
+                    .push(Span::styled(prefix, Self::task_marker_style()));
             }
             Tag::Emphasis => self.emphasis_depth += 1,
             Tag::Strong => self.strong_depth += 1,
@@ -262,7 +430,7 @@ impl MarkdownRenderer {
             Tag::Image { dest_url, .. } => {
                 self.push_text(
                     &format!("[image: {}]", dest_url),
-                    Style::default().fg(theme().magenta),
+                    Style::default().fg(UiSupport::theme().magenta),
                 );
             }
             _ => {}
@@ -307,7 +475,7 @@ impl MarkdownRenderer {
             }
             TagEnd::Link => {
                 if let Some(target) = self.link_targets.pop() {
-                    self.push_text(&format!(" ({target})"), link_style());
+                    self.push_text(&format!(" ({target})"), Self::link_style());
                 }
             }
             _ => {}
@@ -371,8 +539,10 @@ impl MarkdownRenderer {
         }
 
         for _ in 0..self.blockquote_depth {
-            self.current_spans
-                .push(Span::styled("> ", Style::default().fg(theme().muted)));
+            self.current_spans.push(Span::styled(
+                "> ",
+                Style::default().fg(UiSupport::theme().muted),
+            ));
         }
     }
 
@@ -389,7 +559,7 @@ impl MarkdownRenderer {
             style = style.add_modifier(Modifier::CROSSED_OUT);
         }
         if self.heading_level.is_some() {
-            style = style.fg(theme().accent);
+            style = style.fg(UiSupport::theme().accent);
         }
 
         style
@@ -398,189 +568,28 @@ impl MarkdownRenderer {
     fn in_code_block(&self) -> bool {
         self.code_block_depth > 0
     }
-}
 
-fn inline_code_style() -> Style {
-    Style::default()
-        .fg(theme().inline_code_fg)
-        .bg(theme().inline_code_bg)
-}
-
-fn html_style() -> Style {
-    Style::default()
-        .fg(theme().magenta)
-        .add_modifier(Modifier::ITALIC)
-}
-
-fn task_marker_style() -> Style {
-    Style::default()
-        .fg(theme().muted)
-        .add_modifier(Modifier::BOLD)
-}
-
-fn link_style() -> Style {
-    Style::default()
-        .fg(theme().blue)
-        .add_modifier(Modifier::UNDERLINED)
-}
-
-pub(super) fn chat_input_is_shell(input: &str) -> bool {
-    input.starts_with('>')
-}
-
-pub(super) fn shell_command_from_input(input: &str) -> Option<String> {
-    if !chat_input_is_shell(input) {
-        return None;
+    fn inline_code_style() -> Style {
+        Style::default()
+            .fg(UiSupport::theme().inline_code_fg)
+            .bg(UiSupport::theme().inline_code_bg)
     }
 
-    let command = input.strip_prefix('>').unwrap_or(input).trim().to_string();
-    if command.is_empty() {
-        None
-    } else {
-        Some(command)
-    }
-}
-
-pub(super) fn truncate_shell_text(text: &str) -> String {
-    if text.chars().count() <= SHELL_OUTPUT_LIMIT {
-        return text.trim_end_matches('\n').to_string();
+    fn html_style() -> Style {
+        Style::default()
+            .fg(UiSupport::theme().magenta)
+            .add_modifier(Modifier::ITALIC)
     }
 
-    let truncated = text.chars().take(SHELL_OUTPUT_LIMIT).collect::<String>();
-    format!("{}\n[truncated]", truncated.trim_end_matches('\n'))
-}
-
-pub(super) fn format_shell_output(
-    command: &str,
-    stdout: &str,
-    stderr: &str,
-    exit_code: Option<i32>,
-    success: bool,
-) -> String {
-    let mut body = String::new();
-    let stdout = truncate_shell_text(stdout);
-    let stderr = truncate_shell_text(stderr);
-
-    if !stdout.is_empty() {
-        body.push_str(&stdout);
-    }
-    if !stderr.is_empty() {
-        if !body.is_empty() {
-            body.push('\n');
-        }
-        if !stdout.is_empty() {
-            body.push_str("[stderr]\n");
-        }
-        body.push_str(&stderr);
-    }
-    if body.is_empty() {
-        body.push_str("[no output]");
+    fn task_marker_style() -> Style {
+        Style::default()
+            .fg(UiSupport::theme().muted)
+            .add_modifier(Modifier::BOLD)
     }
 
-    let exit_code = exit_code
-        .map(|code| code.to_string())
-        .unwrap_or_else(|| "unavailable".to_string());
-    let status = if success { "ok" } else { "failed" };
-
-    format!("Command: `{command}`\n\n```text\n{body}\n```\n\nExit code: {exit_code} ({status})")
-}
-
-pub(super) fn load_codex_chat_model_label() -> Option<String> {
-    let (model, reasoning_effort) = load_codex_chat_model_config()?;
-    Some(format_chat_model_label(&model, reasoning_effort.as_deref()))
-}
-
-pub(super) fn load_codex_chat_model() -> Option<String> {
-    let (model, _) = load_codex_chat_model_config()?;
-    Some(model)
-}
-
-pub(super) fn load_codex_chat_reasoning_effort() -> Option<String> {
-    let (_, reasoning_effort) = load_codex_chat_model_config()?;
-    reasoning_effort
-}
-
-pub(super) fn format_chat_model_label(model: &str, reasoning_effort: Option<&str>) -> String {
-    match reasoning_effort {
-        Some(effort) if !effort.trim().is_empty() => format!("{model} · {effort}"),
-        _ => model.to_string(),
+    fn link_style() -> Style {
+        Style::default()
+            .fg(UiSupport::theme().blue)
+            .add_modifier(Modifier::UNDERLINED)
     }
-}
-
-pub(super) fn resolve_chat_model_label(
-    selected_model: Option<&str>,
-    selected_effort: Option<&str>,
-    default_model: Option<&str>,
-    default_label: &str,
-) -> String {
-    match selected_model {
-        Some(model) => format_chat_model_label(model, selected_effort),
-        None => match selected_effort
-            .map(str::trim)
-            .filter(|effort| !effort.is_empty())
-        {
-            Some(effort) => default_model
-                .map(|model| format_chat_model_label(model, Some(effort)))
-                .unwrap_or_else(|| format!("default · {effort}")),
-            None => default_label.to_string(),
-        },
-    }
-}
-
-fn load_codex_chat_model_config() -> Option<(String, Option<String>)> {
-    let config_path = codex_config_path()?;
-    let contents = fs::read_to_string(config_path).ok()?;
-
-    let model = parse_codex_top_level_string(&contents, "model")?;
-    let reasoning_effort = parse_codex_top_level_string(&contents, "model_reasoning_effort");
-    Some((model, reasoning_effort))
-}
-
-fn codex_config_path() -> Option<PathBuf> {
-    env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
-        .map(|dir| dir.join("config.toml"))
-}
-
-#[cfg(test)]
-pub(super) fn parse_codex_model_from_config(contents: &str) -> Option<String> {
-    parse_codex_top_level_string(contents, "model")
-}
-
-#[cfg(test)]
-pub(super) fn parse_codex_reasoning_effort_from_config(contents: &str) -> Option<String> {
-    parse_codex_top_level_string(contents, "model_reasoning_effort")
-}
-
-fn parse_codex_top_level_string(contents: &str, wanted_key: &str) -> Option<String> {
-    let mut at_top_level = true;
-
-    for line in contents.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        if trimmed.starts_with('[') {
-            at_top_level = false;
-            continue;
-        }
-        if !at_top_level {
-            continue;
-        }
-
-        let Some((key, value)) = trimmed.split_once('=') else {
-            continue;
-        };
-        if key.trim() != wanted_key {
-            continue;
-        }
-
-        let parsed = value.trim().trim_matches('"').trim_matches('\'').trim();
-        if !parsed.is_empty() {
-            return Some(parsed.to_string());
-        }
-    }
-
-    None
 }

@@ -3,6 +3,7 @@ use std::path::Path;
 use super::*;
 
 pub(super) const SHELL_COMMAND_SENTINEL: &str = "__CMDEX_DONE__:";
+pub(super) struct ShellPresenter;
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct ShellTabState {
@@ -108,8 +109,11 @@ impl ShellSessionState {
     fn new(id: usize, workspace: &Path) -> Self {
         let mut lines = Vec::new();
         lines.push(Line::from(Span::styled(
-            format!("Session started in {}", compact_home(workspace)),
-            Style::default().fg(app_theme().muted),
+            format!(
+                "Session started in {}",
+                ConfigStore::compact_home(workspace)
+            ),
+            Style::default().fg(ThemeRegistry::app().muted),
         )));
         lines.push(Line::default());
 
@@ -133,7 +137,7 @@ impl ShellSessionState {
     pub(super) fn append_command(&mut self, command: &str) {
         self.lines.push(Line::from(Span::styled(
             format!("$ {command}"),
-            Style::default().fg(app_theme().accent),
+            Style::default().fg(ThemeRegistry::app().accent),
         )));
         self.running = true;
         self.scroll = u16::MAX;
@@ -147,7 +151,7 @@ impl ShellSessionState {
     pub(super) fn append_stderr_line(&mut self, line: &str) {
         self.lines.push(Line::from(Span::styled(
             line.to_string(),
-            Style::default().fg(app_theme().error),
+            Style::default().fg(ThemeRegistry::app().error),
         )));
         self.scroll = u16::MAX;
     }
@@ -156,27 +160,29 @@ impl ShellSessionState {
         self.running = false;
         self.lines.push(Line::from(Span::styled(
             format!("[exit {exit_code}]"),
-            Style::default().fg(app_theme().muted),
+            Style::default().fg(ThemeRegistry::app().muted),
         )));
         self.scroll = u16::MAX;
     }
 }
 
-pub(super) fn shell_command_payload(command: &str) -> String {
-    format!("{command}\nprintf '{SHELL_COMMAND_SENTINEL}%s\\n' \"$?\"\n")
-}
-
-pub(super) fn shell_prompt_text(input: &str) -> String {
-    format!("$ {input}")
-}
-
-pub(super) fn shell_display_lines(session: &ShellSessionState, input: &str) -> Vec<Line<'static>> {
-    let mut lines = session.lines.clone();
-    if !session.running {
-        lines.push(Line::from(vec![
-            Span::styled("$ ", Style::default().fg(app_theme().accent)),
-            Span::raw(input.to_string()),
-        ]));
+impl ShellPresenter {
+    pub(super) fn command_payload(command: &str) -> String {
+        format!("{command}\nprintf '{SHELL_COMMAND_SENTINEL}%s\\n' \"$?\"\n")
     }
-    lines
+
+    pub(super) fn prompt_text(input: &str) -> String {
+        format!("$ {input}")
+    }
+
+    pub(super) fn display_lines(session: &ShellSessionState, input: &str) -> Vec<Line<'static>> {
+        let mut lines = session.lines.clone();
+        if !session.running {
+            lines.push(Line::from(vec![
+                Span::styled("$ ", Style::default().fg(ThemeRegistry::app().accent)),
+                Span::raw(input.to_string()),
+            ]));
+        }
+        lines
+    }
 }

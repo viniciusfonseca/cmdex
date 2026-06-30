@@ -7,26 +7,28 @@ use std::{
 use ratatui::text::Line;
 
 use super::{
-    browser::{build_file_tree_rows, contains_git_component},
-    diff::{
-        DiffHunk, parse_status_sections, parse_unified_diff_hunks, render_modified_diff_preview,
-    },
-    render::{add_line_numbers, plain_preview_lines},
+    browser::WorkspaceBrowserSupport,
+    diff::{DiffHunk, GitDiffSupport},
+    render::WorkspaceRenderer,
     *,
 };
 
 #[test]
 fn skips_git_subtree_entries() {
-    assert!(contains_git_component(Path::new("/tmp/repo/.git/config")));
-    assert!(contains_git_component(Path::new(
+    assert!(WorkspaceBrowserSupport::contains_git_component(Path::new(
+        "/tmp/repo/.git/config"
+    )));
+    assert!(WorkspaceBrowserSupport::contains_git_component(Path::new(
         "/tmp/repo/.git/objects/aa"
     )));
-    assert!(!contains_git_component(Path::new("/tmp/repo/src/main.rs")));
+    assert!(!WorkspaceBrowserSupport::contains_git_component(Path::new(
+        "/tmp/repo/src/main.rs"
+    )));
 }
 
 #[test]
 fn preserves_blank_lines_in_plain_preview() {
-    let lines = plain_preview_lines("first\n\nthird");
+    let lines = WorkspaceRenderer::plain_preview_lines("first\n\nthird");
     assert_eq!(lines.len(), 3);
     assert_eq!(lines[0].spans[0].content, "first");
     assert!(lines[1].spans.is_empty() || lines[1].spans[0].content.is_empty());
@@ -35,7 +37,9 @@ fn preserves_blank_lines_in_plain_preview() {
 
 #[test]
 fn adds_line_numbers_to_blank_and_non_blank_lines() {
-    let lines = add_line_numbers(plain_preview_lines("first\n\nthird"));
+    let lines = WorkspaceRenderer::add_line_numbers(WorkspaceRenderer::plain_preview_lines(
+        "first\n\nthird",
+    ));
 
     assert_eq!(lines.len(), 3);
     assert_eq!(lines[0].spans[0].content, "1 | ");
@@ -180,7 +184,8 @@ fn builds_workspace_sidebar_tree_rows_from_files() {
         },
     ];
 
-    let (rows, file_rows) = build_file_tree_rows(&entries, &BTreeSet::new());
+    let (rows, file_rows) =
+        WorkspaceBrowserSupport::build_file_tree_rows(&entries, &BTreeSet::new());
 
     assert_eq!(
         rows.iter()
@@ -213,7 +218,7 @@ fn hides_descendants_for_collapsed_directory_rows() {
     ];
     let collapsed = BTreeSet::from([PathBuf::from("src")]);
 
-    let (rows, file_rows) = build_file_tree_rows(&entries, &collapsed);
+    let (rows, file_rows) = WorkspaceBrowserSupport::build_file_tree_rows(&entries, &collapsed);
 
     assert_eq!(
         rows.iter()
@@ -361,7 +366,7 @@ A  src/new.rs
 R  src/old.rs -> src/new_name.rs
 ";
 
-    let sections = parse_status_sections(root, output);
+    let sections = GitDiffSupport::parse_status_sections(root, output);
 
     assert_eq!(
         sections
@@ -411,7 +416,7 @@ fn parses_unified_diff_hunks_and_removed_lines() {
 +new three
 ";
 
-    let hunks = parse_unified_diff_hunks(diff);
+    let hunks = GitDiffSupport::parse_unified_diff_hunks(diff);
 
     assert_eq!(hunks.len(), 1);
     assert_eq!(hunks[0].old_start, 2);
@@ -431,8 +436,11 @@ fn renders_removed_lines_inside_full_file_diff_preview() {
         removed_lines: vec!["old value".to_string()],
     }];
 
-    let lines =
-        render_modified_diff_preview(Path::new("example.txt"), "one\nnew value\nthree", &hunks);
+    let lines = GitDiffSupport::render_modified_diff_preview(
+        Path::new("example.txt"),
+        "one\nnew value\nthree",
+        &hunks,
+    );
 
     assert_eq!(line_text(&lines[0]), "1   | one");
     assert_eq!(line_text(&lines[1]), "2 - | old value");

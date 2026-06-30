@@ -5,7 +5,7 @@ mod render;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use diff::run_git_remote_action;
+pub(crate) use diff::GitDiffSupport;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -22,7 +22,7 @@ use ratatui::{
 };
 use syntect::{easy::HighlightLines, highlighting::FontStyle, parsing::SyntaxReference};
 
-use crate::theme::{app_theme, syntax_theme};
+use crate::theme::ThemeRegistry;
 
 const PREVIEW_LIMIT: usize = 200_000;
 

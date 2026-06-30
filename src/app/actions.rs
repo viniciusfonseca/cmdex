@@ -1,49 +1,6 @@
-use super::{chat::*, ui::*, *};
-use crate::workspace::run_git_remote_action;
-use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::task;
+use super::{chat::ChatSupport, shell, ui::*, *};
 
 impl App {
-    pub(super) fn sidebar_labels(&self) -> Vec<String> {
-        match self.current_tab {
-            AppTab::Chat => {
-                let mut items = vec!["+ Add agent".to_string()];
-                items.extend(self.agents.iter().map(|agent| {
-                    format!(
-                        "{}  {}",
-                        agent.definition.name,
-                        compact_home(&agent.definition.workspace)
-                    )
-                }));
-                items
-            }
-            AppTab::Workspace => self
-                .active_agent()
-                .map(|agent| agent.workspace.sidebar_labels())
-                .unwrap_or_default(),
-            AppTab::Shell => self
-                .active_agent()
-                .map(|agent| {
-                    let mut items = vec!["+ New session".to_string()];
-                    items.extend(agent.shell_tab.labels(self.spinner_index));
-                    items
-                })
-                .unwrap_or_default(),
-            AppTab::GitDiff => self
-                .active_agent()
-                .map(|agent| {
-                    agent
-                        .git_diff
-                        .visible_entries()
-                        .iter()
-                        .map(|entry| entry.label.clone())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default(),
-        }
-    }
-
     pub(super) fn on_tick(&mut self) {
         self.spinner_index = (self.spinner_index + 1) % SPINNER.len();
         self.maybe_refresh_workspace();
@@ -61,60 +18,6 @@ impl App {
             let _ = std::process::Command::new("kill")
                 .args(["-TERM", &pid.to_string()])
                 .status();
-        }
-    }
-
-    fn set_tab(&mut self, tab: AppTab) {
-        if self.current_tab != tab {
-            self.current_tab = tab;
-            self.refresh_current_tab();
-        }
-    }
-
-    fn activate_tab(&mut self, tab: AppTab, ui_tx: mpsc::UnboundedSender<UiEvent>) {
-        if tab == AppTab::Shell && self.current_tab != AppTab::Shell {
-            self.open_shell_tab(ui_tx);
-        } else {
-            self.set_tab(tab);
-        }
-    }
-
-    pub(super) fn refresh_current_tab(&mut self) {
-        match self.current_tab {
-            AppTab::Chat => {}
-            AppTab::Workspace => {
-                if let Some(agent) = self.active_agent_mut() {
-                    agent.workspace.refresh(&agent.definition.workspace);
-                }
-                self.last_workspace_refresh_at = Some(Instant::now());
-            }
-            AppTab::Shell => {}
-            AppTab::GitDiff => {
-                if let Some(agent) = self.active_agent_mut() {
-                    agent.git_diff.refresh(&agent.definition.workspace);
-                }
-            }
-        }
-    }
-
-    fn maybe_refresh_workspace(&mut self) {
-        if self.current_tab != AppTab::Workspace {
-            return;
-        }
-
-        let now = Instant::now();
-        if self
-            .last_workspace_refresh_at
-            .is_some_and(|last| now.duration_since(last) < WORKSPACE_AUTO_REFRESH_INTERVAL)
-        {
-            return;
-        }
-
-        self.last_workspace_refresh_at = Some(now);
-        if let Some(agent) = self.active_agent_mut() {
-            agent
-                .workspace
-                .refresh_if_changed(&agent.definition.workspace);
         }
     }
 
@@ -291,7 +194,7 @@ impl App {
         };
 
         let metrics = self.scrollbar_metrics(target, layout)?;
-        rect_contains(metrics.track, column, row).then_some(target)
+        UiSupport::rect_contains(metrics.track, column, row).then_some(target)
     }
 
     fn update_scrollbar_drag(
@@ -303,7 +206,7 @@ impl App {
         let Some(metrics) = self.scrollbar_metrics(target, layout) else {
             return false;
         };
-        let scroll = scroll_position_from_row(metrics, row);
+        let scroll = UiSupport::scroll_position_from_row(metrics, row);
 
         match target {
             ScrollbarDragTarget::Chat => {
@@ -357,30 +260,38 @@ impl App {
 
         match target {
             ScrollbarDragTarget::Chat => {
-                let content_length = chat_content_height(agent, layout.body);
-                vertical_scrollbar_metrics(layout.body, content_length)
+                let content_length = ChatSupport::content_height(agent, layout.body);
+                UiSupport::vertical_scrollbar_metrics(layout.body, content_length)
             }
             ScrollbarDragTarget::WorkspacePreview => {
-                let content_length =
-                    scrollable_preview_content_height(&agent.workspace.preview, layout.body);
-                vertical_scrollbar_metrics(layout.body, content_length)
+                let content_length = UiSupport::scrollable_preview_content_height(
+                    &agent.workspace.preview,
+                    layout.body,
+                );
+                UiSupport::vertical_scrollbar_metrics(layout.body, content_length)
             }
             ScrollbarDragTarget::WorkspaceEditor => {
                 let editor = agent.workspace.editor.as_ref()?;
                 let viewport = workspace_editor_viewport(layout.body);
-                vertical_scrollbar_metrics_for_viewport(viewport, editor.content_height())
+                UiSupport::vertical_scrollbar_metrics_for_viewport(
+                    viewport,
+                    editor.content_height(),
+                )
             }
             ScrollbarDragTarget::ShellOutput => {
                 let session = agent.shell_tab.selected_session()?;
-                let lines = shell::shell_display_lines(session, &agent.shell_tab.input);
-                let content_length = scrollable_preview_content_height(&lines, layout.body);
-                vertical_scrollbar_metrics(layout.body, content_length)
+                let lines = shell::ShellPresenter::display_lines(session, &agent.shell_tab.input);
+                let content_length =
+                    UiSupport::scrollable_preview_content_height(&lines, layout.body);
+                UiSupport::vertical_scrollbar_metrics(layout.body, content_length)
             }
             ScrollbarDragTarget::GitDiffPreview => {
                 let diff_layout = git_diff_layout(layout.body);
-                let content_length =
-                    scrollable_preview_content_height(&agent.git_diff.preview, diff_layout.preview);
-                vertical_scrollbar_metrics(diff_layout.preview, content_length)
+                let content_length = UiSupport::scrollable_preview_content_height(
+                    &agent.git_diff.preview,
+                    diff_layout.preview,
+                );
+                UiSupport::vertical_scrollbar_metrics(diff_layout.preview, content_length)
             }
         }
     }
@@ -449,7 +360,7 @@ impl App {
             return;
         };
 
-        let max_scroll = chat_max_scroll(agent, area);
+        let max_scroll = ChatSupport::max_scroll(agent, area);
         let current = if agent.chat_follow_output {
             max_scroll
         } else {
@@ -466,7 +377,7 @@ impl App {
             return;
         };
 
-        let max_scroll = chat_max_scroll(agent, area);
+        let max_scroll = ChatSupport::max_scroll(agent, area);
         let current = if agent.chat_follow_output {
             max_scroll
         } else {
@@ -662,1065 +573,6 @@ impl App {
         }
     }
 
-    fn handle_workspace_key(&mut self, key: KeyEvent, area: Rect) -> bool {
-        if self.current_tab != AppTab::Workspace {
-            return false;
-        }
-
-        let Some(agent_index) = self.current_agent else {
-            return false;
-        };
-
-        let viewport = workspace_editor_viewport(self.compute_layout(area).body);
-        let page_step = usize::from(CONTENT_SCROLL_STEP);
-        let mut saved = false;
-        let mut close = false;
-        let mut handled = false;
-        let mut selection_delta = 0i8;
-
-        {
-            let agent = &mut self.agents[agent_index];
-            let workspace = &mut agent.workspace;
-
-            if workspace.sidebar_tab == WorkspaceSidebarTab::Search {
-                match key.code {
-                    KeyCode::Esc => {
-                        workspace.set_sidebar_tab(WorkspaceSidebarTab::Files);
-                        return true;
-                    }
-                    KeyCode::Up => {
-                        workspace.search_move_up();
-                        return true;
-                    }
-                    KeyCode::Down => {
-                        workspace.search_move_down();
-                        return true;
-                    }
-                    KeyCode::Enter => {
-                        match workspace.open_selected_search_result() {
-                            Ok(true) => {
-                                if let Some(editor) = workspace.editor.as_mut() {
-                                    editor.ensure_visible(viewport.width, viewport.height);
-                                }
-                            }
-                            Ok(false) => {}
-                            Err(error) => workspace.error = Some(error.to_string()),
-                        }
-                        return true;
-                    }
-                    KeyCode::Backspace => {
-                        workspace.pop_search_char();
-                        return true;
-                    }
-                    KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        workspace.push_search_char(character);
-                        return true;
-                    }
-                    _ => {}
-                }
-            }
-
-            if workspace.editor.is_none() {
-                if key.code == KeyCode::Enter {
-                    if workspace.toggle_current_directory() {
-                        return true;
-                    }
-                    match workspace.open_editor() {
-                        Ok(()) => {}
-                        Err(error) => workspace.error = Some(error.to_string()),
-                    }
-                    return true;
-                }
-                return false;
-            }
-
-            {
-                let editor = workspace.editor.as_mut().expect("editor checked above");
-                match editor.mode {
-                    EditorMode::Command => match key.code {
-                        KeyCode::Esc => {
-                            editor.cancel_command();
-                            handled = true;
-                        }
-                        KeyCode::Backspace => {
-                            editor.command.pop();
-                            handled = true;
-                        }
-                        KeyCode::Enter => {
-                            match editor.execute_command() {
-                                Ok(result) => {
-                                    saved = result.saved;
-                                    close = result.close;
-                                }
-                                Err(error) => editor.status = Some(error.to_string()),
-                            }
-                            handled = true;
-                        }
-                        KeyCode::Char(character)
-                            if !key.modifiers.contains(KeyModifiers::CONTROL) =>
-                        {
-                            editor.command.push(character);
-                            handled = true;
-                        }
-                        _ => handled = true,
-                    },
-                    EditorMode::Insert => match key.code {
-                        KeyCode::Esc => {
-                            editor.mode = EditorMode::Normal;
-                            handled = true;
-                        }
-                        KeyCode::Enter => {
-                            editor.insert_newline();
-                            handled = true;
-                        }
-                        KeyCode::Backspace => {
-                            editor.backspace();
-                            handled = true;
-                        }
-                        KeyCode::Delete => {
-                            editor.delete_char();
-                            handled = true;
-                        }
-                        KeyCode::Left => {
-                            editor.move_left();
-                            handled = true;
-                        }
-                        KeyCode::Right => {
-                            editor.move_right();
-                            handled = true;
-                        }
-                        KeyCode::Up => {
-                            editor.move_up();
-                            handled = true;
-                        }
-                        KeyCode::Down => {
-                            editor.move_down();
-                            handled = true;
-                        }
-                        KeyCode::Home => {
-                            editor.move_line_start();
-                            handled = true;
-                        }
-                        KeyCode::End => {
-                            editor.move_line_end();
-                            handled = true;
-                        }
-                        KeyCode::PageUp => {
-                            editor.move_page_up(page_step);
-                            handled = true;
-                        }
-                        KeyCode::PageDown => {
-                            editor.move_page_down(page_step);
-                            handled = true;
-                        }
-                        KeyCode::Tab => {
-                            for _ in 0..4 {
-                                editor.insert_char(' ');
-                            }
-                            handled = true;
-                        }
-                        _ => {}
-                    },
-                    EditorMode::Normal => match key.code {
-                        KeyCode::Esc => handled = true,
-                        KeyCode::Enter => {
-                            handled = workspace.toggle_current_directory();
-                        }
-                        KeyCode::Up => {
-                            selection_delta = -1;
-                            handled = true;
-                        }
-                        KeyCode::Down => {
-                            selection_delta = 1;
-                            handled = true;
-                        }
-                        KeyCode::Left => {
-                            editor.move_left();
-                            handled = true;
-                        }
-                        KeyCode::Right => {
-                            editor.move_right();
-                            handled = true;
-                        }
-                        KeyCode::Home => {
-                            editor.move_line_start();
-                            handled = true;
-                        }
-                        KeyCode::End => {
-                            editor.move_line_end();
-                            handled = true;
-                        }
-                        KeyCode::PageUp => {
-                            editor.move_page_up(page_step);
-                            handled = true;
-                        }
-                        KeyCode::PageDown => {
-                            editor.move_page_down(page_step);
-                            handled = true;
-                        }
-                        KeyCode::Delete => {
-                            editor.delete_char();
-                            handled = true;
-                        }
-                        KeyCode::Char('h') => {
-                            editor.move_left();
-                            handled = true;
-                        }
-                        KeyCode::Char('j') => {
-                            editor.move_down();
-                            handled = true;
-                        }
-                        KeyCode::Char('k') => {
-                            editor.move_up();
-                            handled = true;
-                        }
-                        KeyCode::Char('l') => {
-                            editor.move_right();
-                            handled = true;
-                        }
-                        KeyCode::Char('0') => {
-                            editor.move_line_start();
-                            handled = true;
-                        }
-                        KeyCode::Char('$') => {
-                            editor.move_line_end();
-                            handled = true;
-                        }
-                        KeyCode::Char('i') => {
-                            editor.enter_insert_mode();
-                            handled = true;
-                        }
-                        KeyCode::Char('a') => {
-                            editor.enter_insert_after();
-                            handled = true;
-                        }
-                        KeyCode::Char('o') => {
-                            editor.open_below();
-                            handled = true;
-                        }
-                        KeyCode::Char('x') => {
-                            editor.delete_char();
-                            handled = true;
-                        }
-                        KeyCode::Char(':') => {
-                            editor.start_command();
-                            handled = true;
-                        }
-                        _ => {}
-                    },
-                }
-            }
-
-            if selection_delta < 0 {
-                workspace.move_up();
-            } else if selection_delta > 0 {
-                workspace.move_down();
-            }
-
-            if handled {
-                if let Some(editor) = workspace.editor.as_mut() {
-                    editor.ensure_visible(viewport.width, viewport.height);
-                }
-            }
-        }
-
-        if saved {
-            let root = self.agents[agent_index].definition.workspace.clone();
-            self.agents[agent_index].git_diff.refresh(&root);
-        }
-
-        if close {
-            if let Err(error) = self.agents[agent_index].workspace.close_editor() {
-                self.agents[agent_index].workspace.error = Some(error.to_string());
-            }
-        }
-
-        handled || saved || close
-    }
-
-    fn handle_git_diff_key(
-        &mut self,
-        key: KeyEvent,
-        _ui_tx: &mpsc::UnboundedSender<UiEvent>,
-    ) -> bool {
-        if self.current_tab != AppTab::GitDiff {
-            return false;
-        }
-
-        match key.code {
-            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.stage_git_diff_changes();
-                true
-            }
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.unstage_git_diff_changes();
-                true
-            }
-            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.discard_git_diff_changes();
-                true
-            }
-            KeyCode::Left if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Some(agent) = self.active_agent_mut() {
-                    let root = agent.definition.workspace.clone();
-                    agent
-                        .git_diff
-                        .set_active_section(&root, DiffSection::Changes);
-                }
-                true
-            }
-            KeyCode::Right if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Some(agent) = self.active_agent_mut() {
-                    let root = agent.definition.workspace.clone();
-                    agent
-                        .git_diff
-                        .set_active_section(&root, DiffSection::Staged);
-                }
-                true
-            }
-            KeyCode::Tab => {
-                if let Some(agent) = self.active_agent_mut() {
-                    let root = agent.definition.workspace.clone();
-                    let next = match agent.git_diff.active_section {
-                        DiffSection::Changes => DiffSection::Staged,
-                        DiffSection::Staged => DiffSection::Changes,
-                    };
-                    agent.git_diff.set_active_section(&root, next);
-                }
-                true
-            }
-            KeyCode::Enter => {
-                self.commit_git_diff_changes();
-                true
-            }
-            _ => false,
-        }
-    }
-
-    fn commit_git_diff_changes(&mut self) {
-        let Some(agent) = self.active_agent_mut() else {
-            self.status_message = Some("Add an agent before committing changes.".to_string());
-            return;
-        };
-        if agent.git_diff.remote_action.is_some() {
-            agent.git_diff.error = Some("Wait for git push/pull to finish.".to_string());
-            return;
-        }
-
-        let root = agent.definition.workspace.clone();
-        match agent.git_diff.commit(&root) {
-            Ok(()) => agent.workspace.refresh(&root),
-            Err(error) => agent.git_diff.error = Some(error.to_string()),
-        }
-    }
-
-    fn stage_git_diff_changes(&mut self) {
-        let Some(agent) = self.active_agent_mut() else {
-            self.status_message = Some("Add an agent before staging changes.".to_string());
-            return;
-        };
-        if agent.git_diff.remote_action.is_some() {
-            agent.git_diff.error = Some("Wait for git push/pull to finish.".to_string());
-            return;
-        }
-
-        let root = agent.definition.workspace.clone();
-        match agent.git_diff.stage_selected(&root) {
-            Ok(()) => agent.workspace.refresh(&root),
-            Err(error) => agent.git_diff.error = Some(error.to_string()),
-        }
-    }
-
-    fn unstage_git_diff_changes(&mut self) {
-        let Some(agent) = self.active_agent_mut() else {
-            self.status_message = Some("Add an agent before unstaging changes.".to_string());
-            return;
-        };
-        if agent.git_diff.remote_action.is_some() {
-            agent.git_diff.error = Some("Wait for git push/pull to finish.".to_string());
-            return;
-        }
-
-        let root = agent.definition.workspace.clone();
-        match agent.git_diff.unstage_selected(&root) {
-            Ok(()) => agent.workspace.refresh(&root),
-            Err(error) => agent.git_diff.error = Some(error.to_string()),
-        }
-    }
-
-    fn discard_git_diff_changes(&mut self) {
-        let Some(agent) = self.active_agent_mut() else {
-            self.status_message = Some("Add an agent before discarding changes.".to_string());
-            return;
-        };
-        if agent.git_diff.remote_action.is_some() {
-            agent.git_diff.error = Some("Wait for git push/pull to finish.".to_string());
-            return;
-        }
-
-        let root = agent.definition.workspace.clone();
-        match agent.git_diff.discard_selected(&root) {
-            Ok(()) => agent.workspace.refresh(&root),
-            Err(error) => agent.git_diff.error = Some(error.to_string()),
-        }
-    }
-
-    fn push_git_diff_changes(&mut self, ui_tx: &mpsc::UnboundedSender<UiEvent>) {
-        let Some(agent_index) = self.current_agent else {
-            self.status_message = Some("Add an agent before pushing changes.".to_string());
-            return;
-        };
-
-        let root = self.agents[agent_index].definition.workspace.clone();
-        match self.agents[agent_index]
-            .git_diff
-            .begin_remote_action(GitRemoteAction::Push)
-        {
-            Ok(()) => {}
-            Err(error) => {
-                self.agents[agent_index].git_diff.error = Some(error.to_string());
-                return;
-            }
-        }
-
-        let ui_tx = ui_tx.clone();
-        task::spawn(async move {
-            let result =
-                task::spawn_blocking(move || run_git_remote_action(&root, GitRemoteAction::Push))
-                    .await;
-            let (success, message) = match result {
-                Ok(Ok(output)) => (true, output),
-                Ok(Err(error)) => (false, error.to_string()),
-                Err(error) => (false, format!("git push task failed: {error}")),
-            };
-            let _ = ui_tx.send(UiEvent::GitDiffRemoteCompleted {
-                agent_index,
-                action: GitRemoteAction::Push,
-                success,
-                message,
-            });
-        });
-    }
-
-    fn pull_git_diff_changes(&mut self, ui_tx: &mpsc::UnboundedSender<UiEvent>) {
-        let Some(agent_index) = self.current_agent else {
-            self.status_message = Some("Add an agent before pulling changes.".to_string());
-            return;
-        };
-
-        let root = self.agents[agent_index].definition.workspace.clone();
-        match self.agents[agent_index]
-            .git_diff
-            .begin_remote_action(GitRemoteAction::Pull)
-        {
-            Ok(()) => {}
-            Err(error) => {
-                self.agents[agent_index].git_diff.error = Some(error.to_string());
-                return;
-            }
-        }
-
-        let ui_tx = ui_tx.clone();
-        task::spawn(async move {
-            let result =
-                task::spawn_blocking(move || run_git_remote_action(&root, GitRemoteAction::Pull))
-                    .await;
-            let (success, message) = match result {
-                Ok(Ok(output)) => (true, output),
-                Ok(Err(error)) => (false, error.to_string()),
-                Err(error) => (false, format!("git pull task failed: {error}")),
-            };
-            let _ = ui_tx.send(UiEvent::GitDiffRemoteCompleted {
-                agent_index,
-                action: GitRemoteAction::Pull,
-                success,
-                message,
-            });
-        });
-    }
-
-    fn select_chat_sidebar_index(&mut self, index: usize) {
-        self.chat_sidebar_index = index.min(self.agents.len());
-        if self.chat_sidebar_index > 0 {
-            self.current_agent = Some(self.chat_sidebar_index - 1);
-            self.add_form.error = None;
-        }
-    }
-
-    fn submit_new_agent(&mut self, codex: CodexAppServer, ui_tx: mpsc::UnboundedSender<UiEvent>) {
-        match validate_agent_input(&self.add_form.name, &self.add_form.workspace) {
-            Ok(agent) => {
-                self.config.agents.push(agent.clone());
-                if let Err(error) = save_config(&self.config_path, &self.config) {
-                    self.add_form.error = Some(error.to_string());
-                    return;
-                }
-
-                self.agents.push(AgentState::new(
-                    agent,
-                    self.default_chat_model.clone(),
-                    self.default_chat_reasoning_effort.clone(),
-                    &self.chat_model_label,
-                ));
-                let new_index = self.agents.len().saturating_sub(1);
-                self.current_agent = Some(new_index);
-                self.chat_sidebar_index = new_index + 1;
-                self.add_form = AddAgentForm::default();
-                self.status_message = Some("Agent saved to ~/.cmdex.yml".to_string());
-                spawn_session_load(
-                    codex,
-                    ui_tx,
-                    new_index,
-                    self.agents[new_index].definition.workspace.clone(),
-                );
-            }
-            Err(error) => {
-                self.add_form.error = Some(error.to_string());
-            }
-        }
-    }
-
-    fn submit_message(&mut self, codex: CodexAppServer, ui_tx: mpsc::UnboundedSender<UiEvent>) {
-        if let Some(command) = chat_command_from_input(&self.chat_input) {
-            self.submit_chat_command(command, codex, ui_tx);
-            return;
-        }
-
-        if let Some(command) = shell_command_from_input(&self.chat_input) {
-            self.submit_shell_command(command, ui_tx);
-            return;
-        }
-
-        let text = self.chat_input.trim().to_string();
-        if text.is_empty() {
-            return;
-        }
-
-        let Some(agent_index) = self.current_agent else {
-            self.status_message = Some("Add an agent before sending messages.".to_string());
-            return;
-        };
-
-        let agent = &mut self.agents[agent_index];
-        if agent.thinking || agent.shell_running {
-            self.status_message = Some("Wait for the current response to finish.".to_string());
-            return;
-        }
-
-        agent
-            .messages
-            .push(ChatMessage::new(MessageRole::User, text.clone(), None));
-        agent.thinking = true;
-        agent.status = None;
-        let existing_thread = agent.thread_id.clone();
-        let thread_loaded = agent.thread_loaded;
-        let selected_model = agent.chat_model.clone();
-        let selected_effort = agent.chat_reasoning_effort.clone();
-        let workspace = agent.definition.workspace.clone();
-        self.chat_input.clear();
-
-        tokio::spawn(async move {
-            let thread_id = match existing_thread {
-                Some(thread_id) => {
-                    if !thread_loaded {
-                        match codex
-                            .resume_thread(&thread_id, selected_model.as_deref())
-                            .await
-                        {
-                            Ok(thread) => {
-                                let id = thread.id.clone();
-                                let _ = ui_tx.send(UiEvent::ThreadReady {
-                                    agent_index,
-                                    thread,
-                                });
-                                id
-                            }
-                            Err(error) => {
-                                let _ = ui_tx.send(UiEvent::SubmissionFailed {
-                                    agent_index,
-                                    message: error.to_string(),
-                                });
-                                return;
-                            }
-                        }
-                    } else {
-                        thread_id
-                    }
-                }
-                None => match codex
-                    .start_thread(&workspace, selected_model.as_deref())
-                    .await
-                {
-                    Ok(thread) => {
-                        let id = thread.id.clone();
-                        let _ = ui_tx.send(UiEvent::ThreadReady {
-                            agent_index,
-                            thread,
-                        });
-                        id
-                    }
-                    Err(error) => {
-                        let _ = ui_tx.send(UiEvent::SubmissionFailed {
-                            agent_index,
-                            message: error.to_string(),
-                        });
-                        return;
-                    }
-                },
-            };
-
-            match codex
-                .start_turn(
-                    &thread_id,
-                    &text,
-                    selected_model.as_deref(),
-                    selected_effort.as_deref(),
-                )
-                .await
-            {
-                Ok(turn_id) => {
-                    let _ = ui_tx.send(UiEvent::TurnStartedLocal {
-                        agent_index,
-                        turn_id,
-                    });
-                }
-                Err(error) => {
-                    let _ = ui_tx.send(UiEvent::SubmissionFailed {
-                        agent_index,
-                        message: error.to_string(),
-                    });
-                }
-            }
-        });
-    }
-
-    fn submit_chat_command(
-        &mut self,
-        command: ChatCommand,
-        codex: CodexAppServer,
-        ui_tx: mpsc::UnboundedSender<UiEvent>,
-    ) {
-        match command {
-            ChatCommand::Model(command) => self.submit_model_command(command, codex, ui_tx),
-        }
-    }
-
-    fn submit_model_command(
-        &mut self,
-        command: ModelCommand,
-        codex: CodexAppServer,
-        ui_tx: mpsc::UnboundedSender<UiEvent>,
-    ) {
-        let Some(agent_index) = self.current_agent else {
-            self.status_message = Some("Add an agent before changing the model.".to_string());
-            return;
-        };
-
-        self.chat_input.clear();
-
-        match command {
-            ModelCommand::List => {
-                let current_label = self.agents[agent_index].chat_model_label.clone();
-                self.agents[agent_index].status = Some("Loading available models...".to_string());
-                tokio::spawn(async move {
-                    let message = match codex.list_models().await {
-                        Ok(models) => format_model_list_message(&current_label, &models),
-                        Err(error) => format!("Unable to load available models.\n\n{error}"),
-                    };
-                    let _ = ui_tx.send(UiEvent::ModelCommandResult {
-                        agent_index,
-                        message,
-                    });
-                });
-            }
-            ModelCommand::ResetDefault => {
-                let agent = &mut self.agents[agent_index];
-                agent.chat_model = self.default_chat_model.clone();
-                agent.chat_reasoning_effort = self.default_chat_reasoning_effort.clone();
-                agent.chat_model_label = self.chat_model_label.clone();
-                agent.chat_settings_explicit = false;
-                let message = format!("Model set to `{}`.", agent.chat_model_label);
-                agent.status = Some(message.clone());
-                agent
-                    .messages
-                    .push(ChatMessage::new(MessageRole::System, message, None));
-                self.status_message = Some("Model updated".to_string());
-            }
-            ModelCommand::Set { model, effort } => {
-                let default_model = self.default_chat_model.clone();
-                let default_label = self.chat_model_label.clone();
-                let agent = &mut self.agents[agent_index];
-                if let Some(model) = model {
-                    agent.chat_model = Some(model);
-                }
-                if let Some(effort) = effort {
-                    agent.chat_reasoning_effort = Some(effort);
-                }
-                agent.chat_settings_explicit = true;
-                agent.chat_model_label = resolve_chat_model_label(
-                    agent.chat_model.as_deref(),
-                    agent.chat_reasoning_effort.as_deref(),
-                    default_model.as_deref(),
-                    &default_label,
-                );
-                let message = format!("Model set to `{}`.", agent.chat_model_label);
-                agent.status = Some(message.clone());
-                agent
-                    .messages
-                    .push(ChatMessage::new(MessageRole::System, message, None));
-                self.status_message = Some("Model updated".to_string());
-            }
-        }
-    }
-
-    fn submit_shell_command(&mut self, command: String, ui_tx: mpsc::UnboundedSender<UiEvent>) {
-        let Some(agent_index) = self.current_agent else {
-            self.status_message = Some("Add an agent before running shell commands.".to_string());
-            return;
-        };
-
-        let agent = &mut self.agents[agent_index];
-        if agent.thinking || agent.shell_running {
-            self.status_message = Some("Wait for the current response to finish.".to_string());
-            return;
-        }
-
-        agent.messages.push(ChatMessage::new(
-            MessageRole::Shell,
-            format!("> {command}"),
-            None,
-        ));
-        agent.shell_running = true;
-        agent.status = None;
-        let workspace = agent.definition.workspace.clone();
-        self.chat_input.clear();
-
-        tokio::spawn(async move {
-            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-            let result = Command::new(shell)
-                .arg("-c")
-                .arg(&command)
-                .current_dir(&workspace)
-                .output()
-                .await;
-
-            let (output, success) = match result {
-                Ok(output) => {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    (
-                        format_shell_output(
-                            &command,
-                            &stdout,
-                            &stderr,
-                            output.status.code(),
-                            output.status.success(),
-                        ),
-                        output.status.success(),
-                    )
-                }
-                Err(error) => (
-                    format!(
-                        "```text\n{}\n```\n\nExit code: unavailable",
-                        truncate_shell_text(&error.to_string())
-                    ),
-                    false,
-                ),
-            };
-
-            let _ = ui_tx.send(UiEvent::ShellCompleted {
-                agent_index,
-                output,
-                success,
-            });
-        });
-    }
-
-    fn open_shell_tab(&mut self, ui_tx: mpsc::UnboundedSender<UiEvent>) {
-        let Some(agent_index) = self.current_agent else {
-            self.status_message = Some("Add an agent before creating a shell session.".to_string());
-            return;
-        };
-
-        self.current_tab = AppTab::Shell;
-        self.refresh_current_tab();
-        let workspace = self.agents[agent_index].definition.workspace.clone();
-        let Some(session_id) = self.agents[agent_index]
-            .shell_tab
-            .create_session_if_empty(&workspace)
-        else {
-            return;
-        };
-        self.start_shell_session(agent_index, session_id, workspace, ui_tx);
-    }
-
-    fn open_shell_tab_and_create_session(&mut self, ui_tx: mpsc::UnboundedSender<UiEvent>) {
-        let Some(agent_index) = self.current_agent else {
-            self.status_message = Some("Add an agent before creating a shell session.".to_string());
-            return;
-        };
-
-        self.current_tab = AppTab::Shell;
-        self.refresh_current_tab();
-        let workspace = self.agents[agent_index].definition.workspace.clone();
-        let session_id = self.agents[agent_index]
-            .shell_tab
-            .create_session(&workspace);
-        self.start_shell_session(agent_index, session_id, workspace, ui_tx);
-    }
-
-    fn start_shell_session(
-        &mut self,
-        agent_index: usize,
-        session_id: usize,
-        workspace: PathBuf,
-        ui_tx: mpsc::UnboundedSender<UiEvent>,
-    ) {
-        if let Err(error) =
-            self.spawn_shell_session_runtime(agent_index, session_id, workspace, ui_tx)
-        {
-            self.agents[agent_index]
-                .shell_tab
-                .remove_session_by_id(session_id);
-            self.status_message = Some(error.to_string());
-        }
-    }
-
-    fn submit_shell_session_command(&mut self, _ui_tx: mpsc::UnboundedSender<UiEvent>) {
-        let Some(agent_index) = self.current_agent else {
-            self.status_message = Some("Add an agent before running shell commands.".to_string());
-            return;
-        };
-
-        let Some(session_id) = self.agents[agent_index]
-            .shell_tab
-            .selected_session()
-            .map(|session| session.id)
-        else {
-            self.status_message = Some("Click + New session or press Ctrl+T.".to_string());
-            return;
-        };
-
-        let command = self.agents[agent_index].shell_tab.input.trim().to_string();
-        if command.is_empty() {
-            return;
-        }
-
-        let key = ShellSessionKey {
-            agent_index,
-            session_id,
-        };
-        let Some(runtime) = self.shell_runtimes.get(&key) else {
-            self.status_message =
-                Some("The selected shell session is no longer available.".to_string());
-            self.agents[agent_index]
-                .shell_tab
-                .remove_session_by_id(session_id);
-            return;
-        };
-
-        let Some(session) = self.agents[agent_index]
-            .shell_tab
-            .session_by_id_mut(session_id)
-        else {
-            return;
-        };
-        if session.running {
-            self.status_message = Some("Wait for the current shell command to finish.".to_string());
-            return;
-        }
-
-        session.append_command(&command);
-        self.agents[agent_index].shell_tab.input.clear();
-
-        if runtime
-            .command_tx
-            .send(shell::shell_command_payload(&command))
-            .is_err()
-        {
-            self.agents[agent_index]
-                .shell_tab
-                .remove_session_by_id(session_id);
-            self.shell_runtimes.remove(&key);
-            self.status_message = Some("Failed to send command to shell.".to_string());
-        }
-    }
-
-    fn spawn_shell_session_runtime(
-        &mut self,
-        agent_index: usize,
-        session_id: usize,
-        workspace: PathBuf,
-        ui_tx: mpsc::UnboundedSender<UiEvent>,
-    ) -> Result<()> {
-        let shell_path = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        let mut child = Command::new(&shell_path)
-            .current_dir(&workspace)
-            .env("PS1", "")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("failed to open shell stdin"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("failed to open shell stdout"))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("failed to open shell stderr"))?;
-        let pid = child.id().unwrap_or_default();
-
-        let (command_tx, mut command_rx) = mpsc::unbounded_channel::<String>();
-        let writer_tx = ui_tx.clone();
-        tokio::spawn(async move {
-            let mut stdin = stdin;
-            while let Some(command) = command_rx.recv().await {
-                if let Err(error) = stdin.write_all(command.as_bytes()).await {
-                    let _ = writer_tx.send(UiEvent::ShellSessionExited {
-                        agent_index,
-                        session_id,
-                        message: format!("Shell stdin write failed: {error}"),
-                    });
-                    break;
-                }
-                if let Err(error) = stdin.flush().await {
-                    let _ = writer_tx.send(UiEvent::ShellSessionExited {
-                        agent_index,
-                        session_id,
-                        message: format!("Shell stdin flush failed: {error}"),
-                    });
-                    break;
-                }
-            }
-        });
-
-        let stdout_tx = ui_tx.clone();
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stdout).lines();
-            loop {
-                match lines.next_line().await {
-                    Ok(Some(line)) => {
-                        if let Some(code) = line.strip_prefix(shell::SHELL_COMMAND_SENTINEL) {
-                            let exit_code = code.parse::<i32>().unwrap_or(-1);
-                            let _ = stdout_tx.send(UiEvent::ShellSessionCommandFinished {
-                                agent_index,
-                                session_id,
-                                exit_code,
-                            });
-                        } else {
-                            let _ = stdout_tx.send(UiEvent::ShellSessionOutput {
-                                agent_index,
-                                session_id,
-                                line,
-                                stderr: false,
-                            });
-                        }
-                    }
-                    Ok(None) => break,
-                    Err(error) => {
-                        let _ = stdout_tx.send(UiEvent::ShellSessionExited {
-                            agent_index,
-                            session_id,
-                            message: format!("Shell stdout read failed: {error}"),
-                        });
-                        break;
-                    }
-                }
-            }
-        });
-
-        let stderr_tx = ui_tx.clone();
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            loop {
-                match lines.next_line().await {
-                    Ok(Some(line)) => {
-                        let _ = stderr_tx.send(UiEvent::ShellSessionOutput {
-                            agent_index,
-                            session_id,
-                            line,
-                            stderr: true,
-                        });
-                    }
-                    Ok(None) => break,
-                    Err(error) => {
-                        let _ = stderr_tx.send(UiEvent::ShellSessionExited {
-                            agent_index,
-                            session_id,
-                            message: format!("Shell stderr read failed: {error}"),
-                        });
-                        break;
-                    }
-                }
-            }
-        });
-
-        let exit_tx = ui_tx.clone();
-        tokio::spawn(async move {
-            let message = match child.wait().await {
-                Ok(status) => format!("Shell exited with status {}", status),
-                Err(error) => format!("Shell wait failed: {error}"),
-            };
-            let _ = exit_tx.send(UiEvent::ShellSessionExited {
-                agent_index,
-                session_id,
-                message,
-            });
-        });
-
-        self.shell_runtimes.insert(
-            ShellSessionKey {
-                agent_index,
-                session_id,
-            },
-            ShellSessionRuntime { command_tx, pid },
-        );
-        Ok(())
-    }
-
-    fn interrupt_active_chat_turn(
-        &mut self,
-        codex: CodexAppServer,
-        ui_tx: mpsc::UnboundedSender<UiEvent>,
-    ) {
-        if self.add_agent_selected() {
-            return;
-        }
-
-        let Some(agent_index) = self.current_agent else {
-            return;
-        };
-        let agent = &mut self.agents[agent_index];
-
-        if !agent.thinking || agent.shell_running {
-            return;
-        }
-
-        let (Some(thread_id), Some(turn_id)) =
-            (agent.thread_id.clone(), agent.active_turn_id.clone())
-        else {
-            return;
-        };
-
-        agent.status = Some("Canceling response...".to_string());
-        self.status_message = Some("Canceling response...".to_string());
-
-        tokio::spawn(async move {
-            if let Err(error) = codex.interrupt_turn(&thread_id, &turn_id).await {
-                let _ = ui_tx.send(UiEvent::TurnInterruptFailed {
-                    agent_index,
-                    message: format!("Failed to cancel response: {error}"),
-                });
-            }
-        });
-    }
-
     pub(super) fn handle_server_event(&mut self, event: ServerEvent) {
         match event {
             ServerEvent::ThreadStatusChanged { thread_id, active } => {
@@ -1750,7 +602,12 @@ impl App {
                 if let Some(agent) = self.find_agent_by_thread_mut(&thread_id) {
                     match item {
                         ThreadItem::AgentMessage { id, text } => {
-                            upsert_message(&mut agent.messages, MessageRole::Assistant, &id, text);
+                            MessageStore::upsert(
+                                &mut agent.messages,
+                                MessageRole::Assistant,
+                                &id,
+                                text,
+                            );
                             agent.streaming_item_id = None;
                         }
                         ThreadItem::UserMessage => {}
@@ -1819,7 +676,7 @@ impl App {
                         agent.chat_model = thread.model;
                         agent.chat_reasoning_effort = thread.reasoning_effort;
                     }
-                    agent.chat_model_label = resolve_chat_model_label(
+                    agent.chat_model_label = ChatSupport::resolve_chat_model_label(
                         agent.chat_model.as_deref(),
                         agent.chat_reasoning_effort.as_deref(),
                         self.default_chat_model.as_deref(),
@@ -1847,7 +704,7 @@ impl App {
             } => {
                 if let (Some(agent), Some(session)) = (self.agents.get_mut(agent_index), session) {
                     if agent.thread_id.is_none() && agent.messages.is_empty() {
-                        let (thread_id, messages) = session_messages(session);
+                        let (thread_id, messages) = SessionLoader::session_messages(session);
                         agent.thread_id = Some(thread_id);
                         agent.thread_loaded = false;
                         agent.messages = messages;
@@ -1990,16 +847,7 @@ impl App {
             .find(|agent| agent.thread_id.as_deref() == Some(thread_id))
     }
 
-    pub(super) fn selected_tab_index(&self) -> usize {
-        match self.current_tab {
-            AppTab::Chat => 0,
-            AppTab::Workspace => 1,
-            AppTab::Shell => 2,
-            AppTab::GitDiff => 3,
-        }
-    }
-
-    fn compute_layout(&self, area: Rect) -> UiLayout {
+    pub(in crate::app) fn compute_layout(&self, area: Rect) -> UiLayout {
         let frame = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -2038,38 +886,36 @@ impl App {
                 add_name: None,
                 add_workspace: None,
             }
-        } else {
-            if self.current_tab == AppTab::Chat {
-                let outer = rounded_block().title("New Agent");
-                let inner = outer.inner(root[1]);
-                let fields = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Length(3),
-                        Constraint::Length(3),
-                        Constraint::Length(3),
-                        Constraint::Min(3),
-                    ])
-                    .margin(1)
-                    .split(inner);
+        } else if self.current_tab == AppTab::Chat {
+            let outer = UiSupport::rounded_block().title("New Agent");
+            let inner = outer.inner(root[1]);
+            let fields = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Length(3),
+                    Constraint::Length(3),
+                    Constraint::Min(3),
+                ])
+                .margin(1)
+                .split(inner);
 
-                UiLayout {
-                    sidebar_list: root[0],
-                    tabs: frame[0],
-                    body: root[1],
-                    footer: None,
-                    add_name: Some(fields[1]),
-                    add_workspace: Some(fields[2]),
-                }
-            } else {
-                UiLayout {
-                    sidebar_list: root[0],
-                    tabs: frame[0],
-                    body: root[1],
-                    footer: None,
-                    add_name: None,
-                    add_workspace: None,
-                }
+            UiLayout {
+                sidebar_list: root[0],
+                tabs: frame[0],
+                body: root[1],
+                footer: None,
+                add_name: Some(fields[1]),
+                add_workspace: Some(fields[2]),
+            }
+        } else {
+            UiLayout {
+                sidebar_list: root[0],
+                tabs: frame[0],
+                body: root[1],
+                footer: None,
+                add_name: None,
+                add_workspace: None,
             }
         }
     }
@@ -2081,14 +927,14 @@ impl App {
         layout: UiLayout,
         ui_tx: &mpsc::UnboundedSender<UiEvent>,
     ) {
-        if rect_contains(layout.tabs, column, row) {
+        if UiSupport::rect_contains(layout.tabs, column, row) {
             if let Some(tab) = tab_from_click(layout.tabs, column, row) {
                 self.activate_tab(tab, ui_tx.clone());
             }
             return;
         }
 
-        if rect_contains(layout.sidebar_list, column, row) {
+        if UiSupport::rect_contains(layout.sidebar_list, column, row) {
             self.handle_sidebar_click(column, row, layout.sidebar_list, ui_tx);
             return;
         }
@@ -2111,14 +957,14 @@ impl App {
         if self.add_agent_selected() {
             if layout
                 .add_name
-                .is_some_and(|rect| rect_contains(rect, column, row))
+                .is_some_and(|rect| UiSupport::rect_contains(rect, column, row))
             {
                 self.add_form.active_field = AddAgentField::Name;
                 return;
             }
             if layout
                 .add_workspace
-                .is_some_and(|rect| rect_contains(rect, column, row))
+                .is_some_and(|rect| UiSupport::rect_contains(rect, column, row))
             {
                 self.add_form.active_field = AddAgentField::Workspace;
             }
@@ -2126,7 +972,7 @@ impl App {
     }
 
     fn handle_scroll(&mut self, column: u16, row: u16, layout: UiLayout, up: bool) {
-        if rect_contains(layout.sidebar_list, column, row) {
+        if UiSupport::rect_contains(layout.sidebar_list, column, row) {
             if up {
                 self.move_selection_up();
             } else {
@@ -2135,10 +981,10 @@ impl App {
             return;
         }
 
-        if rect_contains(layout.body, column, row)
+        if UiSupport::rect_contains(layout.body, column, row)
             || layout
                 .footer
-                .is_some_and(|rect| rect_contains(rect, column, row))
+                .is_some_and(|rect| UiSupport::rect_contains(rect, column, row))
         {
             if self.current_tab == AppTab::Chat && !self.add_agent_selected() {
                 if up {
@@ -2162,244 +1008,10 @@ impl App {
         ui_tx: &mpsc::UnboundedSender<UiEvent>,
     ) {
         match self.current_tab {
-            AppTab::Chat => {
-                let inner = inner_rect(sidebar_list);
-                if inner.height == 0 || !rect_contains(inner, column, row) {
-                    return;
-                }
-
-                let visible_row = row.saturating_sub(inner.y) as usize;
-                let total = self.agents.len() + 1;
-                let offset = list_offset(self.chat_sidebar_index, total, inner.height as usize);
-                let index = (offset + visible_row).min(total.saturating_sub(1));
-                self.select_chat_sidebar_index(index);
-            }
-            AppTab::Workspace => {
-                if let Some(agent) = self.active_agent_mut() {
-                    let layout =
-                        workspace_sidebar_layout(sidebar_list, agent.workspace.sidebar_tab);
-                    if let Some(tab) = workspace_sidebar_tab_from_click(layout.tabs, column, row) {
-                        agent.workspace.set_sidebar_tab(tab);
-                        return;
-                    }
-
-                    match agent.workspace.sidebar_tab {
-                        WorkspaceSidebarTab::Files => {
-                            let inner = inner_rect(layout.content);
-                            if inner.height == 0 || !rect_contains(inner, column, row) {
-                                return;
-                            }
-
-                            let visible_row = row.saturating_sub(inner.y) as usize;
-                            let total = agent.workspace.sidebar_len();
-                            if total == 0 {
-                                return;
-                            }
-                            let offset = list_offset(
-                                agent.workspace.sidebar_selected_row(),
-                                total,
-                                inner.height as usize,
-                            );
-                            let index = (offset + visible_row).min(total.saturating_sub(1));
-                            agent.workspace.select_sidebar_row(index);
-                        }
-                        WorkspaceSidebarTab::Search => {
-                            if layout
-                                .input
-                                .is_some_and(|input| rect_contains(input, column, row))
-                            {
-                                return;
-                            }
-
-                            let inner = inner_rect(layout.content);
-                            if inner.height == 0 || !rect_contains(inner, column, row) {
-                                return;
-                            }
-
-                            let visible_row = row.saturating_sub(inner.y) as usize;
-                            let total = agent.workspace.search_total_rows();
-                            if total == 0 {
-                                return;
-                            }
-                            let offset = list_offset(
-                                agent.workspace.search_selected_row(),
-                                total,
-                                inner.height as usize,
-                            );
-                            let index = (offset + visible_row).min(total.saturating_sub(1));
-                            agent.workspace.select_search_row(index);
-                            if let Err(error) = agent.workspace.open_selected_search_result() {
-                                agent.workspace.error = Some(error.to_string());
-                            }
-                        }
-                    }
-                }
-            }
-            AppTab::Shell => {
-                let inner = inner_rect(sidebar_list);
-                if inner.height == 0 || !rect_contains(inner, column, row) {
-                    return;
-                }
-
-                let visible_row = row.saturating_sub(inner.y) as usize;
-                let clicked_index = self.active_agent().map(|agent| {
-                    let total = agent.shell_tab.sessions.len() + 1;
-                    let selected = if agent.shell_tab.sessions.is_empty() {
-                        0
-                    } else {
-                        agent.shell_tab.selected_index() + 1
-                    };
-                    let offset = list_offset(selected, total, inner.height as usize);
-                    (offset + visible_row).min(total.saturating_sub(1))
-                });
-
-                match clicked_index {
-                    Some(0) => self.open_shell_tab_and_create_session(ui_tx.clone()),
-                    Some(index) => {
-                        if let Some(agent) = self.active_agent_mut() {
-                            agent.shell_tab.select(index - 1);
-                        }
-                    }
-                    None => {}
-                }
-            }
-            AppTab::GitDiff => {
-                let inner = inner_rect(sidebar_list);
-                if inner.height == 0 || !rect_contains(inner, column, row) {
-                    return;
-                }
-
-                let visible_row = row.saturating_sub(inner.y) as usize;
-                if let Some(agent) = self.active_agent_mut() {
-                    let total = agent.git_diff.visible_entries().len();
-                    if total == 0 {
-                        return;
-                    }
-                    let offset = list_offset(
-                        agent.git_diff.selected_index(),
-                        total,
-                        inner.height as usize,
-                    );
-                    let index = (offset + visible_row).min(total.saturating_sub(1));
-                    let root = agent.definition.workspace.clone();
-                    agent.git_diff.select(&root, index);
-                }
-            }
+            AppTab::Chat => self.handle_chat_sidebar_click(column, row, sidebar_list),
+            AppTab::Workspace => self.handle_workspace_sidebar_click(column, row, sidebar_list),
+            AppTab::Shell => self.handle_shell_sidebar_click(column, row, sidebar_list, ui_tx),
+            AppTab::GitDiff => self.handle_git_diff_sidebar_click(column, row, sidebar_list),
         }
     }
-
-    fn handle_workspace_editor_click(&mut self, column: u16, row: u16, area: Rect) {
-        let viewport = workspace_editor_viewport(area);
-        if !rect_contains(viewport, column, row) {
-            return;
-        }
-
-        let Some(agent) = self.active_agent_mut() else {
-            return;
-        };
-        let Some(editor) = agent.workspace.editor.as_mut() else {
-            return;
-        };
-
-        let gutter_width = editor.gutter_width() as u16;
-        let target_row =
-            usize::from(row.saturating_sub(viewport.y)) + editor.vertical_scroll as usize;
-        let content_x = column.saturating_sub(viewport.x);
-        let target_col = if content_x <= gutter_width {
-            0
-        } else {
-            usize::from(content_x.saturating_sub(gutter_width)) + editor.horizontal_scroll as usize
-        };
-
-        editor.mode = EditorMode::Normal;
-        editor.set_cursor(target_row, target_col);
-        editor.ensure_visible(viewport.width, viewport.height);
-    }
-
-    fn handle_git_diff_click(
-        &mut self,
-        column: u16,
-        row: u16,
-        area: Rect,
-        ui_tx: &mpsc::UnboundedSender<UiEvent>,
-    ) -> bool {
-        let layout = git_diff_layout(area);
-        let Some(agent) = self.active_agent() else {
-            return false;
-        };
-
-        let changes_label = format!("Changes ({})", agent.git_diff.count(DiffSection::Changes));
-        let staged_label = format!("Staged ({})", agent.git_diff.count(DiffSection::Staged));
-        let active_section = agent.git_diff.active_section;
-        if let Some(section) =
-            git_diff_section_from_click(layout.sections, &changes_label, &staged_label, column, row)
-        {
-            if let Some(agent) = self.active_agent_mut() {
-                let root = agent.definition.workspace.clone();
-                agent.git_diff.set_active_section(&root, section);
-            }
-            return true;
-        }
-
-        if rect_contains(layout.push_button, column, row) {
-            self.push_git_diff_changes(ui_tx);
-            return true;
-        }
-
-        if rect_contains(layout.stage_button, column, row) {
-            match active_section {
-                DiffSection::Changes => self.stage_git_diff_changes(),
-                DiffSection::Staged => self.unstage_git_diff_changes(),
-            }
-            return true;
-        }
-
-        if rect_contains(layout.discard_button, column, row) {
-            self.discard_git_diff_changes();
-            return true;
-        }
-
-        if rect_contains(layout.pull_button, column, row) {
-            self.pull_git_diff_changes(ui_tx);
-            return true;
-        }
-
-        rect_contains(layout.commit_input, column, row)
-            || rect_contains(layout.preview, column, row)
-    }
-}
-
-fn format_model_list_message(current_label: &str, models: &[ModelInfo]) -> String {
-    if models.is_empty() {
-        return format!(
-            "Current model: `{current_label}`\n\nNo visible models were returned by the app server."
-        );
-    }
-
-    let mut lines = vec![
-        format!("Current model: `{current_label}`"),
-        String::new(),
-        "Available models:".to_string(),
-    ];
-
-    for model in models {
-        let mut line = format!("- `{}`", model.model);
-        if model.id != model.model {
-            line.push_str(&format!(" [{}]", model.id));
-        }
-        if model.display_name != model.model {
-            line.push_str(&format!(" - {}", model.display_name));
-        }
-        if model.is_default {
-            line.push_str(" (default)");
-        }
-        lines.push(line);
-    }
-
-    lines.push(String::new());
-    lines.push("Use `/model <id>` to switch models.".to_string());
-    lines.push("Use `/model <id> <effort>` to switch model and effort together.".to_string());
-    lines.push("Use `/model <effort>` to change only the effort.".to_string());
-    lines.push("Use `/model default` to go back to the configured default.".to_string());
-    lines.join("\n")
 }

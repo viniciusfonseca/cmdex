@@ -1,15 +1,19 @@
 use super::{render::*, *};
 
+pub(super) struct WorkspaceBrowserSupport;
+
 impl FileBrowserState {
     pub fn refresh(&mut self, root: &Path) {
-        match build_file_entries(root).and_then(|entries| self.apply_entries(entries)) {
+        match WorkspaceBrowserSupport::build_file_entries(root)
+            .and_then(|entries| self.apply_entries(entries))
+        {
             Ok(()) => {}
             Err(error) => self.reset_with_error(error),
         }
     }
 
     pub fn refresh_if_changed(&mut self, root: &Path) {
-        match build_file_entries(root).and_then(|entries| {
+        match WorkspaceBrowserSupport::build_file_entries(root).and_then(|entries| {
             if entries == self.entries {
                 Ok(())
             } else {
@@ -324,7 +328,8 @@ impl FileBrowserState {
     }
 
     fn rebuild_tree_rows(&mut self) {
-        let (tree_rows, tree_file_rows) = build_file_tree_rows(&self.entries, &self.collapsed_dirs);
+        let (tree_rows, tree_file_rows) =
+            WorkspaceBrowserSupport::build_file_tree_rows(&self.entries, &self.collapsed_dirs);
         self.tree_rows = tree_rows;
 
         if let Some(row) = tree_file_rows
@@ -338,7 +343,7 @@ impl FileBrowserState {
     }
 
     fn sync_collapsed_dirs(&mut self) {
-        let directory_paths = collect_directory_paths(&self.entries);
+        let directory_paths = WorkspaceBrowserSupport::collect_directory_paths(&self.entries);
 
         if self.known_dirs.is_empty() {
             self.collapsed_dirs = directory_paths.clone();
@@ -372,12 +377,16 @@ impl FileBrowserState {
                 continue;
             }
 
-            let source = normalize_newlines(&String::from_utf8_lossy(&bytes));
+            let source = WorkspaceRenderer::normalize_newlines(&String::from_utf8_lossy(&bytes));
             let mut matches = Vec::new();
             for (line_index, line) in source.lines().enumerate() {
                 if line.contains(query) {
                     matches.push(WorkspaceSearchRow::Match {
-                        label: format!("  {}: {}", line_index + 1, search_result_excerpt(line)),
+                        label: format!(
+                            "  {}: {}",
+                            line_index + 1,
+                            WorkspaceBrowserSupport::search_result_excerpt(line)
+                        ),
                         file_index,
                         line_number: line_index + 1,
                     });
@@ -512,13 +521,14 @@ impl FileBrowserState {
     fn update_preview(&mut self) -> Result<()> {
         if self.entries.is_empty() {
             self.preview_title = "Workspace".to_string();
-            self.preview = plain_preview_lines("No files found for this workspace.");
+            self.preview =
+                WorkspaceRenderer::plain_preview_lines("No files found for this workspace.");
             return Ok(());
         }
 
         let entry = &self.entries[self.selected];
         self.preview_title = entry.path.display().to_string();
-        self.preview = read_text_preview(&entry.path)?;
+        self.preview = WorkspaceRenderer::read_text_preview(&entry.path)?;
         Ok(())
     }
 
@@ -535,7 +545,7 @@ impl FileBrowserState {
         self.search_selected_row = 0;
         self.search_match_count = 0;
         self.preview_title = "Workspace".to_string();
-        self.preview = plain_preview_lines("Unable to load workspace.");
+        self.preview = WorkspaceRenderer::plain_preview_lines("Unable to load workspace.");
         self.error = Some(error.to_string());
     }
 }
@@ -589,199 +599,201 @@ impl WorkspaceSearchRow {
     }
 }
 
-pub(super) fn build_file_entries(root: &Path) -> Result<Vec<FileEntry>> {
-    let mut entries = Vec::new();
-    let walker = WalkBuilder::new(root)
-        .hidden(false)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .build();
-
-    for result in walker {
-        let entry = result.with_context(|| format!("failed to walk {}", root.display()))?;
-        let path = entry.path();
-        if path == root {
-            continue;
-        }
-        if contains_git_component(path) {
-            continue;
-        }
-
-        let relative = path
-            .strip_prefix(root)
-            .with_context(|| format!("failed to make {} relative", path.display()))?;
-        if entry.file_type().is_some_and(|kind| kind.is_dir()) {
-            continue;
-        }
-
-        entries.push(FileEntry {
-            path: path.to_path_buf(),
-            relative_path: relative.to_path_buf(),
-        });
-    }
-
-    entries.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
-    Ok(entries)
-}
-
 #[derive(Debug, Default)]
 struct FileTreeNode {
     directories: BTreeMap<String, FileTreeNode>,
     files: Vec<(String, usize)>,
 }
 
-fn collect_directory_paths(entries: &[FileEntry]) -> BTreeSet<PathBuf> {
-    let mut directories = BTreeSet::new();
+impl WorkspaceBrowserSupport {
+    pub(super) fn build_file_entries(root: &Path) -> Result<Vec<FileEntry>> {
+        let mut entries = Vec::new();
+        let walker = WalkBuilder::new(root)
+            .hidden(false)
+            .git_ignore(true)
+            .git_global(true)
+            .git_exclude(true)
+            .build();
 
-    for entry in entries {
-        let mut ancestor = entry.relative_path.parent();
-        while let Some(path) = ancestor {
-            if path.as_os_str().is_empty() {
-                break;
+        for result in walker {
+            let entry = result.with_context(|| format!("failed to walk {}", root.display()))?;
+            let path = entry.path();
+            if path == root {
+                continue;
             }
-            directories.insert(path.to_path_buf());
-            ancestor = path.parent();
+            if Self::contains_git_component(path) {
+                continue;
+            }
+
+            let relative = path
+                .strip_prefix(root)
+                .with_context(|| format!("failed to make {} relative", path.display()))?;
+            if entry.file_type().is_some_and(|kind| kind.is_dir()) {
+                continue;
+            }
+
+            entries.push(FileEntry {
+                path: path.to_path_buf(),
+                relative_path: relative.to_path_buf(),
+            });
         }
+
+        entries.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        Ok(entries)
     }
 
-    directories
-}
+    fn collect_directory_paths(entries: &[FileEntry]) -> BTreeSet<PathBuf> {
+        let mut directories = BTreeSet::new();
 
-pub(super) fn build_file_tree_rows(
-    entries: &[FileEntry],
-    collapsed_dirs: &BTreeSet<PathBuf>,
-) -> (Vec<FileTreeRow>, Vec<Option<usize>>) {
-    let mut root = FileTreeNode::default();
+        for entry in entries {
+            let mut ancestor = entry.relative_path.parent();
+            while let Some(path) = ancestor {
+                if path.as_os_str().is_empty() {
+                    break;
+                }
+                directories.insert(path.to_path_buf());
+                ancestor = path.parent();
+            }
+        }
 
-    for (index, entry) in entries.iter().enumerate() {
-        let components = entry
-            .relative_path
-            .components()
-            .map(|component| component.as_os_str().to_string_lossy().to_string())
+        directories
+    }
+
+    pub(super) fn build_file_tree_rows(
+        entries: &[FileEntry],
+        collapsed_dirs: &BTreeSet<PathBuf>,
+    ) -> (Vec<FileTreeRow>, Vec<Option<usize>>) {
+        let mut root = FileTreeNode::default();
+
+        for (index, entry) in entries.iter().enumerate() {
+            let components = entry
+                .relative_path
+                .components()
+                .map(|component| component.as_os_str().to_string_lossy().to_string())
+                .collect::<Vec<_>>();
+            if components.is_empty() {
+                continue;
+            }
+
+            let mut node = &mut root;
+            for directory in &components[..components.len().saturating_sub(1)] {
+                node = node.directories.entry(directory.clone()).or_default();
+            }
+
+            if let Some(file_name) = components.last() {
+                node.files.push((file_name.clone(), index));
+            }
+        }
+
+        let mut rows = Vec::new();
+        let mut file_rows = vec![None; entries.len()];
+        Self::append_tree_rows(
+            &root,
+            Path::new(""),
+            &[],
+            collapsed_dirs,
+            &mut rows,
+            &mut file_rows,
+        );
+        (rows, file_rows)
+    }
+
+    fn append_tree_rows(
+        node: &FileTreeNode,
+        base_path: &Path,
+        ancestor_has_more: &[bool],
+        collapsed_dirs: &BTreeSet<PathBuf>,
+        rows: &mut Vec<FileTreeRow>,
+        file_rows: &mut [Option<usize>],
+    ) {
+        let directories = node
+            .directories
+            .iter()
+            .map(|(name, child)| (TreeChild::Directory(name), child))
             .collect::<Vec<_>>();
-        if components.is_empty() {
-            continue;
-        }
+        let files = node
+            .files
+            .iter()
+            .map(|(name, index)| (TreeChild::File(name, *index), node))
+            .collect::<Vec<_>>();
 
-        let mut node = &mut root;
-        for directory in &components[..components.len().saturating_sub(1)] {
-            node = node.directories.entry(directory.clone()).or_default();
-        }
+        let children = directories.into_iter().chain(files).collect::<Vec<_>>();
 
-        if let Some(file_name) = components.last() {
-            node.files.push((file_name.clone(), index));
-        }
-    }
+        for (position, (child, child_node)) in children.iter().enumerate() {
+            let is_last = position + 1 == children.len();
+            let mut label = Self::tree_row_prefix(ancestor_has_more);
+            label.push_str(if is_last { "└── " } else { "├── " });
 
-    let mut rows = Vec::new();
-    let mut file_rows = vec![None; entries.len()];
-    append_tree_rows(
-        &root,
-        Path::new(""),
-        &[],
-        collapsed_dirs,
-        &mut rows,
-        &mut file_rows,
-    );
-    (rows, file_rows)
-}
+            match child {
+                TreeChild::Directory(name) => {
+                    let relative_path = if base_path.as_os_str().is_empty() {
+                        PathBuf::from(name)
+                    } else {
+                        base_path.join(name)
+                    };
+                    let expanded = !collapsed_dirs.contains(&relative_path);
+                    label.push_str(if expanded { "▾ " } else { "▸ " });
+                    label.push_str(name);
+                    rows.push(FileTreeRow {
+                        label,
+                        kind: FileTreeRowKind::Directory {
+                            relative_path: relative_path.clone(),
+                            expanded,
+                        },
+                    });
 
-fn append_tree_rows(
-    node: &FileTreeNode,
-    base_path: &Path,
-    ancestor_has_more: &[bool],
-    collapsed_dirs: &BTreeSet<PathBuf>,
-    rows: &mut Vec<FileTreeRow>,
-    file_rows: &mut [Option<usize>],
-) {
-    let directories = node
-        .directories
-        .iter()
-        .map(|(name, child)| (TreeChild::Directory(name), child))
-        .collect::<Vec<_>>();
-    let files = node
-        .files
-        .iter()
-        .map(|(name, index)| (TreeChild::File(name, *index), node))
-        .collect::<Vec<_>>();
-
-    let children = directories.into_iter().chain(files).collect::<Vec<_>>();
-
-    for (position, (child, child_node)) in children.iter().enumerate() {
-        let is_last = position + 1 == children.len();
-        let mut label = tree_row_prefix(ancestor_has_more);
-        label.push_str(if is_last { "└── " } else { "├── " });
-
-        match child {
-            TreeChild::Directory(name) => {
-                let relative_path = if base_path.as_os_str().is_empty() {
-                    PathBuf::from(name)
-                } else {
-                    base_path.join(name)
-                };
-                let expanded = !collapsed_dirs.contains(&relative_path);
-                label.push_str(if expanded { "▾ " } else { "▸ " });
-                label.push_str(name);
-                rows.push(FileTreeRow {
-                    label,
-                    kind: FileTreeRowKind::Directory {
-                        relative_path: relative_path.clone(),
-                        expanded,
-                    },
-                });
-
-                if expanded {
-                    let mut next_prefix = ancestor_has_more.to_vec();
-                    next_prefix.push(!is_last);
-                    append_tree_rows(
-                        child_node,
-                        &relative_path,
-                        &next_prefix,
-                        collapsed_dirs,
-                        rows,
-                        file_rows,
-                    );
+                    if expanded {
+                        let mut next_prefix = ancestor_has_more.to_vec();
+                        next_prefix.push(!is_last);
+                        Self::append_tree_rows(
+                            child_node,
+                            &relative_path,
+                            &next_prefix,
+                            collapsed_dirs,
+                            rows,
+                            file_rows,
+                        );
+                    }
+                }
+                TreeChild::File(name, file_index) => {
+                    label.push_str(name);
+                    file_rows[*file_index] = Some(rows.len());
+                    rows.push(FileTreeRow {
+                        label,
+                        kind: FileTreeRowKind::File {
+                            file_index: *file_index,
+                        },
+                    });
                 }
             }
-            TreeChild::File(name, file_index) => {
-                label.push_str(name);
-                file_rows[*file_index] = Some(rows.len());
-                rows.push(FileTreeRow {
-                    label,
-                    kind: FileTreeRowKind::File {
-                        file_index: *file_index,
-                    },
-                });
-            }
         }
     }
-}
 
-fn tree_row_prefix(ancestor_has_more: &[bool]) -> String {
-    ancestor_has_more
-        .iter()
-        .map(|has_more| if *has_more { "│   " } else { "    " })
-        .collect::<Vec<_>>()
-        .join("")
+    fn tree_row_prefix(ancestor_has_more: &[bool]) -> String {
+        ancestor_has_more
+            .iter()
+            .map(|has_more| if *has_more { "│   " } else { "    " })
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    pub(super) fn contains_git_component(path: &Path) -> bool {
+        path.components()
+            .any(|component| component.as_os_str() == ".git")
+    }
+
+    fn search_result_excerpt(line: &str) -> String {
+        let collapsed = line.replace('\t', " ").trim().to_string();
+        let chars = collapsed.chars().collect::<Vec<_>>();
+        if chars.len() <= 120 {
+            collapsed
+        } else {
+            chars[..117].iter().collect::<String>() + "..."
+        }
+    }
 }
 
 enum TreeChild<'a> {
     Directory(&'a str),
     File(&'a str, usize),
-}
-
-pub(super) fn contains_git_component(path: &Path) -> bool {
-    path.components()
-        .any(|component| component.as_os_str() == ".git")
-}
-
-fn search_result_excerpt(line: &str) -> String {
-    let collapsed = line.replace('\t', " ").trim().to_string();
-    let chars = collapsed.chars().collect::<Vec<_>>();
-    if chars.len() <= 120 {
-        collapsed
-    } else {
-        chars[..117].iter().collect::<String>() + "..."
-    }
 }

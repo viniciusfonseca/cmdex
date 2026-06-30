@@ -13,8 +13,8 @@ impl WorkspaceEditorState {
             ));
         }
 
-        let source = normalize_newlines(&String::from_utf8_lossy(&bytes));
-        let mut lines = split_preserving_lines(&source);
+        let source = WorkspaceRenderer::normalize_newlines(&String::from_utf8_lossy(&bytes));
+        let mut lines = WorkspaceRenderer::split_preserving_lines(&source);
         if lines.is_empty() {
             lines.push(String::new());
         }
@@ -48,7 +48,7 @@ impl WorkspaceEditorState {
             .checked_sub(start)
             .and_then(|visible_row| lines.get_mut(visible_row))
         {
-            highlight_editor_line(line);
+            WorkspaceRenderer::highlight_editor_line(line);
         }
         lines
     }
@@ -199,7 +199,8 @@ impl WorkspaceEditorState {
     pub fn delete_char(&mut self) {
         let line_len = self.line_len(self.cursor_row);
         if self.cursor_col < line_len {
-            let byte_index = byte_index_for_char(&self.lines[self.cursor_row], self.cursor_col);
+            let byte_index =
+                Self::byte_index_for_char(&self.lines[self.cursor_row], self.cursor_col);
             self.lines[self.cursor_row].remove(byte_index);
             self.dirty = true;
         } else if self.cursor_row + 1 < self.lines.len() {
@@ -215,7 +216,7 @@ impl WorkspaceEditorState {
     }
 
     pub fn insert_char(&mut self, character: char) {
-        let byte_index = byte_index_for_char(&self.lines[self.cursor_row], self.cursor_col);
+        let byte_index = Self::byte_index_for_char(&self.lines[self.cursor_row], self.cursor_col);
         self.lines[self.cursor_row].insert(byte_index, character);
         self.cursor_col += 1;
         self.preferred_col = self.cursor_col;
@@ -225,7 +226,7 @@ impl WorkspaceEditorState {
     }
 
     pub fn insert_newline(&mut self) {
-        let byte_index = byte_index_for_char(&self.lines[self.cursor_row], self.cursor_col);
+        let byte_index = Self::byte_index_for_char(&self.lines[self.cursor_row], self.cursor_col);
         let tail = self.lines[self.cursor_row].split_off(byte_index);
         self.cursor_row += 1;
         self.lines.insert(self.cursor_row, tail);
@@ -238,8 +239,9 @@ impl WorkspaceEditorState {
 
     pub fn backspace(&mut self) {
         if self.cursor_col > 0 {
-            let byte_end = byte_index_for_char(&self.lines[self.cursor_row], self.cursor_col);
-            let byte_start = byte_index_for_char(&self.lines[self.cursor_row], self.cursor_col - 1);
+            let byte_end = Self::byte_index_for_char(&self.lines[self.cursor_row], self.cursor_col);
+            let byte_start =
+                Self::byte_index_for_char(&self.lines[self.cursor_row], self.cursor_col - 1);
             self.lines[self.cursor_row].drain(byte_start..byte_end);
             self.cursor_col -= 1;
         } else if self.cursor_row > 0 {
@@ -348,19 +350,20 @@ impl WorkspaceEditorState {
     }
 
     fn rebuild_render_cache(&mut self) {
-        self.render_cache.lines = build_editor_render_lines(&self.path, &self.lines);
+        self.render_cache.lines =
+            WorkspaceRenderer::build_editor_render_lines(&self.path, &self.lines);
     }
 
     fn max_vertical_scroll(&self, viewport_height: u16) -> u16 {
         self.content_height()
             .saturating_sub(usize::from(viewport_height.max(1))) as u16
     }
-}
 
-fn byte_index_for_char(source: &str, char_index: usize) -> usize {
-    source
-        .char_indices()
-        .nth(char_index)
-        .map(|(index, _)| index)
-        .unwrap_or(source.len())
+    fn byte_index_for_char(source: &str, char_index: usize) -> usize {
+        source
+            .char_indices()
+            .nth(char_index)
+            .map(|(index, _)| index)
+            .unwrap_or(source.len())
+    }
 }
