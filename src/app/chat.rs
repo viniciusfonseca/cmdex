@@ -1,6 +1,12 @@
-use super::{ui::UiSupport, *};
+use super::{components::UiSupport, *};
 
 pub(super) struct ChatSupport;
+const CHAT_RENDER_LINE_LIMIT: usize = 10_000;
+
+pub(super) struct ChatRenderState {
+    pub(super) text: Text<'static>,
+    pub(super) content_height: usize,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum ChatCommand {
@@ -18,29 +24,53 @@ pub(super) enum ModelCommand {
 }
 
 impl ChatSupport {
-    pub(super) fn lines(agent: &AgentState) -> Vec<Line<'static>> {
+    pub(super) fn build_text(agent: &AgentState) -> Text<'static> {
         if agent.messages.is_empty() {
-            vec![Line::from("No messages yet.")]
-        } else {
-            agent
-                .messages
-                .iter()
-                .flat_map(|message| Self::message_lines(message, &agent.definition.name))
-                .collect()
+            return Text::from(vec![Line::from("No messages yet.")]);
         }
+
+        let mut used = 0usize;
+        let mut chunks = Vec::new();
+
+        for message in agent.messages.iter().rev() {
+            let available = CHAT_RENDER_LINE_LIMIT.saturating_sub(used);
+            if available == 0 {
+                break;
+            }
+
+            let message_lines = Self::message_lines(message, &agent.definition.name);
+            let lines = if message_lines.len() <= available {
+                message_lines
+            } else if chunks.is_empty() {
+                Self::truncate_message_lines(message_lines, available)
+            } else {
+                break;
+            };
+            used += lines.len();
+            chunks.push(lines);
+        }
+
+        let mut lines = Vec::with_capacity(used);
+        for chunk in chunks.into_iter().rev() {
+            lines.extend(chunk);
+        }
+
+        Text::from(lines)
+    }
+
+    pub(super) fn lines(agent: &AgentState) -> Vec<Line<'static>> {
+        agent.chat_text().lines
     }
 
     pub(super) fn max_scroll(agent: &AgentState, area: Rect) -> u16 {
-        let lines = Self::lines(agent);
         let inner_height = area.height.saturating_sub(2) as usize;
-        let content_height = Self::text_height(&lines, area);
+        let content_height = agent.chat_content_height(area);
 
         content_height.saturating_sub(inner_height) as u16
     }
 
     pub(super) fn content_height(agent: &AgentState, area: Rect) -> usize {
-        let lines = Self::lines(agent);
-        Self::text_height(&lines, area)
+        agent.chat_content_height(area)
     }
 
     pub(super) fn command_from_input(input: &str) -> Option<ChatCommand> {
@@ -89,26 +119,34 @@ impl ChatSupport {
         )
     }
 
-    pub(super) fn padded_lines(agent: &AgentState, area: Rect) -> Vec<Line<'static>> {
-        let mut lines = Self::lines(agent);
+    pub(super) fn render_state(agent: &AgentState, area: Rect) -> ChatRenderState {
+        let mut text = agent.chat_text();
         let inner_height = area.height.saturating_sub(2) as usize;
         if inner_height == 0 {
-            return lines;
+            return ChatRenderState {
+                text,
+                content_height: agent.chat_content_height(area),
+            };
         }
 
-        let content_height = Self::text_height(&lines, area);
+        let content_height = agent.chat_content_height(area);
         if content_height >= inner_height {
-            return lines;
+            return ChatRenderState {
+                text,
+                content_height,
+            };
         }
 
         let mut padded = vec![Line::default(); inner_height - content_height];
-        padded.append(&mut lines);
-        padded
+        padded.append(&mut text.lines);
+        ChatRenderState {
+            text: Text::from(padded),
+            content_height,
+        }
     }
 
-    fn text_height(lines: &[Line<'_>], area: Rect) -> usize {
-        let viewport = UiSupport::inner_rect(area);
-        UiSupport::wrapped_text_height(&Text::from(lines.to_vec()), viewport.width)
+    pub(super) fn padded_lines(agent: &AgentState, area: Rect) -> Vec<Line<'static>> {
+        Self::render_state(agent, area).text.lines
     }
 
     fn message_lines(message: &ChatMessage, agent_name: &str) -> Vec<Line<'static>> {
@@ -127,6 +165,25 @@ impl ChatSupport {
         lines.extend(message.rendered_lines.iter().cloned());
         lines.push(Line::default());
         lines
+    }
+
+    fn truncate_message_lines(lines: Vec<Line<'static>>, available: usize) -> Vec<Line<'static>> {
+        if lines.len() <= available {
+            return lines;
+        }
+        if available == 0 {
+            return Vec::new();
+        }
+        if available == 1 {
+            return vec![lines[0].clone()];
+        }
+
+        let mut truncated = Vec::with_capacity(available);
+        truncated.push(lines[0].clone());
+        let tail_len = available - 1;
+        let start = lines.len().saturating_sub(tail_len);
+        truncated.extend(lines.into_iter().skip(start));
+        truncated
     }
 
     pub(super) fn render_message_body(source: &str) -> Vec<Line<'static>> {

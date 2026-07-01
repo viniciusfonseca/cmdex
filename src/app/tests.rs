@@ -1,10 +1,10 @@
 use super::{
     chat::{ChatCommand, ChatSupport, ModelCommand},
-    shell::{SHELL_COMMAND_SENTINEL, ShellPresenter, ShellTabState},
-    ui::{
-        UiSupport, chat_input_height_for_main_area, git_diff_remote_button_label, tab_from_click,
-        top_navigation_tabs_rect, wrapped_chat_input_lines,
+    components::{
+        ChatInputComponent, GitDiffComponent, ShellSidebarComponent, TopNavigationComponent,
+        UiSupport,
     },
+    shell::{ShellOutputParser, ShellOutputRecord, ShellPresenter, ShellTabState},
     *,
 };
 
@@ -26,7 +26,7 @@ fn list_offset_scrolls_long_lists_to_keep_selection_visible() {
 #[test]
 fn git_diff_remote_button_label_shows_spinner_only_for_active_action() {
     assert_eq!(
-        git_diff_remote_button_label(
+        GitDiffComponent::remote_button_label(
             "Push",
             Some(GitRemoteAction::Push),
             GitRemoteAction::Push,
@@ -35,7 +35,7 @@ fn git_diff_remote_button_label_shows_spinner_only_for_active_action() {
         format!("{} Push", SPINNER[2])
     );
     assert_eq!(
-        git_diff_remote_button_label(
+        GitDiffComponent::remote_button_label(
             "Pull",
             Some(GitRemoteAction::Push),
             GitRemoteAction::Pull,
@@ -101,9 +101,7 @@ fn shell_tab_removes_closed_session_and_clamps_selection() {
 fn shell_command_payload_appends_completion_sentinel() {
     let payload = ShellPresenter::command_payload("pwd");
 
-    assert!(payload.starts_with("pwd\n"));
-    assert!(payload.contains(SHELL_COMMAND_SENTINEL));
-    assert!(payload.contains("\"$?\""));
+    assert_eq!(payload, "pwd\n");
 }
 
 #[test]
@@ -112,6 +110,7 @@ fn shell_display_lines_hides_prompt_while_session_is_running() {
     let workspace = PathBuf::from("/tmp/project");
     shell_tab.create_session(&workspace);
     let session = shell_tab.selected_session_mut().expect("session");
+    session.mark_ready();
 
     let idle_lines = ShellPresenter::display_lines(session, "ls");
     assert_eq!(line_text(idle_lines.last().expect("idle prompt")), "$ ls");
@@ -125,17 +124,56 @@ fn shell_display_lines_hides_prompt_while_session_is_running() {
 }
 
 #[test]
+fn shell_output_parser_splits_sentinel_from_same_terminal_line() {
+    let mut parser = ShellOutputParser::new();
+    let records = parser.push("value__CMDEX_DONE__:7\n");
+
+    assert_eq!(records.len(), 2);
+    assert!(matches!(&records[0], ShellOutputRecord::Line(line) if line == "value"));
+    assert!(matches!(records[1], ShellOutputRecord::CommandFinished(7)));
+}
+
+#[test]
+fn shell_output_parser_normalizes_carriage_returns() {
+    let mut parser = ShellOutputParser::new();
+    let records = parser.push("first\rsecond\r__CMDEX_DONE__:0\n");
+
+    assert_eq!(records.len(), 3);
+    assert!(matches!(&records[0], ShellOutputRecord::Line(line) if line == "first"));
+    assert!(matches!(&records[1], ShellOutputRecord::Line(line) if line == "second"));
+    assert!(matches!(records[2], ShellOutputRecord::CommandFinished(0)));
+}
+
+#[test]
+fn shell_output_parser_strips_ansi_sequences_before_rendering() {
+    let mut parser = ShellOutputParser::new();
+    let records = parser.push("\u{1b}[31mred\u{1b}[0m\r\n");
+
+    assert!(matches!(records.as_slice(), [ShellOutputRecord::Line(line)] if line == "red"));
+}
+
+#[test]
+fn shell_output_parser_treats_crlf_as_single_line_break() {
+    let mut parser = ShellOutputParser::new();
+    let records = parser.push("first\r\nsecond\r\n");
+
+    assert_eq!(records.len(), 2);
+    assert!(matches!(&records[0], ShellOutputRecord::Line(line) if line == "first"));
+    assert!(matches!(&records[1], ShellOutputRecord::Line(line) if line == "second"));
+}
+
+#[test]
 fn shell_tab_index_sits_between_workspace_and_git_diff() {
     let mut app = App::new(PathBuf::new(), CmdexConfig::default());
 
     app.current_tab = AppTab::Workspace;
-    assert_eq!(app.selected_tab_index(), 1);
+    assert_eq!(TopNavigationComponent::selected_index(&app), 1);
 
     app.current_tab = AppTab::Shell;
-    assert_eq!(app.selected_tab_index(), 2);
+    assert_eq!(TopNavigationComponent::selected_index(&app), 2);
 
     app.current_tab = AppTab::GitDiff;
-    assert_eq!(app.selected_tab_index(), 3);
+    assert_eq!(TopNavigationComponent::selected_index(&app), 3);
 }
 
 #[test]
@@ -151,12 +189,17 @@ fn shell_sidebar_labels_include_new_session_action() {
     app.current_tab = AppTab::Shell;
     app.current_agent = Some(0);
 
-    let labels_without_sessions = app.sidebar_labels();
+    let labels_without_sessions = ShellSidebarComponent::labels(&app);
     assert_eq!(labels_without_sessions, vec!["+ New session".to_string()]);
 
-    app.agents[0].shell_tab.create_session(&workspace);
+    let session_id = app.agents[0].shell_tab.create_session(&workspace);
+    app.agents[0]
+        .shell_tab
+        .session_by_id_mut(session_id)
+        .expect("session")
+        .mark_ready();
 
-    let labels_with_session = app.sidebar_labels();
+    let labels_with_session = ShellSidebarComponent::labels(&app);
     assert_eq!(labels_with_session[0], "+ New session");
     assert_eq!(labels_with_session[1], "Session 1");
 }
@@ -181,21 +224,27 @@ fn shell_session_exit_event_removes_session_from_sidebar() {
         message: "Shell exited".to_string(),
     });
 
-    assert_eq!(app.sidebar_labels(), vec!["+ New session".to_string()]);
+    assert_eq!(
+        ShellSidebarComponent::labels(&app),
+        vec!["+ New session".to_string()]
+    );
     assert_eq!(app.status_message.as_deref(), Some("Shell exited"));
 }
 
 #[test]
 fn top_navigation_clicks_ignore_cmdex_prefix_and_hit_tabs() {
     let area = Rect::new(0, 0, 50, 3);
-    let tabs = top_navigation_tabs_rect(area);
+    let tabs = TopNavigationComponent::tabs_rect(area);
 
-    assert_eq!(tab_from_click(area, 1, 1), None);
-    assert_eq!(tab_from_click(area, tabs.x, tabs.y), Some(AppTab::Chat));
+    assert_eq!(TopNavigationComponent::tab_from_click(area, 1, 1), None);
+    assert_eq!(
+        TopNavigationComponent::tab_from_click(area, tabs.x, tabs.y),
+        Some(AppTab::Chat)
+    );
 
     let workspace_x = tabs.x.saturating_add("Chat".chars().count() as u16 + 3);
     assert_eq!(
-        tab_from_click(area, workspace_x, tabs.y),
+        TopNavigationComponent::tab_from_click(area, workspace_x, tabs.y),
         Some(AppTab::Workspace)
     );
 }
@@ -367,6 +416,34 @@ fn cached_chat_message_lines_refresh_after_text_updates() {
 }
 
 #[test]
+fn chat_limits_rendered_lines_to_ten_thousand() {
+    let mut agent = AgentState::new(
+        AgentDefinition {
+            name: "Test".to_string(),
+            workspace: PathBuf::from("/tmp"),
+        },
+        None,
+        None,
+        "default",
+    );
+
+    for index in 0..4_000 {
+        agent.messages.push(ChatMessage::new(
+            MessageRole::Assistant,
+            format!("message {index}"),
+            None,
+        ));
+    }
+
+    let lines = ChatSupport::lines(&agent);
+
+    assert_eq!(lines.len(), 9_999);
+    assert_eq!(line_text(&lines[0]), "Test:");
+    assert_eq!(line_text(&lines[1]), "message 667");
+    assert!(line_text(lines.last().expect("last line")).is_empty());
+}
+
+#[test]
 fn shell_command_is_detected_from_chat_input() {
     assert_eq!(
         ChatSupport::shell_command_from_input("> cargo test"),
@@ -427,11 +504,11 @@ fn shell_output_is_formatted_for_chat() {
 #[test]
 fn chat_input_wraps_into_multiple_lines() {
     assert_eq!(
-        wrapped_chat_input_lines("abcdef", 4),
+        ChatInputComponent::wrapped_lines("abcdef", 4),
         vec!["abcd".to_string(), "ef".to_string()]
     );
     assert_eq!(
-        wrapped_chat_input_lines("ab\ncd", 4),
+        ChatInputComponent::wrapped_lines("ab\ncd", 4),
         vec!["ab".to_string(), "cd".to_string()]
     );
 }
@@ -440,8 +517,14 @@ fn chat_input_wraps_into_multiple_lines() {
 fn chat_input_height_grows_with_wrapped_content() {
     let main_area = Rect::new(0, 0, 10, 20);
 
-    assert_eq!(chat_input_height_for_main_area("short", main_area), 3);
-    assert_eq!(chat_input_height_for_main_area("abcdefghijk", main_area), 4);
+    assert_eq!(
+        ChatInputComponent::height_for_main_area("short", main_area),
+        3
+    );
+    assert_eq!(
+        ChatInputComponent::height_for_main_area("abcdefghijk", main_area),
+        4
+    );
 }
 
 #[test]
@@ -676,7 +759,7 @@ fn workspace_tree_refreshes_on_tick_after_filesystem_changes() {
     app.current_tab = AppTab::Workspace;
     app.current_agent = Some(0);
     app.chat_sidebar_index = 1;
-    app.refresh_current_tab();
+    TopNavigationComponent::refresh_current_tab(&mut app);
 
     fs::write(root.join("beta.txt"), "beta").unwrap();
     app.last_workspace_refresh_at =

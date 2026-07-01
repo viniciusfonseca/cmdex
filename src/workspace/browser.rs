@@ -12,16 +12,20 @@ impl FileBrowserState {
         }
     }
 
-    pub fn refresh_if_changed(&mut self, root: &Path) {
+    pub fn refresh_if_changed(&mut self, root: &Path) -> bool {
         match WorkspaceBrowserSupport::build_file_entries(root).and_then(|entries| {
             if entries == self.entries {
-                Ok(())
+                Ok(false)
             } else {
-                self.apply_entries(entries)
+                self.apply_entries(entries)?;
+                Ok(true)
             }
         }) {
-            Ok(()) => {}
-            Err(error) => self.reset_with_error(error),
+            Ok(changed) => changed,
+            Err(error) => {
+                self.reset_with_error(error);
+                true
+            }
         }
     }
 

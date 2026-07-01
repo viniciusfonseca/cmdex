@@ -7,6 +7,7 @@ mod tests;
 mod ui;
 
 use std::{
+    cell::RefCell,
     collections::HashMap,
     env, fs,
     path::PathBuf,
@@ -34,10 +35,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap},
 };
-use tokio::{
-    sync::mpsc,
-    time::{MissedTickBehavior, interval},
-};
+use tokio::{sync::mpsc, time::sleep};
 
 use crate::codex::{
     CodexAppServer, HistoryEntryKind, ModelInfo, ServerEvent, ThreadInfo, ThreadItem,
@@ -63,6 +61,9 @@ const CONTENT_SCROLL_STEP: u16 = 4;
 const MOUSE_SCROLL_STEP: u16 = 4;
 const MOUSE_SCROLL_DEBOUNCE: Duration = Duration::from_millis(20);
 const WORKSPACE_AUTO_REFRESH_INTERVAL: Duration = Duration::from_millis(750);
+const FAST_TICK_INTERVAL: Duration = Duration::from_millis(80);
+const WORKSPACE_TICK_INTERVAL: Duration = Duration::from_millis(250);
+const IDLE_TICK_INTERVAL: Duration = Duration::from_millis(1000);
 const SHELL_OUTPUT_LIMIT: usize = 64_000;
 
 #[derive(Debug, Clone)]
@@ -160,25 +161,6 @@ struct UiLayout {
     add_workspace: Option<Rect>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct GitDiffLayout {
-    sections: Rect,
-    preview: Rect,
-    commit_input: Rect,
-    stage_button: Rect,
-    discard_button: Rect,
-    push_button: Rect,
-    pull_button: Rect,
-    status: Rect,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct WorkspaceSidebarLayout {
-    tabs: Rect,
-    input: Option<Rect>,
-    content: Rect,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct ShellSessionKey {
     agent_index: usize,
@@ -186,7 +168,7 @@ struct ShellSessionKey {
 }
 
 struct ShellSessionRuntime {
-    command_tx: mpsc::UnboundedSender<String>,
+    command_tx: std::sync::mpsc::Sender<String>,
     pid: u32,
 }
 
@@ -234,6 +216,23 @@ enum MessageRole {
     Shell,
 }
 
+#[derive(Debug, Clone)]
+struct ChatRenderCache {
+    text: Text<'static>,
+    content_height: Option<(u16, usize)>,
+    dirty: bool,
+}
+
+impl Default for ChatRenderCache {
+    fn default() -> Self {
+        Self {
+            text: Text::default(),
+            content_height: None,
+            dirty: true,
+        }
+    }
+}
+
 impl ChatMessage {
     fn new(role: MessageRole, text: impl Into<String>, item_id: Option<String>) -> Self {
         let text = text.into();
@@ -252,7 +251,14 @@ impl ChatMessage {
 
     fn append_text(&mut self, delta: &str) {
         self.text.push_str(delta);
-        self.rendered_lines = chat::ChatSupport::render_message_body(&self.text);
+        self.rendered_lines = self
+            .text
+            .split('\n')
+            .map(|line| Line::from(line.to_string()))
+            .collect();
+        if self.rendered_lines.is_empty() {
+            self.rendered_lines.push(Line::default());
+        }
     }
 }
 
@@ -278,6 +284,7 @@ struct AgentState {
     thinking: bool,
     shell_running: bool,
     streaming_item_id: Option<String>,
+    chat_render_cache: RefCell<ChatRenderCache>,
     workspace: FileBrowserState,
     shell_tab: shell::ShellTabState,
     git_diff: DiffBrowserState,
@@ -306,11 +313,64 @@ impl AgentState {
             thinking: false,
             shell_running: false,
             streaming_item_id: None,
+            chat_render_cache: RefCell::new(ChatRenderCache::default()),
             workspace: FileBrowserState::default(),
             shell_tab: shell::ShellTabState::default(),
             git_diff: DiffBrowserState::default(),
             status: None,
         }
+    }
+
+    fn push_message(&mut self, message: ChatMessage) {
+        self.messages.push(message);
+        self.invalidate_chat_render_cache();
+    }
+
+    fn replace_messages(&mut self, messages: Vec<ChatMessage>) {
+        self.messages = messages;
+        self.invalidate_chat_render_cache();
+    }
+
+    fn invalidate_chat_render_cache(&self) {
+        let mut cache = self.chat_render_cache.borrow_mut();
+        cache.dirty = true;
+        cache.content_height = None;
+    }
+
+    fn chat_text(&self) -> Text<'static> {
+        self.ensure_chat_render_cache();
+        self.chat_render_cache.borrow().text.clone()
+    }
+
+    fn chat_content_height(&self, area: Rect) -> usize {
+        let width = components::UiSupport::inner_rect(area).width.max(1);
+        self.ensure_chat_render_cache();
+
+        if let Some((cached_width, content_height)) = self.chat_render_cache.borrow().content_height
+        {
+            if cached_width == width {
+                return content_height;
+            }
+        }
+
+        let content_height = {
+            let cache = self.chat_render_cache.borrow();
+            components::UiSupport::wrapped_text_height(&cache.text, width)
+        };
+        self.chat_render_cache.borrow_mut().content_height = Some((width, content_height));
+        content_height
+    }
+
+    fn ensure_chat_render_cache(&self) {
+        if !self.chat_render_cache.borrow().dirty {
+            return;
+        }
+
+        let text = chat::ChatSupport::build_text(self);
+        let mut cache = self.chat_render_cache.borrow_mut();
+        cache.text = text;
+        cache.content_height = None;
+        cache.dirty = false;
     }
 }
 
@@ -409,15 +469,19 @@ impl App {
 struct MessageStore;
 
 impl MessageStore {
-    fn upsert(messages: &mut Vec<ChatMessage>, role: MessageRole, item_id: &str, text: String) {
-        if let Some(message) = messages
+    fn upsert(agent: &mut AgentState, role: MessageRole, item_id: &str, text: String) {
+        if let Some(message) = agent
+            .messages
             .iter_mut()
             .find(|message| message.item_id.as_deref() == Some(item_id))
         {
             message.set_text(text);
         } else {
-            messages.push(ChatMessage::new(role, text, Some(item_id.to_string())));
+            agent
+                .messages
+                .push(ChatMessage::new(role, text, Some(item_id.to_string())));
         }
+        agent.invalidate_chat_render_cache();
     }
 }
 
@@ -476,7 +540,7 @@ impl SessionLoader {
             {
                 let (thread_id, messages) = Self::session_messages(session);
                 agent.thread_id = Some(thread_id);
-                agent.messages = messages;
+                agent.replace_messages(messages);
             }
         }
 
@@ -498,14 +562,10 @@ impl AppRuntime {
         SessionLoader::hydrate_latest_sessions(&mut app, &codex).await?;
 
         let mut events = EventStream::new();
-        let mut ticker = interval(Duration::from_millis(80));
-        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
-        app.refresh_current_tab();
+        components::TopNavigationComponent::refresh_current_tab(&mut app);
+        let mut needs_redraw = true;
 
         let exit = loop {
-            terminal.draw(|frame| ui::draw(frame, &app))?;
-
             if app.should_quit {
                 break if app.should_restart {
                     AppExit::Restart
@@ -514,37 +574,52 @@ impl AppRuntime {
                 };
             }
 
+            if needs_redraw {
+                terminal.draw(|frame| ui::AppUi::draw(frame, &app))?;
+            }
+
+            let tick = sleep(app.tick_interval());
+            tokio::pin!(tick);
+
             tokio::select! {
                 maybe_event = events.next() => {
                     match maybe_event {
                         Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
                             let (width, height) = terminal_size()?;
                             app.handle_key(key, &codex, &ui_tx, Rect::new(0, 0, width, height));
+                            needs_redraw = true;
                         }
                         Some(Ok(Event::Mouse(mouse))) => {
                             let (width, height) = terminal_size()?;
                             app.handle_mouse(mouse, Rect::new(0, 0, width, height), &ui_tx);
+                            needs_redraw = true;
                         }
                         Some(Ok(Event::Paste(text))) => {
                             for character in text.chars() {
                                 app.handle_text_input(character);
                             }
+                            needs_redraw = true;
                         }
-                        Some(Ok(_)) => {}
+                        Some(Ok(_)) => {
+                            needs_redraw = true;
+                        }
                         Some(Err(error)) => {
                             app.status_message = Some(error.to_string());
+                            needs_redraw = true;
                         }
                         None => break AppExit::Quit,
                     }
                 }
                 Some(server_event) = server_rx.recv() => {
                     app.handle_server_event(server_event);
+                    needs_redraw = true;
                 }
                 Some(ui_event) = ui_rx.recv() => {
                     app.handle_ui_event(ui_event);
+                    needs_redraw = true;
                 }
-                _ = ticker.tick() => {
-                    app.on_tick();
+                _ = &mut tick => {
+                    needs_redraw = app.on_tick();
                 }
             }
         };

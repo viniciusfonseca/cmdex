@@ -917,13 +917,63 @@ impl CodexResponseMapper {
     }
 
     fn summarize_file_change(item: &Value) -> String {
-        let count = item
+        let changes = item
             .get("changes")
             .and_then(Value::as_array)
-            .map(|changes| changes.len())
-            .unwrap_or(0);
+            .cloned()
+            .unwrap_or_default();
+        let count = changes.len();
         let noun = if count == 1 { "file" } else { "files" };
-        format!("[File Change] {count} {noun} updated")
+
+        if changes.is_empty() {
+            return "[File Change] 0 files updated".to_string();
+        }
+
+        let mut text = format!("[File Change] {count} {noun} updated");
+        for change in changes {
+            let path = change
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let diff = change
+                .get("diff")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            let detail = Self::summarize_patch_change_kind(change.get("kind"));
+
+            text.push_str("\n\n");
+            text.push_str("- ");
+            text.push_str(&detail);
+            text.push_str(" `");
+            text.push_str(path);
+            text.push('`');
+
+            if !diff.is_empty() {
+                text.push_str("\n\n```diff\n");
+                text.push_str(diff);
+                text.push_str("\n```");
+            }
+        }
+
+        text
+    }
+
+    fn summarize_patch_change_kind(kind: Option<&Value>) -> String {
+        let Some(kind) = kind else {
+            return "Updated".to_string();
+        };
+
+        match kind.get("type").and_then(Value::as_str).unwrap_or("update") {
+            "add" => "Added".to_string(),
+            "delete" => "Deleted".to_string(),
+            "update" => kind
+                .get("move_path")
+                .and_then(Value::as_str)
+                .map(|move_path| format!("Updated (moved to `{move_path}`)"))
+                .unwrap_or_else(|| "Updated".to_string()),
+            _ => "Updated".to_string(),
+        }
     }
 
     fn summarize_mcp_tool_call(item: &Value) -> String {
@@ -1027,6 +1077,36 @@ mod tests {
         assert!(entries[1].text.contains("cargo check"));
         assert_eq!(entries[2].kind, HistoryEntryKind::Assistant);
         assert_eq!(entries[2].text, "done");
+    }
+
+    #[test]
+    fn file_change_entries_include_paths_and_diffs() {
+        let turns = vec![ThreadTurn {
+            items: vec![json!({
+                "type": "fileChange",
+                "changes": [
+                    {
+                        "path": "src/main.rs",
+                        "diff": "@@ -1 +1 @@\n-old\n+new",
+                        "kind": { "type": "update", "move_path": null }
+                    },
+                    {
+                        "path": "README.md",
+                        "diff": "+ hello",
+                        "kind": { "type": "add" }
+                    }
+                ]
+            })],
+        }];
+
+        let entries = CodexResponseMapper::history_entries_from_turns(&turns);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, HistoryEntryKind::Event);
+        assert!(entries[0].text.contains("[File Change] 2 files updated"));
+        assert!(entries[0].text.contains("- Updated `src/main.rs`"));
+        assert!(entries[0].text.contains("```diff"));
+        assert!(entries[0].text.contains("+new"));
+        assert!(entries[0].text.contains("- Added `README.md`"));
     }
 
     #[test]

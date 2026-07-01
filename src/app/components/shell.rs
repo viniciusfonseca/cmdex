@@ -2,13 +2,11 @@ use super::super::{
     shell::{self, ShellPresenter},
     *,
 };
-use super::{chat::wrapped_chat_input_lines, shared::UiSupport};
-use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use super::{ChatInputComponent, TopNavigationComponent, UiSupport};
 
-pub(in crate::app) struct ShellView;
+pub(in crate::app) struct ShellComponent;
 
-impl ShellView {
+impl ShellComponent {
     pub(in crate::app) fn draw(frame: &mut Frame, app: &App, area: Rect) {
         let Some(agent) = app.active_agent() else {
             let empty = Paragraph::new("Add an agent from the sidebar to start a shell session.")
@@ -32,6 +30,11 @@ impl ShellView {
                 "{} · {} Running...",
                 session.title, SPINNER[app.spinner_index]
             )
+        } else if !session.ready {
+            format!(
+                "{} · {} Starting...",
+                session.title, SPINNER[app.spinner_index]
+            )
         } else {
             session.title.clone()
         };
@@ -49,12 +52,12 @@ impl ShellView {
         UiSupport::render_vertical_scrollbar(frame, area, content_length, scroll);
 
         let inner = UiSupport::inner_rect(area);
-        if inner.width == 0 || inner.height == 0 || session.running {
+        if inner.width == 0 || inner.height == 0 || session.running || !session.ready {
             return;
         }
 
         let prompt_text = ShellPresenter::prompt_text(&agent.shell_tab.input);
-        let prompt_lines = wrapped_chat_input_lines(&prompt_text, inner.width);
+        let prompt_lines = ChatInputComponent::wrapped_lines(&prompt_text, inner.width);
         let prompt_last_line = prompt_lines
             .last()
             .map(|line| line.chars().count())
@@ -75,116 +78,57 @@ impl ShellView {
         let y = inner.y.saturating_add(prompt_row);
         frame.set_cursor_position((x, y));
     }
-}
 
-impl App {
-    pub(in crate::app) fn handle_shell_sidebar_click(
-        &mut self,
-        column: u16,
-        row: u16,
-        sidebar_list: Rect,
-        ui_tx: &mpsc::UnboundedSender<UiEvent>,
-    ) {
-        let inner = UiSupport::inner_rect(sidebar_list);
-        if inner.height == 0 || !UiSupport::rect_contains(inner, column, row) {
-            return;
-        }
-
-        let visible_row = row.saturating_sub(inner.y) as usize;
-        let clicked_index = self.active_agent().map(|agent| {
-            let total = agent.shell_tab.sessions.len() + 1;
-            let selected = if agent.shell_tab.sessions.is_empty() {
-                0
-            } else {
-                agent.shell_tab.selected_index() + 1
-            };
-            let offset = UiSupport::list_offset(selected, total, inner.height as usize);
-            (offset + visible_row).min(total.saturating_sub(1))
-        });
-
-        match clicked_index {
-            Some(0) => self.open_shell_tab_and_create_session(ui_tx.clone()),
-            Some(index) => {
-                if let Some(agent) = self.active_agent_mut() {
-                    agent.shell_tab.select(index - 1);
-                }
-            }
-            None => {}
-        }
-    }
-
-    pub(in crate::app) fn open_shell_tab(&mut self, ui_tx: mpsc::UnboundedSender<UiEvent>) {
-        let Some(agent_index) = self.current_agent else {
-            self.status_message = Some("Add an agent before creating a shell session.".to_string());
+    pub(in crate::app) fn open_tab(app: &mut App, ui_tx: mpsc::UnboundedSender<UiEvent>) {
+        let Some(agent_index) = app.current_agent else {
+            app.status_message = Some("Add an agent before creating a shell session.".to_string());
             return;
         };
 
-        self.current_tab = AppTab::Shell;
-        self.refresh_current_tab();
-        let workspace = self.agents[agent_index].definition.workspace.clone();
-        let Some(session_id) = self.agents[agent_index]
+        app.current_tab = AppTab::Shell;
+        TopNavigationComponent::refresh_current_tab(app);
+        let workspace = app.agents[agent_index].definition.workspace.clone();
+        let Some(session_id) = app.agents[agent_index]
             .shell_tab
             .create_session_if_empty(&workspace)
         else {
             return;
         };
-        self.start_shell_session(agent_index, session_id, workspace, ui_tx);
+        Self::start_session(app, agent_index, session_id, workspace, ui_tx);
     }
 
-    pub(in crate::app) fn open_shell_tab_and_create_session(
-        &mut self,
+    pub(in crate::app) fn open_tab_and_create_session(
+        app: &mut App,
         ui_tx: mpsc::UnboundedSender<UiEvent>,
     ) {
-        let Some(agent_index) = self.current_agent else {
-            self.status_message = Some("Add an agent before creating a shell session.".to_string());
+        let Some(agent_index) = app.current_agent else {
+            app.status_message = Some("Add an agent before creating a shell session.".to_string());
             return;
         };
 
-        self.current_tab = AppTab::Shell;
-        self.refresh_current_tab();
-        let workspace = self.agents[agent_index].definition.workspace.clone();
-        let session_id = self.agents[agent_index]
-            .shell_tab
-            .create_session(&workspace);
-        self.start_shell_session(agent_index, session_id, workspace, ui_tx);
+        app.current_tab = AppTab::Shell;
+        TopNavigationComponent::refresh_current_tab(app);
+        let workspace = app.agents[agent_index].definition.workspace.clone();
+        let session_id = app.agents[agent_index].shell_tab.create_session(&workspace);
+        Self::start_session(app, agent_index, session_id, workspace, ui_tx);
     }
 
-    fn start_shell_session(
-        &mut self,
-        agent_index: usize,
-        session_id: usize,
-        workspace: PathBuf,
-        ui_tx: mpsc::UnboundedSender<UiEvent>,
-    ) {
-        if let Err(error) =
-            self.spawn_shell_session_runtime(agent_index, session_id, workspace, ui_tx)
-        {
-            self.agents[agent_index]
-                .shell_tab
-                .remove_session_by_id(session_id);
-            self.status_message = Some(error.to_string());
-        }
-    }
-
-    pub(in crate::app) fn submit_shell_session_command(
-        &mut self,
-        _ui_tx: mpsc::UnboundedSender<UiEvent>,
-    ) {
-        let Some(agent_index) = self.current_agent else {
-            self.status_message = Some("Add an agent before running shell commands.".to_string());
+    pub(in crate::app) fn submit_command(app: &mut App, _ui_tx: mpsc::UnboundedSender<UiEvent>) {
+        let Some(agent_index) = app.current_agent else {
+            app.status_message = Some("Add an agent before running shell commands.".to_string());
             return;
         };
 
-        let Some(session_id) = self.agents[agent_index]
+        let Some(session_id) = app.agents[agent_index]
             .shell_tab
             .selected_session()
             .map(|session| session.id)
         else {
-            self.status_message = Some("Click + New session or press Ctrl+T.".to_string());
+            app.status_message = Some("Click + New session or press Ctrl+T.".to_string());
             return;
         };
 
-        let command = self.agents[agent_index].shell_tab.input.trim().to_string();
+        let command = app.agents[agent_index].shell_tab.input.trim().to_string();
         if command.is_empty() {
             return;
         }
@@ -193,171 +137,84 @@ impl App {
             agent_index,
             session_id,
         };
-        let Some(runtime) = self.shell_runtimes.get(&key) else {
-            self.status_message =
+        let Some(runtime) = app.shell_runtimes.get(&key) else {
+            app.status_message =
                 Some("The selected shell session is no longer available.".to_string());
-            self.agents[agent_index]
+            app.agents[agent_index]
                 .shell_tab
                 .remove_session_by_id(session_id);
             return;
         };
 
-        let Some(session) = self.agents[agent_index]
+        let Some(session) = app.agents[agent_index]
             .shell_tab
             .session_by_id_mut(session_id)
         else {
             return;
         };
         if session.running {
-            self.status_message = Some("Wait for the current shell command to finish.".to_string());
+            app.status_message = Some("Wait for the current shell command to finish.".to_string());
+            return;
+        }
+        if !session.ready {
+            app.status_message = Some("Shell session is still starting.".to_string());
             return;
         }
 
         session.append_command(&command);
-        self.agents[agent_index].shell_tab.input.clear();
+        app.agents[agent_index].shell_tab.input.clear();
 
         if runtime
             .command_tx
             .send(ShellPresenter::command_payload(&command))
             .is_err()
         {
-            self.agents[agent_index]
+            app.agents[agent_index]
                 .shell_tab
                 .remove_session_by_id(session_id);
-            self.shell_runtimes.remove(&key);
-            self.status_message = Some("Failed to send command to shell.".to_string());
+            app.shell_runtimes.remove(&key);
+            app.status_message = Some("Failed to send command to shell.".to_string());
         }
     }
 
-    fn spawn_shell_session_runtime(
-        &mut self,
+    fn start_session(
+        app: &mut App,
+        agent_index: usize,
+        session_id: usize,
+        workspace: PathBuf,
+        ui_tx: mpsc::UnboundedSender<UiEvent>,
+    ) {
+        if let Err(error) = Self::spawn_runtime(app, agent_index, session_id, workspace, ui_tx) {
+            app.agents[agent_index]
+                .shell_tab
+                .remove_session_by_id(session_id);
+            app.status_message = Some(error.to_string());
+        }
+    }
+
+    fn spawn_runtime(
+        app: &mut App,
         agent_index: usize,
         session_id: usize,
         workspace: PathBuf,
         ui_tx: mpsc::UnboundedSender<UiEvent>,
     ) -> Result<()> {
         let shell_path = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        let mut child = Command::new(&shell_path)
-            .current_dir(&workspace)
-            .env("PS1", "")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+        let (command_tx, pid) = shell::ShellRuntimeFactory::spawn(
+            &shell_path,
+            &workspace,
+            agent_index,
+            session_id,
+            ui_tx,
+        )?;
+        if let Some(session) = app.agents[agent_index]
+            .shell_tab
+            .session_by_id_mut(session_id)
+        {
+            session.mark_ready();
+        }
 
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("failed to open shell stdin"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("failed to open shell stdout"))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("failed to open shell stderr"))?;
-        let pid = child.id().unwrap_or_default();
-
-        let (command_tx, mut command_rx) = mpsc::unbounded_channel::<String>();
-        let writer_tx = ui_tx.clone();
-        tokio::spawn(async move {
-            let mut stdin = stdin;
-            while let Some(command) = command_rx.recv().await {
-                if let Err(error) = stdin.write_all(command.as_bytes()).await {
-                    let _ = writer_tx.send(UiEvent::ShellSessionExited {
-                        agent_index,
-                        session_id,
-                        message: format!("Shell stdin write failed: {error}"),
-                    });
-                    break;
-                }
-                if let Err(error) = stdin.flush().await {
-                    let _ = writer_tx.send(UiEvent::ShellSessionExited {
-                        agent_index,
-                        session_id,
-                        message: format!("Shell stdin flush failed: {error}"),
-                    });
-                    break;
-                }
-            }
-        });
-
-        let stdout_tx = ui_tx.clone();
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stdout).lines();
-            loop {
-                match lines.next_line().await {
-                    Ok(Some(line)) => {
-                        if let Some(code) = line.strip_prefix(shell::SHELL_COMMAND_SENTINEL) {
-                            let exit_code = code.parse::<i32>().unwrap_or(-1);
-                            let _ = stdout_tx.send(UiEvent::ShellSessionCommandFinished {
-                                agent_index,
-                                session_id,
-                                exit_code,
-                            });
-                        } else {
-                            let _ = stdout_tx.send(UiEvent::ShellSessionOutput {
-                                agent_index,
-                                session_id,
-                                line,
-                                stderr: false,
-                            });
-                        }
-                    }
-                    Ok(None) => break,
-                    Err(error) => {
-                        let _ = stdout_tx.send(UiEvent::ShellSessionExited {
-                            agent_index,
-                            session_id,
-                            message: format!("Shell stdout read failed: {error}"),
-                        });
-                        break;
-                    }
-                }
-            }
-        });
-
-        let stderr_tx = ui_tx.clone();
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            loop {
-                match lines.next_line().await {
-                    Ok(Some(line)) => {
-                        let _ = stderr_tx.send(UiEvent::ShellSessionOutput {
-                            agent_index,
-                            session_id,
-                            line,
-                            stderr: true,
-                        });
-                    }
-                    Ok(None) => break,
-                    Err(error) => {
-                        let _ = stderr_tx.send(UiEvent::ShellSessionExited {
-                            agent_index,
-                            session_id,
-                            message: format!("Shell stderr read failed: {error}"),
-                        });
-                        break;
-                    }
-                }
-            }
-        });
-
-        let exit_tx = ui_tx.clone();
-        tokio::spawn(async move {
-            let message = match child.wait().await {
-                Ok(status) => format!("Shell exited with status {}", status),
-                Err(error) => format!("Shell wait failed: {error}"),
-            };
-            let _ = exit_tx.send(UiEvent::ShellSessionExited {
-                agent_index,
-                session_id,
-                message,
-            });
-        });
-
-        self.shell_runtimes.insert(
+        app.shell_runtimes.insert(
             ShellSessionKey {
                 agent_index,
                 session_id,

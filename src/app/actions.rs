@@ -1,9 +1,42 @@
-use super::{chat::ChatSupport, shell, ui::*, *};
+use super::{chat::ChatSupport, components::*, shell, *};
 
 impl App {
-    pub(super) fn on_tick(&mut self) {
-        self.spinner_index = (self.spinner_index + 1) % SPINNER.len();
-        self.maybe_refresh_workspace();
+    pub(super) fn on_tick(&mut self) -> bool {
+        let mut needs_redraw = false;
+
+        if self.has_active_animation() {
+            self.spinner_index = (self.spinner_index + 1) % SPINNER.len();
+            needs_redraw = true;
+        }
+
+        WorkspaceComponent::maybe_refresh(self) || needs_redraw
+    }
+
+    pub(super) fn tick_interval(&self) -> Duration {
+        if self.has_active_animation() {
+            FAST_TICK_INTERVAL
+        } else if self.current_tab == AppTab::Workspace {
+            WORKSPACE_TICK_INTERVAL
+        } else {
+            IDLE_TICK_INTERVAL
+        }
+    }
+
+    fn has_active_animation(&self) -> bool {
+        let Some(agent) = self.active_agent() else {
+            return false;
+        };
+
+        match self.current_tab {
+            AppTab::Chat => agent.thinking || agent.shell_running,
+            AppTab::Workspace => false,
+            AppTab::Shell => agent
+                .shell_tab
+                .sessions
+                .iter()
+                .any(|session| !session.ready || session.running),
+            AppTab::GitDiff => agent.git_diff.remote_action.is_some(),
+        }
     }
 
     pub(super) fn shutdown_shell_sessions(&mut self) {
@@ -24,7 +57,10 @@ impl App {
     fn move_selection_up(&mut self) {
         match self.current_tab {
             AppTab::Chat => {
-                self.select_chat_sidebar_index(self.chat_sidebar_index.saturating_sub(1));
+                AgentsSidebarComponent::select_index(
+                    self,
+                    self.chat_sidebar_index.saturating_sub(1),
+                );
             }
             AppTab::Workspace => {
                 if let Some(agent) = self.active_agent_mut() {
@@ -53,7 +89,10 @@ impl App {
         match self.current_tab {
             AppTab::Chat => {
                 let max_index = self.agents.len();
-                self.select_chat_sidebar_index((self.chat_sidebar_index + 1).min(max_index));
+                AgentsSidebarComponent::select_index(
+                    self,
+                    (self.chat_sidebar_index + 1).min(max_index),
+                );
             }
             AppTab::Workspace => {
                 if let Some(agent) = self.active_agent_mut() {
@@ -272,7 +311,7 @@ impl App {
             }
             ScrollbarDragTarget::WorkspaceEditor => {
                 let editor = agent.workspace.editor.as_ref()?;
-                let viewport = workspace_editor_viewport(layout.body);
+                let viewport = WorkspaceEditorComponent::viewport(layout.body);
                 UiSupport::vertical_scrollbar_metrics_for_viewport(
                     viewport,
                     editor.content_height(),
@@ -286,7 +325,7 @@ impl App {
                 UiSupport::vertical_scrollbar_metrics(layout.body, content_length)
             }
             ScrollbarDragTarget::GitDiffPreview => {
-                let diff_layout = git_diff_layout(layout.body);
+                let diff_layout = GitDiffComponent::layout(layout.body);
                 let content_length = UiSupport::scrollable_preview_content_height(
                     &agent.git_diff.preview,
                     diff_layout.preview,
@@ -330,7 +369,7 @@ impl App {
             AppTab::Workspace => {
                 if let Some(agent) = self.active_agent_mut() {
                     if let Some(editor) = agent.workspace.editor.as_mut() {
-                        let viewport = workspace_editor_viewport(area);
+                        let viewport = WorkspaceEditorComponent::viewport(area);
                         editor.scroll_down(lines, viewport.height);
                         return;
                     }
@@ -396,10 +435,10 @@ impl App {
         ui_tx: &mpsc::UnboundedSender<UiEvent>,
         area: Rect,
     ) {
-        if self.handle_workspace_key(key, area) {
+        if WorkspaceComponent::handle_key(self, key, area) {
             return;
         }
-        if self.handle_git_diff_key(key, ui_tx) {
+        if GitDiffComponent::handle_key(self, key, ui_tx) {
             return;
         }
 
@@ -415,7 +454,7 @@ impl App {
                 self.should_quit = true;
             }
             KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.open_shell_tab_and_create_session(ui_tx.clone());
+                ShellComponent::open_tab_and_create_session(self, ui_tx.clone());
             }
             KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 let tab = match self.current_tab {
@@ -424,7 +463,7 @@ impl App {
                     AppTab::Shell => AppTab::Workspace,
                     AppTab::GitDiff => AppTab::Shell,
                 };
-                self.activate_tab(tab, ui_tx.clone());
+                TopNavigationComponent::activate_tab(self, tab, ui_tx.clone());
             }
             KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 let tab = match self.current_tab {
@@ -433,7 +472,7 @@ impl App {
                     AppTab::Shell => AppTab::GitDiff,
                     AppTab::GitDiff => AppTab::Chat,
                 };
-                self.activate_tab(tab, ui_tx.clone());
+                TopNavigationComponent::activate_tab(self, tab, ui_tx.clone());
             }
             KeyCode::Enter
                 if self.current_tab == AppTab::Chat
@@ -458,7 +497,7 @@ impl App {
                     self.scroll_content_down(self.compute_layout(area).body);
                 }
             }
-            KeyCode::F(5) => self.refresh_current_tab(),
+            KeyCode::F(5) => TopNavigationComponent::refresh_current_tab(self),
             KeyCode::Esc if self.add_agent_selected() => {
                 self.add_form = AddAgentForm::default();
                 if !self.agents.is_empty() {
@@ -467,7 +506,7 @@ impl App {
                 }
             }
             KeyCode::Esc if self.current_tab == AppTab::Chat => {
-                self.interrupt_active_chat_turn(codex.clone(), ui_tx.clone());
+                ChatComponent::interrupt_active_turn(self, codex.clone(), ui_tx.clone());
             }
             KeyCode::Tab if self.add_agent_selected() => {
                 self.add_form.active_field = match self.add_form.active_field {
@@ -476,13 +515,13 @@ impl App {
                 };
             }
             KeyCode::Enter if self.add_agent_selected() => {
-                self.submit_new_agent(codex.clone(), ui_tx.clone())
+                AddAgentDialogComponent::submit(self, codex.clone(), ui_tx.clone())
             }
             KeyCode::Enter if self.current_tab == AppTab::Chat => {
-                self.submit_message(codex.clone(), ui_tx.clone());
+                ChatComponent::submit_message(self, codex.clone(), ui_tx.clone());
             }
             KeyCode::Enter if self.current_tab == AppTab::Shell => {
-                self.submit_shell_session_command(ui_tx.clone());
+                ShellComponent::submit_command(self, ui_tx.clone());
             }
             KeyCode::Backspace => self.handle_backspace(),
             KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -590,7 +629,7 @@ impl App {
                 if let Some(agent) = self.find_agent_by_thread_mut(&thread_id) {
                     if let ThreadItem::AgentMessage { id, text } = item {
                         agent.streaming_item_id = Some(id.clone());
-                        agent.messages.push(ChatMessage::new(
+                        agent.push_message(ChatMessage::new(
                             MessageRole::Assistant,
                             text,
                             Some(id),
@@ -602,12 +641,7 @@ impl App {
                 if let Some(agent) = self.find_agent_by_thread_mut(&thread_id) {
                     match item {
                         ThreadItem::AgentMessage { id, text } => {
-                            MessageStore::upsert(
-                                &mut agent.messages,
-                                MessageRole::Assistant,
-                                &id,
-                                text,
-                            );
+                            MessageStore::upsert(agent, MessageRole::Assistant, &id, text);
                             agent.streaming_item_id = None;
                         }
                         ThreadItem::UserMessage => {}
@@ -627,8 +661,9 @@ impl App {
                         .find(|message| message.item_id.as_deref() == Some(item_id.as_str()))
                     {
                         message.append_text(&delta);
+                        agent.invalidate_chat_render_cache();
                     } else {
-                        agent.messages.push(ChatMessage::new(
+                        agent.push_message(ChatMessage::new(
                             MessageRole::Assistant,
                             delta,
                             Some(item_id),
@@ -690,7 +725,7 @@ impl App {
             } => {
                 if let Some(agent) = self.agents.get_mut(agent_index) {
                     agent.status = Some("Model command finished".to_string());
-                    agent.messages.push(ChatMessage::new(
+                    agent.push_message(ChatMessage::new(
                         MessageRole::System,
                         message.clone(),
                         None,
@@ -707,7 +742,7 @@ impl App {
                         let (thread_id, messages) = SessionLoader::session_messages(session);
                         agent.thread_id = Some(thread_id);
                         agent.thread_loaded = false;
-                        agent.messages = messages;
+                        agent.replace_messages(messages);
                     }
                 }
             }
@@ -721,7 +756,7 @@ impl App {
                     agent.active_turn_id = None;
                     agent.streaming_item_id = None;
                     agent.status = Some(message.clone());
-                    agent.messages.push(ChatMessage::new(
+                    agent.push_message(ChatMessage::new(
                         MessageRole::System,
                         message.clone(),
                         None,
@@ -745,9 +780,7 @@ impl App {
             } => {
                 if let Some(agent) = self.agents.get_mut(agent_index) {
                     agent.shell_running = false;
-                    agent
-                        .messages
-                        .push(ChatMessage::new(MessageRole::Shell, output, None));
+                    agent.push_message(ChatMessage::new(MessageRole::Shell, output, None));
                     agent.status = Some(if success {
                         "Shell command finished".to_string()
                     } else {
@@ -764,7 +797,7 @@ impl App {
             } => {
                 if let Some(agent) = self.agents.get_mut(agent_index) {
                     agent.status = Some(message.clone());
-                    agent.messages.push(ChatMessage::new(
+                    agent.push_message(ChatMessage::new(
                         MessageRole::System,
                         message.clone(),
                         None,
@@ -863,7 +896,7 @@ impl App {
             .split(frame[1]);
 
         if self.current_tab == AppTab::Chat && !self.add_agent_selected() {
-            let input_height = chat_input_height_for_main_area(&self.chat_input, root[1]);
+            let input_height = ChatInputComponent::height_for_main_area(&self.chat_input, root[1]);
             let main = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Min(10), Constraint::Length(input_height)])
@@ -928,8 +961,8 @@ impl App {
         ui_tx: &mpsc::UnboundedSender<UiEvent>,
     ) {
         if UiSupport::rect_contains(layout.tabs, column, row) {
-            if let Some(tab) = tab_from_click(layout.tabs, column, row) {
-                self.activate_tab(tab, ui_tx.clone());
+            if let Some(tab) = TopNavigationComponent::tab_from_click(layout.tabs, column, row) {
+                TopNavigationComponent::activate_tab(self, tab, ui_tx.clone());
             }
             return;
         }
@@ -940,7 +973,7 @@ impl App {
         }
 
         if self.current_tab == AppTab::GitDiff
-            && self.handle_git_diff_click(column, row, layout.body, ui_tx)
+            && GitDiffComponent::handle_click(self, column, row, layout.body, ui_tx)
         {
             return;
         }
@@ -950,7 +983,7 @@ impl App {
                 .active_agent()
                 .is_some_and(|agent| agent.workspace.editor.is_some())
         {
-            self.handle_workspace_editor_click(column, row, layout.body);
+            WorkspaceComponent::handle_editor_click(self, column, row, layout.body);
             return;
         }
 
@@ -1008,10 +1041,16 @@ impl App {
         ui_tx: &mpsc::UnboundedSender<UiEvent>,
     ) {
         match self.current_tab {
-            AppTab::Chat => self.handle_chat_sidebar_click(column, row, sidebar_list),
-            AppTab::Workspace => self.handle_workspace_sidebar_click(column, row, sidebar_list),
-            AppTab::Shell => self.handle_shell_sidebar_click(column, row, sidebar_list, ui_tx),
-            AppTab::GitDiff => self.handle_git_diff_sidebar_click(column, row, sidebar_list),
+            AppTab::Chat => AgentsSidebarComponent::handle_click(self, column, row, sidebar_list),
+            AppTab::Workspace => {
+                WorkspaceSidebarComponent::handle_click(self, column, row, sidebar_list)
+            }
+            AppTab::Shell => {
+                ShellSidebarComponent::handle_click(self, column, row, sidebar_list, ui_tx)
+            }
+            AppTab::GitDiff => {
+                GitDiffSidebarComponent::handle_click(self, column, row, sidebar_list)
+            }
         }
     }
 }

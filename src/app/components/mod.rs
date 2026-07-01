@@ -1,26 +1,23 @@
+pub(super) mod add_agent_dialog;
+pub(super) mod agents_sidebar;
 pub(super) mod chat;
+pub(super) mod chat_input;
 pub(super) mod git_diff;
+pub(super) mod git_diff_sidebar;
+pub(super) mod help_bar;
 pub(super) mod navigation;
 pub(super) mod shared;
 pub(super) mod shell;
+pub(super) mod shell_sidebar;
 pub(super) mod workspace;
+pub(super) mod workspace_editor;
+pub(super) mod workspace_sidebar;
 
-#[allow(unused_imports)]
 pub(super) use self::{
-    chat::{
-        chat_input_height_for_main_area, draw_add_agent_form, draw_chat, draw_chat_input,
-        wrapped_chat_input_lines,
-    },
-    git_diff::{
-        draw_git_diff, git_diff_layout, git_diff_remote_button_label, git_diff_section_from_click,
-    },
-    navigation::{
-        draw_help_line, draw_sidebar, draw_top_navigation, tab_from_click, top_navigation_tabs_rect,
-    },
-    shared::UiSupport,
-    shell::ShellView,
-    workspace::{
-        draw_workspace, draw_workspace_sidebar, workspace_editor_viewport,
-        workspace_sidebar_layout, workspace_sidebar_tab_from_click,
-    },
+    add_agent_dialog::AddAgentDialogComponent, agents_sidebar::AgentsSidebarComponent,
+    chat::ChatComponent, chat_input::ChatInputComponent, git_diff::GitDiffComponent,
+    git_diff_sidebar::GitDiffSidebarComponent, help_bar::HelpBarComponent,
+    navigation::TopNavigationComponent, shared::UiSupport, shell::ShellComponent,
+    shell_sidebar::ShellSidebarComponent, workspace::WorkspaceComponent,
+    workspace_editor::WorkspaceEditorComponent, workspace_sidebar::WorkspaceSidebarComponent,
 };
