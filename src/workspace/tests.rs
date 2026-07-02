@@ -192,11 +192,11 @@ fn builds_workspace_sidebar_tree_rows_from_files() {
             .map(|row| row.label.as_str())
             .collect::<Vec<_>>(),
         vec![
-            "├── ▾ src",
-            "│   ├── ▾ ui",
-            "│   │   └── mod.rs",
-            "│   └── app.rs",
-            "└── README.md",
+            " ├─ ▾ src",
+            " │  ├─ ▾ ui",
+            " │  │  └─ mod.rs",
+            " │  └─ app.rs",
+            " └─ README.md",
         ]
     );
     assert_eq!(file_rows, vec![Some(4), Some(3), Some(2)]);
@@ -224,7 +224,7 @@ fn hides_descendants_for_collapsed_directory_rows() {
         rows.iter()
             .map(|row| row.label.as_str())
             .collect::<Vec<_>>(),
-        vec!["└── ▸ src"]
+        vec![" └─ ▸ src"]
     );
     assert_eq!(file_rows, vec![None, None]);
 }
@@ -252,7 +252,7 @@ fn workspace_tree_starts_collapsed_by_default() {
             .iter()
             .map(|row| row.label.as_str())
             .collect::<Vec<_>>(),
-        vec!["└── ▸ src"]
+        vec![" └─ ▸ src"]
     );
 
     let _ = fs::remove_dir_all(root);

@@ -748,7 +748,7 @@ impl WorkspaceBrowserSupport {
         for (position, (child, child_node)) in children.iter().enumerate() {
             let is_last = position + 1 == children.len();
             let mut label = Self::tree_row_prefix(ancestor_has_more);
-            label.push_str(if is_last { "└── " } else { "├── " });
+            label.push_str(if is_last { " └─ " } else { " ├─ " });
             let mut branch_prefix_len = label.len();
 
             match child {
@@ -802,7 +802,7 @@ impl WorkspaceBrowserSupport {
     fn tree_row_prefix(ancestor_has_more: &[bool]) -> String {
         ancestor_has_more
             .iter()
-            .map(|has_more| if *has_more { "│   " } else { "    " })
+            .map(|has_more| if *has_more { " │ " } else { "   " })
             .collect::<Vec<_>>()
             .join("")
     }
