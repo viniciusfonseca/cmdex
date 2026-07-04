@@ -163,6 +163,105 @@ fn shell_output_parser_treats_crlf_as_single_line_break() {
 }
 
 #[test]
+fn shell_output_parser_recognizes_ready_sentinel() {
+    let mut parser = ShellOutputParser::new();
+    let records = parser.push("__CMDEX_READY__\r\n");
+
+    assert!(matches!(records.as_slice(), [ShellOutputRecord::Ready]));
+}
+
+#[cfg(unix)]
+#[test]
+fn shell_pty_session_does_not_echo_commands_into_output() {
+    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+    use std::{
+        io::{BufRead, BufReader, Write},
+        time::{Duration, Instant},
+    };
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 40,
+            cols: 120,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("open PTY");
+
+    let shell_path = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let mut command = CommandBuilder::new(&shell_path);
+    command.arg("-c");
+    command.arg(super::shell::SHELL_SESSION_LOOP);
+
+    let mut child = pair
+        .slave
+        .spawn_command(command)
+        .expect("spawn PTY shell");
+    let mut reader = BufReader::new(pair.master.try_clone_reader().expect("clone PTY reader"));
+    let mut writer = pair.master.take_writer().expect("open PTY writer");
+
+    let mut parser = ShellOutputParser::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut buffer = Vec::new();
+    let mut ready = false;
+
+    while Instant::now() < deadline && !ready {
+        buffer.clear();
+        let bytes = reader.read_until(b'\n', &mut buffer).expect("read PTY output");
+        if bytes == 0 {
+            break;
+        }
+
+        let chunk = String::from_utf8_lossy(&buffer);
+        ready = parser
+            .push(&chunk)
+            .into_iter()
+            .any(|record| matches!(record, ShellOutputRecord::Ready));
+    }
+
+    assert!(ready, "shell PTY did not report readiness");
+
+    writer.write_all(b"pwd\n").expect("write command");
+    writer.flush().expect("flush command");
+
+    let mut records = Vec::new();
+    while Instant::now() < deadline {
+        buffer.clear();
+        let bytes = reader.read_until(b'\n', &mut buffer).expect("read PTY output");
+        if bytes == 0 {
+            break;
+        }
+
+        let chunk = String::from_utf8_lossy(&buffer);
+        records.extend(parser.push(&chunk));
+
+        if records
+            .iter()
+            .any(|record| matches!(record, ShellOutputRecord::CommandFinished(_)))
+        {
+            break;
+        }
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(
+        records
+            .iter()
+            .all(|record| !matches!(record, ShellOutputRecord::Line(line) if line == "pwd")),
+        "command echo leaked into shell output"
+    );
+    assert!(
+        records
+            .iter()
+            .any(|record| matches!(record, ShellOutputRecord::CommandFinished(0))),
+        "shell command did not finish successfully"
+    );
+}
+
+#[test]
 fn shell_tab_index_sits_between_workspace_and_git_diff() {
     let mut app = App::new(PathBuf::new(), CmdexConfig::default());
 

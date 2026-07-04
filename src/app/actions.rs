@@ -824,6 +824,16 @@ impl App {
                     message
                 });
             }
+            UiEvent::ShellSessionReady {
+                agent_index,
+                session_id,
+            } => {
+                if let Some(agent) = self.agents.get_mut(agent_index) {
+                    if let Some(session) = agent.shell_tab.session_by_id_mut(session_id) {
+                        session.mark_ready();
+                    }
+                }
+            }
             UiEvent::ShellSessionOutput {
                 agent_index,
                 session_id,

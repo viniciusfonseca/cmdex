@@ -10,8 +10,9 @@ use anyhow::{Context, Result};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
 pub(super) const SHELL_COMMAND_SENTINEL: &str = "__CMDEX_DONE__:";
-const SHELL_SESSION_LOOP: &str =
-    "while IFS= read -r cmd; do eval \"$cmd\"; printf '__CMDEX_DONE__:%s\\n' \"$?\"; done";
+pub(super) const SHELL_READY_SENTINEL: &str = "__CMDEX_READY__";
+pub(super) const SHELL_SESSION_LOOP: &str =
+    "stty -echo; printf '__CMDEX_READY__\\n'; while IFS= read -r cmd; do eval \"$cmd\"; printf '__CMDEX_DONE__:%s\\n' \"$?\"; done";
 pub(super) struct ShellPresenter;
 pub(super) struct ShellRuntimeFactory;
 
@@ -209,6 +210,7 @@ pub(super) struct ShellOutputParser {
 }
 
 pub(super) enum ShellOutputRecord {
+    Ready,
     Line(String),
     CommandFinished(i32),
 }
@@ -374,6 +376,12 @@ impl ShellRuntimeFactory {
         ui_tx: &mpsc::UnboundedSender<UiEvent>,
     ) {
         match record {
+            ShellOutputRecord::Ready => {
+                let _ = ui_tx.send(UiEvent::ShellSessionReady {
+                    agent_index,
+                    session_id,
+                });
+            }
             ShellOutputRecord::Line(line) => {
                 let _ = ui_tx.send(UiEvent::ShellSessionOutput {
                     agent_index,
@@ -436,6 +444,11 @@ impl ShellOutputParser {
     }
 
     fn process_segment(&mut self, segment: &str, records: &mut Vec<ShellOutputRecord>) {
+        if segment.trim() == SHELL_READY_SENTINEL {
+            records.push(ShellOutputRecord::Ready);
+            return;
+        }
+
         if let Some(position) = segment.find(SHELL_COMMAND_SENTINEL) {
             let before = &segment[..position];
             if !before.is_empty() {

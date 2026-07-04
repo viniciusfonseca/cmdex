@@ -207,12 +207,6 @@ impl ShellComponent {
             session_id,
             ui_tx,
         )?;
-        if let Some(session) = app.agents[agent_index]
-            .shell_tab
-            .session_by_id_mut(session_id)
-        {
-            session.mark_ready();
-        }
 
         app.shell_runtimes.insert(
             ShellSessionKey {

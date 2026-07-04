@@ -103,6 +103,10 @@ enum UiEvent {
         success: bool,
         message: String,
     },
+    ShellSessionReady {
+        agent_index: usize,
+        session_id: usize,
+    },
     ShellSessionOutput {
         agent_index: usize,
         session_id: usize,
