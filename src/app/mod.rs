@@ -44,7 +44,7 @@ use crate::codex::{
 use crate::config::{AgentDefinition, CmdexConfig, ConfigStore};
 use crate::theme::ThemeRegistry;
 use crate::workspace::{
-    DiffBrowserState, DiffSection, EditorMode, FileBrowserState, GitRemoteAction,
+    DiffBrowserState, DiffSection, EditorMode, EditorPosition, FileBrowserState, GitRemoteAction,
     WorkspaceEditorState, WorkspaceSidebarTab,
 };
 use tokio::process::Command;
@@ -396,6 +396,7 @@ pub struct App {
     should_restart: bool,
     last_mouse_scroll: Option<(ScrollDirection, Instant)>,
     active_scrollbar_drag: Option<ScrollbarDragTarget>,
+    active_workspace_selection_drag: bool,
     last_workspace_refresh_at: Option<Instant>,
     shell_runtimes: HashMap<ShellSessionKey, ShellSessionRuntime>,
 }
@@ -445,6 +446,7 @@ impl App {
             should_restart: false,
             last_mouse_scroll: None,
             active_scrollbar_drag: None,
+            active_workspace_selection_drag: false,
             last_workspace_refresh_at: None,
             shell_runtimes: HashMap::new(),
         }

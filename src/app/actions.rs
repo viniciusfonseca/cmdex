@@ -64,6 +64,9 @@ impl App {
             }
             AppTab::Workspace => {
                 if let Some(agent) = self.active_agent_mut() {
+                    if agent.workspace.editor_focused() {
+                        return;
+                    }
                     if agent.workspace.sidebar_tab == WorkspaceSidebarTab::Search {
                         agent.workspace.search_move_up();
                     } else {
@@ -96,6 +99,9 @@ impl App {
             }
             AppTab::Workspace => {
                 if let Some(agent) = self.active_agent_mut() {
+                    if agent.workspace.editor_focused() {
+                        return;
+                    }
                     if agent.workspace.sidebar_tab == WorkspaceSidebarTab::Search {
                         agent.workspace.search_move_down();
                     } else {
@@ -160,6 +166,7 @@ impl App {
 
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                self.active_workspace_selection_drag = false;
                 if self.handle_scrollbar_press(mouse.column, mouse.row, layout) {
                     return;
                 }
@@ -169,9 +176,32 @@ impl App {
                 if self.handle_scrollbar_drag(mouse.row, layout) {
                     return;
                 }
+                if self.active_workspace_selection_drag
+                    && self.current_tab == AppTab::Workspace
+                    && self
+                        .active_agent()
+                        .is_some_and(|agent| agent.workspace.editor.is_some())
+                {
+                    WorkspaceComponent::handle_editor_drag(
+                        self,
+                        mouse.column,
+                        mouse.row,
+                        layout.body,
+                    );
+                }
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 self.active_scrollbar_drag = None;
+                if self.active_workspace_selection_drag {
+                    if let Some(agent) = self.active_agent_mut() {
+                        if let Some(editor) = agent.workspace.editor.as_mut() {
+                            if editor.mode == EditorMode::Visual && !editor.has_selection() {
+                                editor.exit_visual_mode();
+                            }
+                        }
+                    }
+                }
+                self.active_workspace_selection_drag = false;
             }
             MouseEventKind::ScrollUp if self.should_handle_mouse_scroll(ScrollDirection::Up) => {
                 self.handle_scroll(mouse.column, mouse.row, layout, true)
@@ -540,7 +570,9 @@ impl App {
             }
         } else if self.current_tab == AppTab::Workspace {
             if let Some(agent) = self.active_agent_mut() {
-                if agent.workspace.sidebar_tab == WorkspaceSidebarTab::Search {
+                if agent.workspace.sidebar_focused()
+                    && agent.workspace.sidebar_tab == WorkspaceSidebarTab::Search
+                {
                     agent.workspace.push_search_char(character);
                     return;
                 }
@@ -548,7 +580,7 @@ impl App {
                     match editor.mode {
                         EditorMode::Insert => editor.insert_char(character),
                         EditorMode::Command => editor.command.push(character),
-                        EditorMode::Normal => {}
+                        EditorMode::Normal | EditorMode::Visual => {}
                     }
                 }
             }
@@ -581,7 +613,9 @@ impl App {
             }
         } else if self.current_tab == AppTab::Workspace {
             if let Some(agent) = self.active_agent_mut() {
-                if agent.workspace.sidebar_tab == WorkspaceSidebarTab::Search {
+                if agent.workspace.sidebar_focused()
+                    && agent.workspace.sidebar_tab == WorkspaceSidebarTab::Search
+                {
                     agent.workspace.pop_search_char();
                     return;
                 }
@@ -591,7 +625,7 @@ impl App {
                         EditorMode::Command => {
                             editor.command.pop();
                         }
-                        EditorMode::Normal => {}
+                        EditorMode::Normal | EditorMode::Visual => {}
                     }
                 }
             }
@@ -993,7 +1027,8 @@ impl App {
                 .active_agent()
                 .is_some_and(|agent| agent.workspace.editor.is_some())
         {
-            WorkspaceComponent::handle_editor_click(self, column, row, layout.body);
+            self.active_workspace_selection_drag =
+                WorkspaceComponent::handle_editor_click(self, column, row, layout.body);
             return;
         }
 

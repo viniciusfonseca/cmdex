@@ -91,6 +91,20 @@ impl UiSupport {
         Self::rounded_block().style(Self::editor_style())
     }
 
+    pub(in crate::app) fn focus_block(block: Block<'static>, focused: bool) -> Block<'static> {
+        if focused {
+            block
+                .border_style(Style::default().fg(Self::theme().accent))
+                .title_style(
+                    Style::default()
+                        .fg(Self::theme().accent)
+                        .add_modifier(Modifier::BOLD),
+                )
+        } else {
+            block
+        }
+    }
+
     pub(in crate::app) fn action_style(color: ratatui::style::Color) -> Style {
         Style::default().bg(Self::theme().panel_bg).fg(color)
     }

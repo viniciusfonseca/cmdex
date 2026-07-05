@@ -2,7 +2,7 @@ use super::{
     chat::{ChatCommand, ChatSupport, ModelCommand},
     components::{
         ChatInputComponent, GitDiffComponent, ShellSidebarComponent, TopNavigationComponent,
-        UiSupport,
+        UiSupport, WorkspaceComponent, WorkspaceEditorComponent,
     },
     shell::{ShellOutputParser, ShellOutputRecord, ShellPresenter, ShellTabState},
     *,
@@ -194,10 +194,7 @@ fn shell_pty_session_does_not_echo_commands_into_output() {
     command.arg("-c");
     command.arg(super::shell::SHELL_SESSION_LOOP);
 
-    let mut child = pair
-        .slave
-        .spawn_command(command)
-        .expect("spawn PTY shell");
+    let mut child = pair.slave.spawn_command(command).expect("spawn PTY shell");
     let mut reader = BufReader::new(pair.master.try_clone_reader().expect("clone PTY reader"));
     let mut writer = pair.master.take_writer().expect("open PTY writer");
 
@@ -208,7 +205,9 @@ fn shell_pty_session_does_not_echo_commands_into_output() {
 
     while Instant::now() < deadline && !ready {
         buffer.clear();
-        let bytes = reader.read_until(b'\n', &mut buffer).expect("read PTY output");
+        let bytes = reader
+            .read_until(b'\n', &mut buffer)
+            .expect("read PTY output");
         if bytes == 0 {
             break;
         }
@@ -228,7 +227,9 @@ fn shell_pty_session_does_not_echo_commands_into_output() {
     let mut records = Vec::new();
     while Instant::now() < deadline {
         buffer.clear();
-        let bytes = reader.read_until(b'\n', &mut buffer).expect("read PTY output");
+        let bytes = reader
+            .read_until(b'\n', &mut buffer)
+            .expect("read PTY output");
         if bytes == 0 {
             break;
         }
@@ -874,6 +875,347 @@ fn workspace_tree_refreshes_on_tick_after_filesystem_changes() {
             .iter()
             .any(|label| label.contains("beta.txt"))
     );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn workspace_arrow_keys_move_editor_cursor_when_editor_is_focused() {
+    let root = std::env::temp_dir().join(format!(
+        "cmdex-app-workspace-focus-editor-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let alpha = root.join("alpha.txt");
+    let zeta = root.join("zeta.txt");
+    fs::write(&alpha, "alpha\nbeta\n").unwrap();
+    fs::write(&zeta, "zeta\n").unwrap();
+
+    let config = CmdexConfig {
+        agents: vec![AgentDefinition {
+            name: "Test".to_string(),
+            workspace: root.clone(),
+        }],
+    };
+    let mut app = App::new(PathBuf::new(), config);
+    app.current_tab = AppTab::Workspace;
+    app.current_agent = Some(0);
+    app.chat_sidebar_index = 1;
+    TopNavigationComponent::refresh_current_tab(&mut app);
+
+    {
+        let workspace = &mut app.active_agent_mut().unwrap().workspace;
+        workspace.select(0);
+        workspace.open_editor().unwrap();
+        assert!(workspace.editor_focused());
+    }
+
+    let handled = WorkspaceComponent::handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        Rect::new(0, 0, 120, 40),
+    );
+
+    assert!(handled);
+    let workspace = &app.active_agent().unwrap().workspace;
+    assert_eq!(workspace.selected, 0);
+    assert!(workspace.editor_focused());
+    assert_eq!(workspace.editor.as_ref().unwrap().path, alpha);
+    assert_eq!(workspace.editor.as_ref().unwrap().cursor_row, 1);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn workspace_arrow_keys_move_sidebar_selection_when_sidebar_is_focused() {
+    let root = std::env::temp_dir().join(format!(
+        "cmdex-app-workspace-focus-sidebar-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let alpha = root.join("alpha.txt");
+    let zeta = root.join("zeta.txt");
+    fs::write(&alpha, "alpha\nbeta\n").unwrap();
+    fs::write(&zeta, "zeta\n").unwrap();
+
+    let config = CmdexConfig {
+        agents: vec![AgentDefinition {
+            name: "Test".to_string(),
+            workspace: root.clone(),
+        }],
+    };
+    let mut app = App::new(PathBuf::new(), config);
+    app.current_tab = AppTab::Workspace;
+    app.current_agent = Some(0);
+    app.chat_sidebar_index = 1;
+    TopNavigationComponent::refresh_current_tab(&mut app);
+
+    {
+        let workspace = &mut app.active_agent_mut().unwrap().workspace;
+        workspace.select(0);
+        workspace.open_editor().unwrap();
+        assert!(workspace.editor_focused());
+    }
+
+    assert!(WorkspaceComponent::handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+        Rect::new(0, 0, 120, 40),
+    ));
+    assert!(app.active_agent().unwrap().workspace.sidebar_focused());
+
+    let handled = WorkspaceComponent::handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        Rect::new(0, 0, 120, 40),
+    );
+
+    assert!(handled);
+    let workspace = &app.active_agent().unwrap().workspace;
+    assert_eq!(workspace.selected, 1);
+    assert!(workspace.sidebar_focused());
+    assert_eq!(workspace.editor.as_ref().unwrap().path, zeta);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn workspace_search_only_captures_text_when_sidebar_is_focused() {
+    let root = std::env::temp_dir().join(format!(
+        "cmdex-app-workspace-search-focus-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let alpha = root.join("alpha.txt");
+    fs::write(&alpha, "needle\n").unwrap();
+
+    let config = CmdexConfig {
+        agents: vec![AgentDefinition {
+            name: "Test".to_string(),
+            workspace: root.clone(),
+        }],
+    };
+    let mut app = App::new(PathBuf::new(), config);
+    app.current_tab = AppTab::Workspace;
+    app.current_agent = Some(0);
+    app.chat_sidebar_index = 1;
+    TopNavigationComponent::refresh_current_tab(&mut app);
+
+    {
+        let workspace = &mut app.active_agent_mut().unwrap().workspace;
+        workspace.set_sidebar_tab(WorkspaceSidebarTab::Search);
+        for character in "needle".chars() {
+            workspace.push_search_char(character);
+        }
+        assert!(workspace.open_selected_search_result().unwrap());
+        workspace.editor.as_mut().unwrap().enter_insert_mode();
+        assert!(workspace.editor_focused());
+    }
+
+    app.handle_text_input('!');
+
+    let workspace = &app.active_agent().unwrap().workspace;
+    assert_eq!(workspace.search_query, "needle");
+    assert_eq!(workspace.editor.as_ref().unwrap().lines[0], "!needle");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn workspace_mouse_drag_selects_text_in_editor() {
+    let root = std::env::temp_dir().join(format!(
+        "cmdex-app-workspace-mouse-select-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let alpha = root.join("alpha.txt");
+    fs::write(&alpha, "hello\n").unwrap();
+
+    let config = CmdexConfig {
+        agents: vec![AgentDefinition {
+            name: "Test".to_string(),
+            workspace: root.clone(),
+        }],
+    };
+    let mut app = App::new(PathBuf::new(), config);
+    app.current_tab = AppTab::Workspace;
+    app.current_agent = Some(0);
+    app.chat_sidebar_index = 1;
+    TopNavigationComponent::refresh_current_tab(&mut app);
+
+    {
+        let workspace = &mut app.active_agent_mut().unwrap().workspace;
+        workspace.select(0);
+        workspace.open_editor().unwrap();
+    }
+
+    let area = Rect::new(0, 0, 120, 40);
+    let layout = app.compute_layout(area);
+    let viewport = WorkspaceEditorComponent::viewport(layout.body);
+    let gutter_width = app
+        .active_agent()
+        .unwrap()
+        .workspace
+        .editor
+        .as_ref()
+        .unwrap()
+        .gutter_width() as u16;
+    let origin_x = viewport.x + gutter_width;
+    let row = viewport.y;
+    let (ui_tx, _ui_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    app.handle_mouse(
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: origin_x,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+        area,
+        &ui_tx,
+    );
+    app.handle_mouse(
+        MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: origin_x + 2,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+        area,
+        &ui_tx,
+    );
+    app.handle_mouse(
+        MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: origin_x + 2,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+        area,
+        &ui_tx,
+    );
+
+    let editor = app
+        .active_agent()
+        .unwrap()
+        .workspace
+        .editor
+        .as_ref()
+        .unwrap();
+    assert_eq!(editor.mode, EditorMode::Visual);
+    assert!(editor.has_selection());
+
+    let selected = editor.rendered_lines(1)[0]
+        .spans
+        .iter()
+        .filter(|span| span.style.bg == Some(ThemeRegistry::app().selection_bg))
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    assert_eq!(selected, "he");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn workspace_mouse_click_clears_existing_selection() {
+    let root = std::env::temp_dir().join(format!(
+        "cmdex-app-workspace-mouse-clear-select-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let alpha = root.join("alpha.txt");
+    fs::write(&alpha, "hello\n").unwrap();
+
+    let config = CmdexConfig {
+        agents: vec![AgentDefinition {
+            name: "Test".to_string(),
+            workspace: root.clone(),
+        }],
+    };
+    let mut app = App::new(PathBuf::new(), config);
+    app.current_tab = AppTab::Workspace;
+    app.current_agent = Some(0);
+    app.chat_sidebar_index = 1;
+    TopNavigationComponent::refresh_current_tab(&mut app);
+
+    {
+        let workspace = &mut app.active_agent_mut().unwrap().workspace;
+        workspace.select(0);
+        workspace.open_editor().unwrap();
+        let editor = workspace.editor.as_mut().unwrap();
+        editor.enter_visual_mode();
+        editor.extend_right();
+        editor.extend_right();
+        assert!(editor.has_selection());
+    }
+
+    let area = Rect::new(0, 0, 120, 40);
+    let layout = app.compute_layout(area);
+    let viewport = WorkspaceEditorComponent::viewport(layout.body);
+    let gutter_width = app
+        .active_agent()
+        .unwrap()
+        .workspace
+        .editor
+        .as_ref()
+        .unwrap()
+        .gutter_width() as u16;
+    let click_x = viewport.x + gutter_width + 3;
+    let row = viewport.y;
+    let (ui_tx, _ui_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    app.handle_mouse(
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: click_x,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+        area,
+        &ui_tx,
+    );
+    app.handle_mouse(
+        MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: click_x,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+        area,
+        &ui_tx,
+    );
+
+    let editor = app
+        .active_agent()
+        .unwrap()
+        .workspace
+        .editor
+        .as_ref()
+        .unwrap();
+    assert_eq!(editor.mode, EditorMode::Normal);
+    assert!(!editor.has_selection());
+    assert_eq!(editor.cursor_row, 0);
+    assert_eq!(editor.cursor_col, 3);
 
     let _ = fs::remove_dir_all(root);
 }

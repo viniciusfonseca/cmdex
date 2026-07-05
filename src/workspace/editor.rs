@@ -31,6 +31,7 @@ impl WorkspaceEditorState {
             dirty: false,
             status: None,
             preferred_col: 0,
+            selection_anchor: None,
             render_cache: EditorRenderCache::default(),
         };
         editor.rebuild_render_cache();
@@ -43,12 +44,21 @@ impl WorkspaceEditorState {
             .saturating_add(usize::from(viewport_height.max(1)))
             .min(self.render_cache.lines.len());
         let mut lines = self.render_cache.lines[start..end].to_vec();
-        if let Some(line) = self
-            .cursor_row
-            .checked_sub(start)
-            .and_then(|visible_row| lines.get_mut(visible_row))
-        {
-            WorkspaceRenderer::highlight_editor_line(line);
+        let gutter_width = self.gutter_width();
+
+        for (visible_row, line) in lines.iter_mut().enumerate() {
+            let row = start + visible_row;
+            if row == self.cursor_row {
+                WorkspaceRenderer::highlight_editor_line(line);
+            }
+            if let Some((selection_start, selection_end)) = self.selection_range_for_row(row) {
+                WorkspaceRenderer::highlight_editor_selection(
+                    line,
+                    gutter_width,
+                    selection_start,
+                    selection_end,
+                );
+            }
         }
         lines
     }
@@ -169,7 +179,63 @@ impl WorkspaceEditorState {
         self.status = None;
     }
 
+    pub fn enter_visual_mode(&mut self) {
+        self.mode = EditorMode::Visual;
+        self.command.clear();
+        if self.selection_anchor.is_none() {
+            self.selection_anchor = Some(self.cursor_position());
+        }
+        self.status = None;
+    }
+
+    pub fn exit_visual_mode(&mut self) {
+        self.mode = EditorMode::Normal;
+        self.clear_selection();
+        self.status = None;
+    }
+
+    pub fn extend_left(&mut self) {
+        self.enter_visual_mode();
+        self.move_left();
+    }
+
+    pub fn extend_right(&mut self) {
+        self.enter_visual_mode();
+        self.move_right();
+    }
+
+    pub fn extend_up(&mut self) {
+        self.enter_visual_mode();
+        self.move_up();
+    }
+
+    pub fn extend_down(&mut self) {
+        self.enter_visual_mode();
+        self.move_down();
+    }
+
+    pub fn extend_page_up(&mut self, lines: usize) {
+        self.enter_visual_mode();
+        self.move_page_up(lines);
+    }
+
+    pub fn extend_page_down(&mut self, lines: usize) {
+        self.enter_visual_mode();
+        self.move_page_down(lines);
+    }
+
+    pub fn extend_line_start(&mut self) {
+        self.enter_visual_mode();
+        self.move_line_start();
+    }
+
+    pub fn extend_line_end(&mut self) {
+        self.enter_visual_mode();
+        self.move_line_end();
+    }
+
     pub fn enter_insert_mode(&mut self) {
+        self.clear_selection();
         self.mode = EditorMode::Insert;
         self.command.clear();
         self.status = None;
@@ -197,6 +263,10 @@ impl WorkspaceEditorState {
     }
 
     pub fn delete_char(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
+
         let line_len = self.line_len(self.cursor_row);
         if self.cursor_col < line_len {
             let byte_index =
@@ -216,6 +286,7 @@ impl WorkspaceEditorState {
     }
 
     pub fn insert_char(&mut self, character: char) {
+        let _ = self.delete_selection();
         let byte_index = Self::byte_index_for_char(&self.lines[self.cursor_row], self.cursor_col);
         self.lines[self.cursor_row].insert(byte_index, character);
         self.cursor_col += 1;
@@ -226,6 +297,7 @@ impl WorkspaceEditorState {
     }
 
     pub fn insert_newline(&mut self) {
+        let _ = self.delete_selection();
         let byte_index = Self::byte_index_for_char(&self.lines[self.cursor_row], self.cursor_col);
         let tail = self.lines[self.cursor_row].split_off(byte_index);
         self.cursor_row += 1;
@@ -238,6 +310,10 @@ impl WorkspaceEditorState {
     }
 
     pub fn backspace(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
+
         if self.cursor_col > 0 {
             let byte_end = Self::byte_index_for_char(&self.lines[self.cursor_row], self.cursor_col);
             let byte_start =
@@ -268,6 +344,18 @@ impl WorkspaceEditorState {
     }
 
     pub fn set_cursor(&mut self, row: usize, col: usize) {
+        self.clear_selection();
+        if self.mode == EditorMode::Visual {
+            self.mode = EditorMode::Normal;
+        }
+        self.cursor_row = row.min(self.lines.len().saturating_sub(1));
+        self.cursor_col = col.min(self.line_len(self.cursor_row));
+        self.preferred_col = self.cursor_col;
+        self.status = None;
+    }
+
+    pub fn select_to(&mut self, row: usize, col: usize) {
+        self.enter_visual_mode();
         self.cursor_row = row.min(self.lines.len().saturating_sub(1));
         self.cursor_col = col.min(self.line_len(self.cursor_row));
         self.preferred_col = self.cursor_col;
@@ -275,6 +363,7 @@ impl WorkspaceEditorState {
     }
 
     pub fn start_command(&mut self) {
+        self.clear_selection();
         self.mode = EditorMode::Command;
         self.command.clear();
     }
@@ -336,11 +425,86 @@ impl WorkspaceEditorState {
         }
     }
 
+    pub fn has_selection(&self) -> bool {
+        self.selection_bounds().is_some()
+    }
+
+    pub fn delete_selection(&mut self) -> bool {
+        let Some((start, end)) = self.selection_bounds() else {
+            return false;
+        };
+
+        if start.row == end.row {
+            let byte_start = Self::byte_index_for_char(&self.lines[start.row], start.col);
+            let byte_end = Self::byte_index_for_char(&self.lines[end.row], end.col);
+            self.lines[start.row].drain(byte_start..byte_end);
+        } else {
+            let start_byte = Self::byte_index_for_char(&self.lines[start.row], start.col);
+            let end_byte = Self::byte_index_for_char(&self.lines[end.row], end.col);
+            let prefix = self.lines[start.row][..start_byte].to_string();
+            let suffix = self.lines[end.row][end_byte..].to_string();
+            self.lines[start.row] = prefix + &suffix;
+            self.lines.drain(start.row + 1..=end.row);
+        }
+
+        if self.lines.is_empty() {
+            self.lines.push(String::new());
+        }
+
+        self.cursor_row = start.row.min(self.lines.len().saturating_sub(1));
+        self.cursor_col = start.col.min(self.line_len(self.cursor_row));
+        self.preferred_col = self.cursor_col;
+        self.clear_selection();
+        self.dirty = true;
+        self.status = None;
+        self.rebuild_render_cache();
+        true
+    }
+
     fn line_len(&self, row: usize) -> usize {
         self.lines
             .get(row)
             .map(|line| line.chars().count())
             .unwrap_or(0)
+    }
+
+    fn cursor_position(&self) -> EditorPosition {
+        EditorPosition {
+            row: self.cursor_row,
+            col: self.cursor_col,
+        }
+    }
+
+    fn clear_selection(&mut self) {
+        self.selection_anchor = None;
+    }
+
+    fn selection_bounds(&self) -> Option<(EditorPosition, EditorPosition)> {
+        let anchor = self.selection_anchor?;
+        let cursor = self.cursor_position();
+        if anchor == cursor {
+            return None;
+        }
+
+        Some(if anchor < cursor {
+            (anchor, cursor)
+        } else {
+            (cursor, anchor)
+        })
+    }
+
+    fn selection_range_for_row(&self, row: usize) -> Option<(usize, usize)> {
+        let (start, end) = self.selection_bounds()?;
+        if row < start.row || row > end.row {
+            return None;
+        }
+
+        let line_len = self.line_len(row);
+        let selection_start = if row == start.row { start.col } else { 0 };
+        let selection_end = if row == end.row { end.col } else { line_len };
+
+        (selection_start < selection_end)
+            .then_some((selection_start.min(line_len), selection_end.min(line_len)))
     }
 
     fn clamp_cursor(&mut self) {

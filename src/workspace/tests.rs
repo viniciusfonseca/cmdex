@@ -12,6 +12,7 @@ use super::{
     render::WorkspaceRenderer,
     *,
 };
+use crate::theme::ThemeRegistry;
 
 #[test]
 fn skips_git_subtree_entries() {
@@ -100,6 +101,53 @@ fn editor_refuses_quit_when_dirty_without_bang() {
             .as_deref()
             .is_some_and(|status| status.contains("Unsaved"))
     );
+
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn editor_visual_selection_highlights_selected_text() {
+    let path = std::env::temp_dir().join(format!("cmdex-editor-visual-{}.txt", std::process::id()));
+    fs::write(&path, "hello").unwrap();
+
+    let mut editor = WorkspaceEditorState::open(&path).unwrap();
+    editor.enter_visual_mode();
+    editor.extend_right();
+    editor.extend_right();
+
+    let lines = editor.rendered_lines(1);
+    let selected = lines[0]
+        .spans
+        .iter()
+        .filter(|span| span.style.bg == Some(ThemeRegistry::app().selection_bg))
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+
+    assert_eq!(line_text(&lines[0]), "1 | hello");
+    assert_eq!(selected, "he");
+
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn editor_delete_selection_removes_selected_range_across_lines() {
+    let path = std::env::temp_dir().join(format!(
+        "cmdex-editor-delete-selection-{}.txt",
+        std::process::id()
+    ));
+    fs::write(&path, "alpha\nbeta\ngamma").unwrap();
+
+    let mut editor = WorkspaceEditorState::open(&path).unwrap();
+    editor.move_right();
+    editor.move_right();
+    editor.enter_visual_mode();
+    editor.extend_down();
+
+    assert!(editor.delete_selection());
+    assert_eq!(editor.lines, vec!["alta".to_string(), "gamma".to_string()]);
+    assert_eq!(editor.cursor_row, 0);
+    assert_eq!(editor.cursor_col, 2);
+    assert_eq!(editor.mode, EditorMode::Visual);
 
     let _ = fs::remove_file(path);
 }

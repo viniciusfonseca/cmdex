@@ -11,8 +11,7 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
 pub(super) const SHELL_COMMAND_SENTINEL: &str = "__CMDEX_DONE__:";
 pub(super) const SHELL_READY_SENTINEL: &str = "__CMDEX_READY__";
-pub(super) const SHELL_SESSION_LOOP: &str =
-    "stty -echo; printf '__CMDEX_READY__\\n'; while IFS= read -r cmd; do eval \"$cmd\"; printf '__CMDEX_DONE__:%s\\n' \"$?\"; done";
+pub(super) const SHELL_SESSION_LOOP: &str = "stty -echo; printf '__CMDEX_READY__\\n'; while IFS= read -r cmd; do eval \"$cmd\"; printf '__CMDEX_DONE__:%s\\n' \"$?\"; done";
 pub(super) struct ShellPresenter;
 pub(super) struct ShellRuntimeFactory;
 

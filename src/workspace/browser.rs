@@ -69,12 +69,14 @@ impl FileBrowserState {
         self.editor = Some(WorkspaceEditorState::open(
             &self.entries[self.selected].path,
         )?);
+        self.focus_editor();
         self.error = None;
         Ok(())
     }
 
     pub fn close_editor(&mut self) -> Result<()> {
         self.editor = None;
+        self.focus_sidebar();
         self.content_scroll = 0;
         self.update_preview()
     }
@@ -99,6 +101,36 @@ impl FileBrowserState {
 
     pub fn set_sidebar_tab(&mut self, tab: WorkspaceSidebarTab) {
         self.sidebar_tab = tab;
+    }
+
+    pub fn focus_sidebar(&mut self) {
+        self.focus = WorkspaceFocus::Sidebar;
+    }
+
+    pub fn focus_editor(&mut self) {
+        if self.editor.is_some() {
+            self.focus = WorkspaceFocus::Editor;
+        }
+    }
+
+    pub fn toggle_focus(&mut self) {
+        if self.editor.is_none() {
+            self.focus = WorkspaceFocus::Sidebar;
+            return;
+        }
+
+        self.focus = match self.focus {
+            WorkspaceFocus::Sidebar => WorkspaceFocus::Editor,
+            WorkspaceFocus::Editor => WorkspaceFocus::Sidebar,
+        };
+    }
+
+    pub fn sidebar_focused(&self) -> bool {
+        self.editor.is_none() || self.focus == WorkspaceFocus::Sidebar
+    }
+
+    pub fn editor_focused(&self) -> bool {
+        self.editor.is_some() && self.focus == WorkspaceFocus::Editor
     }
 
     pub fn search_rows_labels(&self) -> Vec<String> {
@@ -170,6 +202,7 @@ impl FileBrowserState {
             editor.vertical_scroll = row as u16;
             editor.horizontal_scroll = 0;
         }
+        self.focus_editor();
 
         Ok(true)
     }
@@ -501,6 +534,7 @@ impl FileBrowserState {
     fn sync_editor_to_selection(&mut self, auto_open: bool) -> Result<()> {
         if self.entries.is_empty() {
             self.editor = None;
+            self.focus_sidebar();
             return Ok(());
         }
 
@@ -548,6 +582,7 @@ impl FileBrowserState {
         self.tree_rows.clear();
         self.selected = 0;
         self.tree_cursor = 0;
+        self.focus = WorkspaceFocus::Sidebar;
         self.sidebar_tab = WorkspaceSidebarTab::Files;
         self.search_query.clear();
         self.collapsed_dirs.clear();

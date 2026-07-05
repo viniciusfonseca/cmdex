@@ -170,6 +170,50 @@ impl WorkspaceRenderer {
         }
     }
 
+    pub(super) fn highlight_editor_selection(
+        line: &mut Line<'static>,
+        gutter_width: usize,
+        selection_start: usize,
+        selection_end: usize,
+    ) {
+        if selection_start >= selection_end {
+            return;
+        }
+
+        let selection_start = gutter_width.saturating_add(selection_start);
+        let selection_end = gutter_width.saturating_add(selection_end);
+        let mut highlighted = Vec::with_capacity(line.spans.len() + 2);
+        let mut offset = 0usize;
+
+        for span in &line.spans {
+            let text = span.content.as_ref();
+            let span_width = text.chars().count();
+            let span_start = offset;
+            let span_end = offset.saturating_add(span_width);
+
+            if span_width == 0 || selection_end <= span_start || selection_start >= span_end {
+                highlighted.push(span.clone());
+                offset = span_end;
+                continue;
+            }
+
+            let local_start = selection_start.saturating_sub(span_start).min(span_width);
+            let local_end = selection_end.min(span_end).saturating_sub(span_start);
+            Self::push_span_slice(&mut highlighted, span, 0, local_start, span.style);
+            Self::push_span_slice(
+                &mut highlighted,
+                span,
+                local_start,
+                local_end,
+                span.style.bg(ThemeRegistry::app().selection_bg),
+            );
+            Self::push_span_slice(&mut highlighted, span, local_end, span_width, span.style);
+            offset = span_end;
+        }
+
+        line.spans = highlighted;
+    }
+
     pub(super) fn split_preserving_lines(source: &str) -> Vec<String> {
         if source.is_empty() {
             return vec![String::new()];
@@ -216,5 +260,29 @@ impl WorkspaceRenderer {
                 style.background.b,
             ))
             .add_modifier(modifiers)
+    }
+
+    fn push_span_slice(
+        spans: &mut Vec<Span<'static>>,
+        original: &Span<'static>,
+        start: usize,
+        end: usize,
+        style: Style,
+    ) {
+        if start >= end {
+            return;
+        }
+
+        let content = original
+            .content
+            .chars()
+            .skip(start)
+            .take(end.saturating_sub(start))
+            .collect::<String>();
+        if content.is_empty() {
+            return;
+        }
+
+        spans.push(Span::styled(content, style));
     }
 }

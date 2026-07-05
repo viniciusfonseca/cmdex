@@ -4,19 +4,28 @@ use super::UiSupport;
 pub(in crate::app) struct WorkspaceEditorComponent;
 
 impl WorkspaceEditorComponent {
-    pub(in crate::app) fn draw(frame: &mut Frame, editor: &WorkspaceEditorState, area: Rect) {
+    pub(in crate::app) fn draw(
+        frame: &mut Frame,
+        editor: &WorkspaceEditorState,
+        area: Rect,
+        focused: bool,
+    ) {
         let mode = match editor.mode {
             EditorMode::Normal => "NORMAL",
+            EditorMode::Visual => "VISUAL",
             EditorMode::Insert => "INSERT",
             EditorMode::Command => "COMMAND",
         };
         let dirty = if editor.dirty { " [+]" } else { "" };
-        let block = UiSupport::editor_block().title(format!(
-            "{}{} [{}]",
-            editor.path.display(),
-            dirty,
-            mode
-        ));
+        let block = UiSupport::focus_block(
+            UiSupport::editor_block().title(format!(
+                "{}{} [{}]",
+                editor.path.display(),
+                dirty,
+                mode
+            )),
+            focused,
+        );
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -35,12 +44,16 @@ impl WorkspaceEditorComponent {
         );
 
         if let Some(status_area) = status_area {
-            let status_widget = Paragraph::new(Self::status(editor)).style(
+            let status_widget = Paragraph::new(Self::status(editor, focused)).style(
                 Style::default()
                     .bg(UiSupport::theme().app_bg)
                     .fg(UiSupport::theme().muted),
             );
             frame.render_widget(status_widget, status_area);
+        }
+
+        if !focused {
+            return;
         }
 
         match editor.mode {
@@ -53,7 +66,7 @@ impl WorkspaceEditorComponent {
                     frame.set_cursor_position((x, status_area.y));
                 }
             }
-            EditorMode::Normal | EditorMode::Insert => {
+            EditorMode::Normal | EditorMode::Visual | EditorMode::Insert => {
                 if code_area.width == 0 || code_area.height == 0 {
                     return;
                 }
@@ -100,14 +113,25 @@ impl WorkspaceEditorComponent {
         (panes[0], Some(panes[1]))
     }
 
-    fn status(editor: &WorkspaceEditorState) -> String {
+    fn status(editor: &WorkspaceEditorState, focused: bool) -> String {
+        if !focused {
+            return editor
+                .status
+                .clone()
+                .unwrap_or_else(|| "SIDEBAR FOCUSED  Tab editor".to_string());
+        }
+
         match editor.mode {
             EditorMode::Command => format!(":{}", editor.command),
+            EditorMode::Visual => {
+                "-- VISUAL --  Esc normal  Tab sidebar  h/j/k/l move  x delete selection"
+                    .to_string()
+            }
             EditorMode::Insert => {
                 "-- INSERT --  Esc normal  Enter newline  Backspace delete".to_string()
             }
             EditorMode::Normal => editor.status.clone().unwrap_or_else(|| {
-                "NORMAL  ↑/↓ file  h/j/k/l move  i/a/o edit  x delete  :w save  :q preview"
+                "NORMAL  Tab sidebar  arrows move  v select  i/a/o edit  x delete  :w save  :q preview"
                     .to_string()
             }),
         }

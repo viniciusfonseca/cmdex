@@ -14,7 +14,7 @@ impl WorkspaceComponent {
         };
 
         if let Some(editor) = agent.workspace.editor.as_ref() {
-            WorkspaceEditorComponent::draw(frame, editor, area);
+            WorkspaceEditorComponent::draw(frame, editor, area, agent.workspace.editor_focused());
             return;
         }
 
@@ -86,16 +86,25 @@ impl WorkspaceComponent {
         let mut saved = false;
         let mut close = false;
         let mut handled = false;
-        let mut selection_delta = 0i8;
 
         {
             let agent = &mut app.agents[agent_index];
             let workspace = &mut agent.workspace;
+            let editor_mode = workspace.editor.as_ref().map(|editor| editor.mode);
 
-            if workspace.sidebar_tab == WorkspaceSidebarTab::Search {
+            if workspace.editor.is_some()
+                && key.code == KeyCode::Tab
+                && matches!(editor_mode, Some(EditorMode::Normal | EditorMode::Visual))
+            {
+                workspace.toggle_focus();
+                return true;
+            }
+
+            if workspace.sidebar_focused() && workspace.sidebar_tab == WorkspaceSidebarTab::Search {
                 match key.code {
                     KeyCode::Esc => {
                         workspace.set_sidebar_tab(WorkspaceSidebarTab::Files);
+                        workspace.focus_sidebar();
                         return true;
                     }
                     KeyCode::Up => {
@@ -144,6 +153,43 @@ impl WorkspaceComponent {
                 return false;
             }
 
+            if workspace.sidebar_focused() {
+                match key.code {
+                    KeyCode::Up => {
+                        workspace.move_up();
+                        handled = true;
+                    }
+                    KeyCode::Down => {
+                        workspace.move_down();
+                        handled = true;
+                    }
+                    KeyCode::Enter => {
+                        if workspace.toggle_current_directory() {
+                            handled = true;
+                        } else {
+                            match workspace.open_editor() {
+                                Ok(()) => {
+                                    handled = true;
+                                }
+                                Err(error) => {
+                                    workspace.error = Some(error.to_string());
+                                    handled = true;
+                                }
+                            }
+                        }
+                    }
+                    KeyCode::Esc => handled = true,
+                    _ => {}
+                }
+
+                if handled {
+                    if let Some(editor) = workspace.editor.as_mut() {
+                        editor.ensure_visible(viewport.width, viewport.height);
+                    }
+                }
+                return handled;
+            }
+
             {
                 let editor = workspace.editor.as_mut().expect("editor checked above");
                 match editor.mode {
@@ -173,6 +219,72 @@ impl WorkspaceComponent {
                             handled = true;
                         }
                         _ => handled = true,
+                    },
+                    EditorMode::Visual => match key.code {
+                        KeyCode::Esc | KeyCode::Char('v') => {
+                            editor.exit_visual_mode();
+                            handled = true;
+                        }
+                        KeyCode::Left => {
+                            editor.extend_left();
+                            handled = true;
+                        }
+                        KeyCode::Char('h') => {
+                            editor.extend_left();
+                            handled = true;
+                        }
+                        KeyCode::Right => {
+                            editor.extend_right();
+                            handled = true;
+                        }
+                        KeyCode::Char('l') => {
+                            editor.extend_right();
+                            handled = true;
+                        }
+                        KeyCode::Up => {
+                            editor.extend_up();
+                            handled = true;
+                        }
+                        KeyCode::Char('k') => {
+                            editor.extend_up();
+                            handled = true;
+                        }
+                        KeyCode::Down => {
+                            editor.extend_down();
+                            handled = true;
+                        }
+                        KeyCode::Char('j') => {
+                            editor.extend_down();
+                            handled = true;
+                        }
+                        KeyCode::Home | KeyCode::Char('0') => {
+                            editor.extend_line_start();
+                            handled = true;
+                        }
+                        KeyCode::End | KeyCode::Char('$') => {
+                            editor.extend_line_end();
+                            handled = true;
+                        }
+                        KeyCode::PageUp => {
+                            editor.extend_page_up(page_step);
+                            handled = true;
+                        }
+                        KeyCode::PageDown => {
+                            editor.extend_page_down(page_step);
+                            handled = true;
+                        }
+                        KeyCode::Delete | KeyCode::Backspace | KeyCode::Char('x') => {
+                            if editor.has_selection() {
+                                editor.delete_selection();
+                            }
+                            editor.mode = EditorMode::Normal;
+                            handled = true;
+                        }
+                        KeyCode::Char(':') => {
+                            editor.start_command();
+                            handled = true;
+                        }
+                        _ => {}
                     },
                     EditorMode::Insert => match key.code {
                         KeyCode::Esc => {
@@ -233,15 +345,45 @@ impl WorkspaceComponent {
                     },
                     EditorMode::Normal => match key.code {
                         KeyCode::Esc => handled = true,
-                        KeyCode::Enter => {
-                            handled = workspace.toggle_current_directory();
+                        KeyCode::Enter => handled = true,
+                        KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                            editor.extend_left();
+                            handled = true;
+                        }
+                        KeyCode::Right if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                            editor.extend_right();
+                            handled = true;
+                        }
+                        KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                            editor.extend_up();
+                            handled = true;
+                        }
+                        KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                            editor.extend_down();
+                            handled = true;
+                        }
+                        KeyCode::Home if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                            editor.extend_line_start();
+                            handled = true;
+                        }
+                        KeyCode::End if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                            editor.extend_line_end();
+                            handled = true;
+                        }
+                        KeyCode::PageUp if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                            editor.extend_page_up(page_step);
+                            handled = true;
+                        }
+                        KeyCode::PageDown if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                            editor.extend_page_down(page_step);
+                            handled = true;
                         }
                         KeyCode::Up => {
-                            selection_delta = -1;
+                            editor.move_up();
                             handled = true;
                         }
                         KeyCode::Down => {
-                            selection_delta = 1;
+                            editor.move_down();
                             handled = true;
                         }
                         KeyCode::Left => {
@@ -296,6 +438,10 @@ impl WorkspaceComponent {
                             editor.move_line_end();
                             handled = true;
                         }
+                        KeyCode::Char('v') => {
+                            editor.enter_visual_mode();
+                            handled = true;
+                        }
                         KeyCode::Char('i') => {
                             editor.enter_insert_mode();
                             handled = true;
@@ -321,12 +467,6 @@ impl WorkspaceComponent {
                 }
             }
 
-            if selection_delta < 0 {
-                workspace.move_up();
-            } else if selection_delta > 0 {
-                workspace.move_down();
-            }
-
             if handled {
                 if let Some(editor) = workspace.editor.as_mut() {
                     editor.ensure_visible(viewport.width, viewport.height);
@@ -348,17 +488,85 @@ impl WorkspaceComponent {
         handled || saved || close
     }
 
-    pub(in crate::app) fn handle_editor_click(app: &mut App, column: u16, row: u16, area: Rect) {
-        let viewport = WorkspaceEditorComponent::viewport(area);
-        if !UiSupport::rect_contains(viewport, column, row) {
-            return;
-        }
-
+    pub(in crate::app) fn handle_editor_click(
+        app: &mut App,
+        column: u16,
+        row: u16,
+        area: Rect,
+    ) -> bool {
         let Some(agent) = app.active_agent_mut() else {
-            return;
+            return false;
+        };
+        agent.workspace.focus_editor();
+        let Some(target) = agent
+            .workspace
+            .editor
+            .as_ref()
+            .and_then(|editor| Self::editor_position_at(editor, column, row, area, false))
+        else {
+            return false;
         };
         let Some(editor) = agent.workspace.editor.as_mut() else {
-            return;
+            return false;
+        };
+        editor.mode = EditorMode::Normal;
+        editor.set_cursor(target.row, target.col);
+        let viewport = WorkspaceEditorComponent::viewport(area);
+        editor.ensure_visible(viewport.width, viewport.height);
+        true
+    }
+
+    pub(in crate::app) fn handle_editor_drag(
+        app: &mut App,
+        column: u16,
+        row: u16,
+        area: Rect,
+    ) -> bool {
+        let Some(agent) = app.active_agent_mut() else {
+            return false;
+        };
+        agent.workspace.focus_editor();
+        let Some(target) = agent
+            .workspace
+            .editor
+            .as_ref()
+            .and_then(|editor| Self::editor_position_at(editor, column, row, area, true))
+        else {
+            return false;
+        };
+        let Some(editor) = agent.workspace.editor.as_mut() else {
+            return false;
+        };
+        editor.select_to(target.row, target.col);
+        let viewport = WorkspaceEditorComponent::viewport(area);
+        editor.ensure_visible(viewport.width, viewport.height);
+        true
+    }
+
+    fn editor_position_at(
+        editor: &WorkspaceEditorState,
+        column: u16,
+        row: u16,
+        area: Rect,
+        clamp_to_viewport: bool,
+    ) -> Option<EditorPosition> {
+        let viewport = WorkspaceEditorComponent::viewport(area);
+        if viewport.width == 0 || viewport.height == 0 {
+            return None;
+        }
+
+        let (column, row) = if clamp_to_viewport {
+            let max_x = viewport.x + viewport.width.saturating_sub(1);
+            let max_y = viewport.y + viewport.height.saturating_sub(1);
+            (
+                column.clamp(viewport.x, max_x),
+                row.clamp(viewport.y, max_y),
+            )
+        } else {
+            if !UiSupport::rect_contains(viewport, column, row) {
+                return None;
+            }
+            (column, row)
         };
 
         let gutter_width = editor.gutter_width() as u16;
@@ -371,8 +579,9 @@ impl WorkspaceComponent {
             usize::from(content_x.saturating_sub(gutter_width)) + editor.horizontal_scroll as usize
         };
 
-        editor.mode = EditorMode::Normal;
-        editor.set_cursor(target_row, target_col);
-        editor.ensure_visible(viewport.width, viewport.height);
+        Some(EditorPosition {
+            row: target_row,
+            col: target_col,
+        })
     }
 }

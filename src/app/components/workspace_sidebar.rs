@@ -19,7 +19,10 @@ impl WorkspaceSidebarComponent {
                 WorkspaceSidebarTab::Files => 0,
                 WorkspaceSidebarTab::Search => 1,
             })
-            .block(UiSupport::sidebar_block().title("Workspace"))
+            .block(UiSupport::focus_block(
+                UiSupport::sidebar_block().title("Workspace"),
+                agent.workspace.sidebar_focused(),
+            ))
             .style(UiSupport::sidebar_style())
             .highlight_style(UiSupport::tab_highlight_style());
         frame.render_widget(tabs, layout.tabs);
@@ -34,6 +37,7 @@ impl WorkspaceSidebarComponent {
         if let Some(agent) = app.active_agent_mut() {
             let layout = Self::layout(sidebar_list, agent.workspace.sidebar_tab);
             if let Some(tab) = Self::tab_from_click(layout.tabs, column, row) {
+                agent.workspace.focus_sidebar();
                 agent.workspace.set_sidebar_tab(tab);
                 return;
             }
@@ -50,6 +54,7 @@ impl WorkspaceSidebarComponent {
                     if total == 0 {
                         return;
                     }
+                    agent.workspace.focus_sidebar();
                     let offset = UiSupport::list_offset(
                         agent.workspace.sidebar_selected_row(),
                         total,
@@ -63,6 +68,7 @@ impl WorkspaceSidebarComponent {
                         .input
                         .is_some_and(|input| UiSupport::rect_contains(input, column, row))
                     {
+                        agent.workspace.focus_sidebar();
                         return;
                     }
 
@@ -76,6 +82,7 @@ impl WorkspaceSidebarComponent {
                     if total == 0 {
                         return;
                     }
+                    agent.workspace.focus_sidebar();
                     let offset = UiSupport::list_offset(
                         agent.workspace.search_selected_row(),
                         total,
@@ -173,7 +180,10 @@ impl WorkspaceSidebarComponent {
             .with_selected(Some(selected));
 
         let list = List::new(items)
-            .block(UiSupport::sidebar_block().title("Files"))
+            .block(UiSupport::focus_block(
+                UiSupport::sidebar_block().title("Files"),
+                agent.workspace.sidebar_focused(),
+            ))
             .style(UiSupport::sidebar_style())
             .highlight_style(UiSupport::selection_style())
             .highlight_symbol("› ");
@@ -187,8 +197,12 @@ impl WorkspaceSidebarComponent {
     }
 
     fn draw_search(frame: &mut Frame, agent: &AgentState, layout: WorkspaceSidebarLayout) {
+        let sidebar_focused = agent.workspace.sidebar_focused();
         let input = Paragraph::new(agent.workspace.search_query.as_str())
-            .block(UiSupport::panel_block().title("Search"))
+            .block(UiSupport::focus_block(
+                UiSupport::panel_block().title("Search"),
+                sidebar_focused,
+            ))
             .style(UiSupport::panel_style());
         if let Some(input_area) = layout.input {
             frame.render_widget(input, input_area);
@@ -215,21 +229,26 @@ impl WorkspaceSidebarComponent {
             ));
         }
         let list = List::new(items)
-            .block(UiSupport::sidebar_block().title(format!(
-                "Results ({})",
-                agent.workspace.search_match_count()
-            )))
+            .block(UiSupport::focus_block(
+                UiSupport::sidebar_block().title(format!(
+                    "Results ({})",
+                    agent.workspace.search_match_count()
+                )),
+                sidebar_focused,
+            ))
             .style(UiSupport::sidebar_style())
             .highlight_style(UiSupport::selection_style())
             .highlight_symbol("› ");
         frame.render_stateful_widget(list, layout.content, &mut state);
 
-        if let Some(input_area) = layout.input {
-            let cursor_x = input_area
-                .x
-                .saturating_add(1 + agent.workspace.search_query.chars().count() as u16)
-                .min(input_area.x + input_area.width.saturating_sub(2));
-            frame.set_cursor_position((cursor_x, input_area.y + 1));
+        if sidebar_focused {
+            if let Some(input_area) = layout.input {
+                let cursor_x = input_area
+                    .x
+                    .saturating_add(1 + agent.workspace.search_query.chars().count() as u16)
+                    .min(input_area.x + input_area.width.saturating_sub(2));
+                frame.set_cursor_position((cursor_x, input_area.y + 1));
+            }
         }
     }
 }

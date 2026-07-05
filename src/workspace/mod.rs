@@ -32,6 +32,7 @@ pub struct FileBrowserState {
     pub tree_rows: Vec<FileTreeRow>,
     pub selected: usize,
     pub tree_cursor: usize,
+    pub focus: WorkspaceFocus,
     pub sidebar_tab: WorkspaceSidebarTab,
     pub search_query: String,
     pub preview_title: String,
@@ -64,6 +65,13 @@ pub enum WorkspaceSidebarTab {
     #[default]
     Files,
     Search,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WorkspaceFocus {
+    #[default]
+    Sidebar,
+    Editor,
 }
 
 #[derive(Debug, Clone)]
@@ -128,6 +136,7 @@ pub struct DiffEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditorMode {
     Normal,
+    Visual,
     Insert,
     Command,
 }
@@ -136,6 +145,12 @@ pub enum EditorMode {
 pub struct EditorCommandResult {
     pub saved: bool,
     pub close: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct EditorPosition {
+    pub row: usize,
+    pub col: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -151,6 +166,7 @@ pub struct WorkspaceEditorState {
     pub dirty: bool,
     pub status: Option<String>,
     preferred_col: usize,
+    selection_anchor: Option<EditorPosition>,
     render_cache: EditorRenderCache,
 }
 
