@@ -165,9 +165,21 @@ pub struct WorkspaceEditorState {
     pub command: String,
     pub dirty: bool,
     pub status: Option<String>,
+    saved_lines: Vec<String>,
+    undo_stack: Vec<EditorUndoState>,
     preferred_col: usize,
     selection_anchor: Option<EditorPosition>,
     render_cache: EditorRenderCache,
+}
+
+#[derive(Debug, Clone)]
+struct EditorUndoState {
+    lines: Vec<String>,
+    cursor_row: usize,
+    cursor_col: usize,
+    vertical_scroll: u16,
+    horizontal_scroll: u16,
+    preferred_col: usize,
 }
 
 #[derive(Debug, Clone, Default)]

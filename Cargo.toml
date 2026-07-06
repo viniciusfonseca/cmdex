@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0"
+arboard = "3.6"
 crossterm = { version = "0.28", features = ["event-stream"] }
 futures-util = "0.3"
 ignore = "0.4"

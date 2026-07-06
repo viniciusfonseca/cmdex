@@ -51,6 +51,13 @@ impl GitDiffComponent {
         let preview_lines = agent.git_diff.preview.clone();
         let content_length =
             UiSupport::scrollable_preview_content_height(&preview_lines, layout.preview);
+        let viewport = UiSupport::inner_rect(layout.preview);
+        let render_width = if content_length > viewport.height as usize && viewport.width > 1 {
+            viewport.width.saturating_sub(1)
+        } else {
+            viewport.width
+        };
+        let preview_lines = Self::pad_preview_lines(&preview_lines, render_width);
         let widget = Paragraph::new(Text::from(preview_lines))
             .block(UiSupport::editor_block().title(agent.git_diff.preview_title.clone()))
             .style(UiSupport::editor_style())
@@ -335,6 +342,38 @@ impl GitDiffComponent {
         } else {
             label.to_string()
         }
+    }
+
+    pub(in crate::app) fn pad_preview_lines(
+        lines: &[Line<'static>],
+        width: u16,
+    ) -> Vec<Line<'static>> {
+        let width = usize::from(width.max(1));
+
+        lines.iter()
+            .cloned()
+            .map(|mut line| {
+                let Some(background) = line.style.bg else {
+                    return line;
+                };
+
+                let remainder = line.width() % width;
+                let padding = if remainder == 0 {
+                    if line.width() == 0 { width } else { 0 }
+                } else {
+                    width - remainder
+                };
+
+                if padding > 0 {
+                    line.spans.push(Span::styled(
+                        " ".repeat(padding),
+                        Style::default().bg(background),
+                    ));
+                }
+
+                line
+            })
+            .collect()
     }
 
     fn commit_changes(app: &mut App) {

@@ -15,6 +15,7 @@ use std::{
 };
 
 use anyhow::Result;
+use arboard::Clipboard;
 use crossterm::{
     event::{
         Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,

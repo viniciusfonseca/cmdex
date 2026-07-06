@@ -153,6 +153,149 @@ fn editor_delete_selection_removes_selected_range_across_lines() {
 }
 
 #[test]
+fn editor_copy_selection_or_line_prefers_selection() {
+    let path = std::env::temp_dir().join(format!(
+        "cmdex-editor-copy-selection-{}.txt",
+        std::process::id()
+    ));
+    fs::write(&path, "alpha\nbeta").unwrap();
+
+    let mut editor = WorkspaceEditorState::open(&path).unwrap();
+    editor.move_right();
+    editor.move_right();
+    editor.enter_visual_mode();
+    editor.extend_down();
+
+    assert_eq!(editor.copy_selection_or_line(), "pha\nbe");
+
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn editor_copy_selection_or_line_falls_back_to_current_line() {
+    let path =
+        std::env::temp_dir().join(format!("cmdex-editor-copy-line-{}.txt", std::process::id()));
+    fs::write(&path, "alpha\nbeta").unwrap();
+
+    let mut editor = WorkspaceEditorState::open(&path).unwrap();
+    editor.move_down();
+
+    assert_eq!(editor.copy_selection_or_line(), "beta");
+
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn editor_paste_text_inserts_multiline_content() {
+    let path = std::env::temp_dir().join(format!(
+        "cmdex-editor-paste-multi-{}.txt",
+        std::process::id()
+    ));
+    fs::write(&path, "alpha\nomega").unwrap();
+
+    let mut editor = WorkspaceEditorState::open(&path).unwrap();
+    editor.move_right();
+    editor.move_right();
+
+    assert!(editor.paste_text("X\nY"));
+    assert_eq!(
+        editor.lines,
+        vec!["alX".to_string(), "Ypha".to_string(), "omega".to_string()]
+    );
+    assert_eq!(editor.cursor_row, 1);
+    assert_eq!(editor.cursor_col, 1);
+    assert_eq!(editor.mode, EditorMode::Normal);
+
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn editor_paste_text_replaces_selection_and_exits_visual_mode() {
+    let path = std::env::temp_dir().join(format!(
+        "cmdex-editor-paste-selection-{}.txt",
+        std::process::id()
+    ));
+    fs::write(&path, "hello").unwrap();
+
+    let mut editor = WorkspaceEditorState::open(&path).unwrap();
+    editor.move_right();
+    editor.enter_visual_mode();
+    editor.extend_right();
+    editor.extend_right();
+    editor.extend_right();
+
+    assert!(editor.paste_text("abc"));
+    assert_eq!(editor.lines, vec!["habco".to_string()]);
+    assert_eq!(editor.cursor_row, 0);
+    assert_eq!(editor.cursor_col, 4);
+    assert_eq!(editor.mode, EditorMode::Normal);
+    assert!(!editor.has_selection());
+
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn editor_undo_reverts_latest_change_and_restores_clean_state() {
+    let path = std::env::temp_dir().join(format!(
+        "cmdex-editor-undo-clean-{}.txt",
+        std::process::id()
+    ));
+    fs::write(&path, "hello").unwrap();
+
+    let mut editor = WorkspaceEditorState::open(&path).unwrap();
+    editor.enter_insert_mode();
+    editor.insert_char('!');
+
+    assert!(editor.dirty);
+    assert!(editor.undo());
+    assert_eq!(editor.lines, vec!["hello".to_string()]);
+    assert_eq!(editor.cursor_row, 0);
+    assert_eq!(editor.cursor_col, 0);
+    assert_eq!(editor.mode, EditorMode::Normal);
+    assert!(!editor.dirty);
+
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn editor_undo_reverts_multiline_paste() {
+    let path = std::env::temp_dir().join(format!(
+        "cmdex-editor-undo-paste-{}.txt",
+        std::process::id()
+    ));
+    fs::write(&path, "alpha\nomega").unwrap();
+
+    let mut editor = WorkspaceEditorState::open(&path).unwrap();
+    editor.move_right();
+    editor.move_right();
+    editor.paste_text("X\nY");
+
+    assert!(editor.undo());
+    assert_eq!(editor.lines, vec!["alpha".to_string(), "omega".to_string()]);
+    assert_eq!(editor.cursor_row, 0);
+    assert_eq!(editor.cursor_col, 2);
+    assert_eq!(editor.mode, EditorMode::Normal);
+
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn editor_undo_reports_when_history_is_empty() {
+    let path = std::env::temp_dir().join(format!(
+        "cmdex-editor-undo-empty-{}.txt",
+        std::process::id()
+    ));
+    fs::write(&path, "hello").unwrap();
+
+    let mut editor = WorkspaceEditorState::open(&path).unwrap();
+
+    assert!(!editor.undo());
+    assert_eq!(editor.status.as_deref(), Some("Nothing to undo"));
+
+    let _ = fs::remove_file(path);
+}
+
+#[test]
 fn selecting_a_file_auto_opens_editor_in_normal_mode() {
     let path =
         std::env::temp_dir().join(format!("cmdex-editor-auto-open-{}.txt", std::process::id()));
@@ -494,6 +637,9 @@ fn renders_removed_lines_inside_full_file_diff_preview() {
     assert_eq!(line_text(&lines[1]), "2 - | old value");
     assert_eq!(line_text(&lines[2]), "2 ~ | new value");
     assert_eq!(line_text(&lines[3]), "3   | three");
+    assert!(lines[0].style.bg.is_none());
+    assert!(lines[1].style.bg.is_some());
+    assert!(lines[2].style.bg.is_some());
 }
 
 fn line_text(line: &Line<'_>) -> String {

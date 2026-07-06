@@ -7,6 +7,7 @@ use super::{
     shell::{ShellOutputParser, ShellOutputRecord, ShellPresenter, ShellTabState},
     *,
 };
+use ratatui::style::Color;
 
 #[test]
 fn wrapped_text_height_matches_paragraph_word_wrapping() {
@@ -43,6 +44,18 @@ fn git_diff_remote_button_label_shows_spinner_only_for_active_action() {
         ),
         "Pull"
     );
+}
+
+#[test]
+fn git_diff_preview_padding_fills_changed_rows_to_viewport_width() {
+    let changed = Line::from("abc").style(Style::default().bg(Color::Red));
+    let context = Line::from("xy");
+
+    let padded = GitDiffComponent::pad_preview_lines(&[changed, context], 5);
+
+    assert_eq!(line_text(&padded[0]), "abc  ");
+    assert_eq!(padded[0].width(), 5);
+    assert_eq!(padded[1].width(), 2);
 }
 
 #[test]
@@ -983,6 +996,65 @@ fn workspace_arrow_keys_move_sidebar_selection_when_sidebar_is_focused() {
     assert_eq!(workspace.selected, 1);
     assert!(workspace.sidebar_focused());
     assert_eq!(workspace.editor.as_ref().unwrap().path, zeta);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn workspace_u_shortcut_undoes_editor_changes() {
+    let root = std::env::temp_dir().join(format!(
+        "cmdex-app-workspace-undo-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let alpha = root.join("alpha.txt");
+    fs::write(&alpha, "hello").unwrap();
+
+    let config = CmdexConfig {
+        agents: vec![AgentDefinition {
+            name: "Test".to_string(),
+            workspace: root.clone(),
+        }],
+    };
+    let mut app = App::new(PathBuf::new(), config);
+    app.current_tab = AppTab::Workspace;
+    app.current_agent = Some(0);
+    app.chat_sidebar_index = 1;
+    TopNavigationComponent::refresh_current_tab(&mut app);
+
+    {
+        let workspace = &mut app.active_agent_mut().unwrap().workspace;
+        workspace.select(0);
+        workspace.open_editor().unwrap();
+        let editor = workspace.editor.as_mut().unwrap();
+        editor.enter_insert_mode();
+        editor.insert_char('!');
+        editor.mode = EditorMode::Normal;
+        assert_eq!(editor.lines, vec!["!hello".to_string()]);
+        assert!(editor.dirty);
+    }
+
+    let handled = WorkspaceComponent::handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE),
+        Rect::new(0, 0, 120, 40),
+    );
+
+    assert!(handled);
+    let editor = app
+        .active_agent()
+        .unwrap()
+        .workspace
+        .editor
+        .as_ref()
+        .unwrap();
+    assert_eq!(editor.lines, vec!["hello".to_string()]);
+    assert!(!editor.dirty);
+    assert_eq!(editor.status.as_deref(), Some("Undid last change"));
 
     let _ = fs::remove_dir_all(root);
 }

@@ -225,6 +225,14 @@ impl WorkspaceComponent {
                             editor.exit_visual_mode();
                             handled = true;
                         }
+                        KeyCode::Char('y') => {
+                            Self::copy_editor(editor);
+                            handled = true;
+                        }
+                        KeyCode::Char('p') => {
+                            Self::paste_editor(editor);
+                            handled = true;
+                        }
                         KeyCode::Left => {
                             editor.extend_left();
                             handled = true;
@@ -346,6 +354,14 @@ impl WorkspaceComponent {
                     EditorMode::Normal => match key.code {
                         KeyCode::Esc => handled = true,
                         KeyCode::Enter => handled = true,
+                        KeyCode::Char('y') => {
+                            Self::copy_editor(editor);
+                            handled = true;
+                        }
+                        KeyCode::Char('p') => {
+                            Self::paste_editor(editor);
+                            handled = true;
+                        }
                         KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) => {
                             editor.extend_left();
                             handled = true;
@@ -440,6 +456,10 @@ impl WorkspaceComponent {
                         }
                         KeyCode::Char('v') => {
                             editor.enter_visual_mode();
+                            handled = true;
+                        }
+                        KeyCode::Char('u') => {
+                            editor.undo();
                             handled = true;
                         }
                         KeyCode::Char('i') => {
@@ -583,5 +603,38 @@ impl WorkspaceComponent {
             row: target_row,
             col: target_col,
         })
+    }
+
+    fn copy_editor(editor: &mut WorkspaceEditorState) {
+        let text = editor.copy_selection_or_line();
+        let copied_chars = text.chars().count();
+
+        match Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text)) {
+            Ok(()) => {
+                if editor.mode == EditorMode::Visual {
+                    editor.exit_visual_mode();
+                }
+                editor.status = Some(format!("Copied {copied_chars} chars"));
+            }
+            Err(error) => {
+                editor.status = Some(format!("Copy failed: {error}"));
+            }
+        }
+    }
+
+    fn paste_editor(editor: &mut WorkspaceEditorState) {
+        match Clipboard::new().and_then(|mut clipboard| clipboard.get_text()) {
+            Ok(text) => {
+                let pasted_chars = text.chars().count();
+                if !editor.paste_text(&text) {
+                    editor.status = Some("Clipboard is empty".to_string());
+                    return;
+                }
+                editor.status = Some(format!("Pasted {pasted_chars} chars"));
+            }
+            Err(error) => {
+                editor.status = Some(format!("Paste failed: {error}"));
+            }
+        }
     }
 }

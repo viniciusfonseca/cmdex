@@ -124,14 +124,14 @@ impl WorkspaceEditorComponent {
         match editor.mode {
             EditorMode::Command => format!(":{}", editor.command),
             EditorMode::Visual => {
-                "-- VISUAL --  Esc normal  Tab sidebar  h/j/k/l move  x delete selection"
+                "-- VISUAL --  Esc normal  y copy  p paste  h/j/k/l move  x delete selection"
                     .to_string()
             }
             EditorMode::Insert => {
                 "-- INSERT --  Esc normal  Enter newline  Backspace delete".to_string()
             }
             EditorMode::Normal => editor.status.clone().unwrap_or_else(|| {
-                "NORMAL  Tab sidebar  arrows move  v select  i/a/o edit  x delete  :w save  :q preview"
+                "NORMAL  Tab sidebar  arrows move  v select  y copy  p paste  u undo  i/a/o edit  x delete  :w save  :q preview"
                     .to_string()
             }),
         }

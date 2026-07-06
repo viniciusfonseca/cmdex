@@ -1,5 +1,7 @@
 use super::{render::*, *};
 
+const UNDO_LIMIT: usize = 256;
+
 impl WorkspaceEditorState {
     pub fn open(path: &Path) -> Result<Self> {
         let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
@@ -21,6 +23,7 @@ impl WorkspaceEditorState {
 
         let mut editor = Self {
             path: path.to_path_buf(),
+            saved_lines: lines.clone(),
             lines,
             cursor_row: 0,
             cursor_col: 0,
@@ -30,6 +33,7 @@ impl WorkspaceEditorState {
             command: String::new(),
             dirty: false,
             status: None,
+            undo_stack: Vec::new(),
             preferred_col: 0,
             selection_anchor: None,
             render_cache: EditorRenderCache::default(),
@@ -251,76 +255,86 @@ impl WorkspaceEditorState {
     }
 
     pub fn open_below(&mut self) {
+        self.push_undo_state();
         let next_row = self.cursor_row + 1;
         self.lines.insert(next_row, String::new());
         self.cursor_row = next_row;
         self.cursor_col = 0;
         self.preferred_col = 0;
-        self.dirty = true;
+        self.sync_dirty_state();
         self.status = None;
         self.rebuild_render_cache();
         self.enter_insert_mode();
     }
 
     pub fn delete_char(&mut self) {
-        if self.delete_selection() {
+        if self.has_selection() {
+            self.push_undo_state();
+            self.delete_selection_internal(false);
             return;
         }
 
         let line_len = self.line_len(self.cursor_row);
         if self.cursor_col < line_len {
+            self.push_undo_state();
             let byte_index =
                 Self::byte_index_for_char(&self.lines[self.cursor_row], self.cursor_col);
             self.lines[self.cursor_row].remove(byte_index);
-            self.dirty = true;
         } else if self.cursor_row + 1 < self.lines.len() {
+            self.push_undo_state();
             let next = self.lines.remove(self.cursor_row + 1);
             self.lines[self.cursor_row].push_str(&next);
-            self.dirty = true;
+        } else {
+            return;
         }
         self.clamp_cursor();
+        self.sync_dirty_state();
         self.status = None;
-        if self.dirty {
-            self.rebuild_render_cache();
-        }
+        self.rebuild_render_cache();
     }
 
     pub fn insert_char(&mut self, character: char) {
-        let _ = self.delete_selection();
+        self.push_undo_state();
+        let _ = self.delete_selection_internal(false);
         let byte_index = Self::byte_index_for_char(&self.lines[self.cursor_row], self.cursor_col);
         self.lines[self.cursor_row].insert(byte_index, character);
         self.cursor_col += 1;
         self.preferred_col = self.cursor_col;
-        self.dirty = true;
+        self.sync_dirty_state();
         self.status = None;
         self.rebuild_render_cache();
     }
 
     pub fn insert_newline(&mut self) {
-        let _ = self.delete_selection();
+        self.push_undo_state();
+        let _ = self.delete_selection_internal(false);
         let byte_index = Self::byte_index_for_char(&self.lines[self.cursor_row], self.cursor_col);
         let tail = self.lines[self.cursor_row].split_off(byte_index);
         self.cursor_row += 1;
         self.lines.insert(self.cursor_row, tail);
         self.cursor_col = 0;
         self.preferred_col = 0;
-        self.dirty = true;
+        self.sync_dirty_state();
         self.status = None;
         self.rebuild_render_cache();
     }
 
     pub fn backspace(&mut self) {
-        if self.delete_selection() {
+        if self.has_selection() {
+            self.push_undo_state();
+            self.delete_selection_internal(false);
             return;
         }
 
         if self.cursor_col > 0 {
+            self.push_undo_state();
             let byte_end = Self::byte_index_for_char(&self.lines[self.cursor_row], self.cursor_col);
             let byte_start =
                 Self::byte_index_for_char(&self.lines[self.cursor_row], self.cursor_col - 1);
             self.lines[self.cursor_row].drain(byte_start..byte_end);
             self.cursor_col -= 1;
         } else if self.cursor_row > 0 {
+            self.push_undo_state();
             let current = self.lines.remove(self.cursor_row);
             self.cursor_row -= 1;
             self.cursor_col = self.line_len(self.cursor_row);
@@ -330,7 +344,7 @@ impl WorkspaceEditorState {
         }
 
         self.preferred_col = self.cursor_col;
-        self.dirty = true;
+        self.sync_dirty_state();
         self.status = None;
         self.rebuild_render_cache();
     }
@@ -338,9 +352,15 @@ impl WorkspaceEditorState {
     pub fn save(&mut self) -> Result<()> {
         fs::write(&self.path, self.lines.join("\n"))
             .with_context(|| format!("failed to write {}", self.path.display()))?;
+        self.saved_lines = self.lines.clone();
         self.dirty = false;
         self.status = Some(format!("{} written", self.path.display()));
         Ok(())
+    }
+
+    pub fn copy_selection_or_line(&self) -> String {
+        self.selection_text()
+            .unwrap_or_else(|| self.lines.get(self.cursor_row).cloned().unwrap_or_default())
     }
 
     pub fn set_cursor(&mut self, row: usize, col: usize) {
@@ -352,6 +372,73 @@ impl WorkspaceEditorState {
         self.cursor_col = col.min(self.line_len(self.cursor_row));
         self.preferred_col = self.cursor_col;
         self.status = None;
+    }
+
+    pub fn paste_text(&mut self, text: &str) -> bool {
+        let text = WorkspaceRenderer::normalize_newlines(text);
+        if text.is_empty() {
+            return false;
+        }
+
+        self.push_undo_state();
+        if self.mode == EditorMode::Visual {
+            self.mode = EditorMode::Normal;
+        }
+        let _ = self.delete_selection_internal(false);
+        self.clear_selection();
+
+        let insert_at = Self::byte_index_for_char(&self.lines[self.cursor_row], self.cursor_col);
+        let tail = self.lines[self.cursor_row].split_off(insert_at);
+        let segments = WorkspaceRenderer::split_preserving_lines(&text);
+
+        if segments.len() == 1 {
+            self.lines[self.cursor_row].push_str(&segments[0]);
+            self.lines[self.cursor_row].push_str(&tail);
+            self.cursor_col += segments[0].chars().count();
+        } else {
+            let start_row = self.cursor_row;
+            self.lines[start_row].push_str(&segments[0]);
+
+            for (offset, segment) in segments[1..segments.len() - 1].iter().enumerate() {
+                self.lines.insert(start_row + 1 + offset, segment.clone());
+            }
+
+            let last_segment = segments.last().cloned().unwrap_or_default();
+            self.lines
+                .insert(start_row + segments.len() - 1, last_segment.clone() + &tail);
+            self.cursor_row = start_row + segments.len() - 1;
+            self.cursor_col = last_segment.chars().count();
+        }
+
+        self.preferred_col = self.cursor_col;
+        self.sync_dirty_state();
+        self.status = None;
+        self.rebuild_render_cache();
+        true
+    }
+
+    pub fn undo(&mut self) -> bool {
+        let Some(snapshot) = self.undo_stack.pop() else {
+            self.status = Some("Nothing to undo".to_string());
+            return false;
+        };
+
+        self.lines = snapshot.lines;
+        if self.lines.is_empty() {
+            self.lines.push(String::new());
+        }
+        self.cursor_row = snapshot.cursor_row.min(self.lines.len().saturating_sub(1));
+        self.cursor_col = snapshot.cursor_col.min(self.line_len(self.cursor_row));
+        self.vertical_scroll = snapshot.vertical_scroll;
+        self.horizontal_scroll = snapshot.horizontal_scroll;
+        self.preferred_col = snapshot.preferred_col.min(self.line_len(self.cursor_row));
+        self.mode = EditorMode::Normal;
+        self.command.clear();
+        self.clear_selection();
+        self.sync_dirty_state();
+        self.status = Some("Undid last change".to_string());
+        self.rebuild_render_cache();
+        true
     }
 
     pub fn select_to(&mut self, row: usize, col: usize) {
@@ -430,9 +517,17 @@ impl WorkspaceEditorState {
     }
 
     pub fn delete_selection(&mut self) -> bool {
+        self.delete_selection_internal(true)
+    }
+
+    fn delete_selection_internal(&mut self, record_undo: bool) -> bool {
         let Some((start, end)) = self.selection_bounds() else {
             return false;
         };
+
+        if record_undo {
+            self.push_undo_state();
+        }
 
         if start.row == end.row {
             let byte_start = Self::byte_index_for_char(&self.lines[start.row], start.col);
@@ -455,7 +550,7 @@ impl WorkspaceEditorState {
         self.cursor_col = start.col.min(self.line_len(self.cursor_row));
         self.preferred_col = self.cursor_col;
         self.clear_selection();
-        self.dirty = true;
+        self.sync_dirty_state();
         self.status = None;
         self.rebuild_render_cache();
         true
@@ -493,6 +588,30 @@ impl WorkspaceEditorState {
         })
     }
 
+    fn selection_text(&self) -> Option<String> {
+        let (start, end) = self.selection_bounds()?;
+        let mut text = String::new();
+
+        for row in start.row..=end.row {
+            if row > start.row {
+                text.push('\n');
+            }
+
+            let line = &self.lines[row];
+            let start_col = if row == start.row { start.col } else { 0 };
+            let end_col = if row == end.row {
+                end.col
+            } else {
+                self.line_len(row)
+            };
+            let start_byte = Self::byte_index_for_char(line, start_col);
+            let end_byte = Self::byte_index_for_char(line, end_col);
+            text.push_str(&line[start_byte..end_byte]);
+        }
+
+        Some(text)
+    }
+
     fn selection_range_for_row(&self, row: usize) -> Option<(usize, usize)> {
         let (start, end) = self.selection_bounds()?;
         if row < start.row || row > end.row {
@@ -511,6 +630,26 @@ impl WorkspaceEditorState {
         self.cursor_row = self.cursor_row.min(self.lines.len().saturating_sub(1));
         self.cursor_col = self.cursor_col.min(self.line_len(self.cursor_row));
         self.preferred_col = self.cursor_col;
+    }
+
+    fn push_undo_state(&mut self) {
+        self.undo_stack.push(EditorUndoState {
+            lines: self.lines.clone(),
+            cursor_row: self.cursor_row,
+            cursor_col: self.cursor_col,
+            vertical_scroll: self.vertical_scroll,
+            horizontal_scroll: self.horizontal_scroll,
+            preferred_col: self.preferred_col,
+        });
+
+        if self.undo_stack.len() > UNDO_LIMIT {
+            let overflow = self.undo_stack.len() - UNDO_LIMIT;
+            self.undo_stack.drain(0..overflow);
+        }
+    }
+
+    fn sync_dirty_state(&mut self) {
+        self.dirty = self.lines != self.saved_lines;
     }
 
     fn rebuild_render_cache(&mut self) {

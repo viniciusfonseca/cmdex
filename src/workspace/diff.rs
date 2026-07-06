@@ -751,6 +751,7 @@ impl GitDiffSupport {
             return;
         };
 
+        line.style = line.style.bg(background);
         for span in &mut line.spans {
             span.style = span.style.bg(background);
         }
