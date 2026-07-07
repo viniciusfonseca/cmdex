@@ -192,7 +192,6 @@ impl WorkspaceEditorComponent {
         let popup = Paragraph::new(text)
             .block(
                 UiSupport::rounded_block()
-                    .title("Hover")
                     .style(
                         Style::default()
                             .bg(UiSupport::theme().panel_bg)
