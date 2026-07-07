@@ -1,5 +1,9 @@
 use super::super::*;
 use super::UiSupport;
+use crate::syntax::SyntaxRegistry;
+use ratatui::style::Color;
+use std::path::Path;
+use syntect::{easy::HighlightLines, highlighting::FontStyle, parsing::SyntaxReference};
 
 pub(in crate::app) struct WorkspaceEditorComponent;
 
@@ -167,10 +171,11 @@ impl WorkspaceEditorComponent {
             .min(code_area.x + code_area.width.saturating_sub(1));
         let anchor_y = code_area.y.saturating_add(visible_row);
 
-        let text = Text::from(hover.to_string());
-        let natural_content_width = hover
-            .lines()
-            .map(|line| Line::from(line.to_string()).width() as u16)
+        let rendered_lines = Self::hover_lines(hover, &editor.path);
+        let text = Text::from(rendered_lines.clone());
+        let natural_content_width = rendered_lines
+            .iter()
+            .map(|line| line.width() as u16)
             .max()
             .unwrap_or(1);
         let max_content_width = code_area.width.saturating_sub(4).clamp(8, 64);
@@ -213,6 +218,214 @@ impl WorkspaceEditorComponent {
         frame.render_widget(popup, popup_area);
     }
 
+    fn hover_lines(hover: &str, path: &Path) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+
+        for (index, block) in Self::parse_hover_blocks(hover).into_iter().enumerate() {
+            if index > 0 && !lines.is_empty() {
+                lines.push(Line::default());
+            }
+
+            match block {
+                HoverBlock::Text(text) => {
+                    lines.extend(text.split('\n').map(|line| {
+                        if line.is_empty() {
+                            Line::default()
+                        } else {
+                            Line::from(line.to_string())
+                        }
+                    }));
+                }
+                HoverBlock::Code { language, text } => {
+                    lines.extend(Self::highlight_hover_code(&text, language.as_deref(), path));
+                }
+            }
+        }
+
+        if lines.is_empty() {
+            lines.push(Line::default());
+        }
+
+        lines
+    }
+
+    fn parse_hover_blocks(hover: &str) -> Vec<HoverBlock> {
+        let mut blocks = Vec::new();
+        let mut text_lines = Vec::new();
+        let mut code_lines = Vec::new();
+        let mut code_language = None;
+        let mut inside_code = false;
+
+        for line in hover.replace("\r\n", "\n").replace('\r', "\n").split('\n') {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("```") {
+                if inside_code {
+                    Self::push_hover_text_block(&mut blocks, &mut text_lines);
+                    Self::push_hover_code_block(&mut blocks, code_language.take(), &mut code_lines);
+                } else {
+                    Self::push_hover_text_block(&mut blocks, &mut text_lines);
+                    let language = trimmed.trim_start_matches("```").trim();
+                    code_language = (!language.is_empty()).then(|| language.to_string());
+                }
+                inside_code = !inside_code;
+                continue;
+            }
+
+            if inside_code {
+                code_lines.push(line.to_string());
+            } else {
+                text_lines.push(line.to_string());
+            }
+        }
+
+        if inside_code {
+            Self::push_hover_code_block(&mut blocks, code_language, &mut code_lines);
+        } else {
+            Self::push_hover_text_block(&mut blocks, &mut text_lines);
+        }
+
+        blocks
+    }
+
+    fn push_hover_text_block(blocks: &mut Vec<HoverBlock>, lines: &mut Vec<String>) {
+        let mut normalized = Vec::new();
+        let mut previous_blank = false;
+
+        for line in lines.drain(..) {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                if !previous_blank && !normalized.is_empty() {
+                    normalized.push(String::new());
+                }
+                previous_blank = true;
+            } else {
+                normalized.push(trimmed.to_string());
+                previous_blank = false;
+            }
+        }
+
+        while normalized.last().is_some_and(String::is_empty) {
+            normalized.pop();
+        }
+
+        if normalized.is_empty() {
+            return;
+        }
+
+        blocks.push(HoverBlock::Text(normalized.join("\n")));
+    }
+
+    fn push_hover_code_block(
+        blocks: &mut Vec<HoverBlock>,
+        language: Option<String>,
+        lines: &mut Vec<String>,
+    ) {
+        while lines.last().is_some_and(String::is_empty) {
+            lines.pop();
+        }
+
+        if lines.is_empty() {
+            return;
+        }
+
+        blocks.push(HoverBlock::Code {
+            language,
+            text: lines.drain(..).collect::<Vec<_>>().join("\n"),
+        });
+    }
+
+    fn highlight_hover_code(
+        source: &str,
+        language: Option<&str>,
+        path: &Path,
+    ) -> Vec<Line<'static>> {
+        let syntax = Self::hover_syntax(language, source, path);
+        match syntax {
+            Some(syntax) => {
+                let mut highlighter = HighlightLines::new(syntax, ThemeRegistry::syntax());
+                source
+                    .split('\n')
+                    .map(|line| {
+                        if line.is_empty() {
+                            return Line::default();
+                        }
+
+                        match highlighter.highlight_line(line, SyntaxRegistry::set()) {
+                            Ok(ranges) => Line::from(
+                                ranges
+                                    .into_iter()
+                                    .map(|(style, text)| {
+                                        Span::styled(
+                                            text.to_string(),
+                                            Self::to_ratatui_style(style),
+                                        )
+                                    })
+                                    .collect::<Vec<_>>(),
+                            ),
+                            Err(_) => Line::from(line.to_string()),
+                        }
+                    })
+                    .collect()
+            }
+            None => source
+                .split('\n')
+                .map(|line| {
+                    if line.is_empty() {
+                        Line::default()
+                    } else {
+                        Line::from(line.to_string())
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    fn hover_syntax(
+        language: Option<&str>,
+        source: &str,
+        path: &Path,
+    ) -> Option<&'static SyntaxReference> {
+        let language = language.unwrap_or_default().trim();
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .and_then(|extension| SyntaxRegistry::set().find_syntax_by_extension(extension))
+            .or_else(|| SyntaxRegistry::set().find_syntax_by_token(language))
+            .or_else(|| SyntaxRegistry::set().find_syntax_by_name(language))
+            .or_else(|| SyntaxRegistry::set().find_syntax_by_extension(language))
+            .or_else(|| {
+                source
+                    .lines()
+                    .next()
+                    .and_then(|line| SyntaxRegistry::set().find_syntax_by_first_line(line))
+            })
+    }
+
+    fn to_ratatui_style(style: syntect::highlighting::Style) -> Style {
+        let mut modifiers = Modifier::empty();
+        if style.font_style.contains(FontStyle::BOLD) {
+            modifiers |= Modifier::BOLD;
+        }
+        if style.font_style.contains(FontStyle::ITALIC) {
+            modifiers |= Modifier::ITALIC;
+        }
+        if style.font_style.contains(FontStyle::UNDERLINE) {
+            modifiers |= Modifier::UNDERLINED;
+        }
+
+        Style::default()
+            .fg(Color::Rgb(
+                style.foreground.r,
+                style.foreground.g,
+                style.foreground.b,
+            ))
+            .bg(Color::Rgb(
+                style.background.r,
+                style.background.g,
+                style.background.b,
+            ))
+            .add_modifier(modifiers)
+    }
+
     pub(in crate::app) fn hover_popover_area(
         code_area: Rect,
         anchor_x: u16,
@@ -250,4 +463,12 @@ impl WorkspaceEditorComponent {
 
         Rect::new(x, y, popup_width, popup_height)
     }
+}
+
+enum HoverBlock {
+    Text(String),
+    Code {
+        language: Option<String>,
+        text: String,
+    },
 }

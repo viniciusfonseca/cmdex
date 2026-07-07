@@ -89,6 +89,17 @@ impl WorkspaceEditorState {
             .min(self.max_vertical_scroll(viewport_height));
     }
 
+    pub fn scroll_left(&mut self, columns: u16) {
+        self.horizontal_scroll = self.horizontal_scroll.saturating_sub(columns);
+    }
+
+    pub fn scroll_right(&mut self, columns: u16, viewport_width: u16) {
+        self.horizontal_scroll = self
+            .horizontal_scroll
+            .saturating_add(columns)
+            .min(self.max_horizontal_scroll(viewport_width));
+    }
+
     pub fn set_vertical_scroll(&mut self, scroll: u16, viewport_height: u16) {
         self.vertical_scroll = scroll.min(self.max_vertical_scroll(viewport_height));
     }
@@ -720,6 +731,21 @@ impl WorkspaceEditorState {
     fn max_vertical_scroll(&self, viewport_height: u16) -> u16 {
         self.content_height()
             .saturating_sub(usize::from(viewport_height.max(1))) as u16
+    }
+
+    fn max_horizontal_scroll(&self, viewport_width: u16) -> u16 {
+        let content_width = usize::from(
+            viewport_width
+                .saturating_sub(self.gutter_width() as u16)
+                .saturating_sub(1)
+                .max(1),
+        );
+        self.lines
+            .iter()
+            .map(|line| line.chars().count())
+            .max()
+            .unwrap_or(0)
+            .saturating_sub(content_width.saturating_sub(1)) as u16
     }
 
     fn byte_index_for_char(source: &str, char_index: usize) -> usize {

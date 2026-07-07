@@ -43,7 +43,7 @@ use crate::codex::{
     CodexAppServer, HistoryEntryKind, ModelInfo, ServerEvent, ThreadInfo, ThreadItem,
     WorkspaceSession,
 };
-use crate::config::{AgentDefinition, CmdexConfig, ConfigStore};
+use crate::config::{AgentDefinition, CmdexConfig, ConfigStore, LspServerConfig};
 use crate::theme::ThemeRegistry;
 use crate::workspace::{
     DiffBrowserState, DiffSection, EditorMode, EditorPosition, FileBrowserState, GitRemoteAction,
@@ -62,7 +62,7 @@ const SPINNER: [&str; 8] = ["⠏", "⠛", "⠹", "⢸", "⣰", "⣤", "⣆", "�
 const CONTENT_SCROLL_STEP: u16 = 4;
 const MOUSE_SCROLL_STEP: u16 = 4;
 const MOUSE_SCROLL_DEBOUNCE: Duration = Duration::from_millis(20);
-const HOVER_POPOVER_DELAY: Duration = Duration::from_millis(300);
+const HOVER_POPOVER_DELAY: Duration = Duration::from_millis(200);
 const WORKSPACE_AUTO_REFRESH_INTERVAL: Duration = Duration::from_millis(750);
 const FAST_TICK_INTERVAL: Duration = Duration::from_millis(80);
 const WORKSPACE_TICK_INTERVAL: Duration = Duration::from_millis(250);
@@ -157,6 +157,12 @@ enum ScrollDirection {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScrollAxis {
+    Vertical,
+    Horizontal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScrollbarDragTarget {
     Chat,
     WorkspacePreview,
@@ -195,6 +201,12 @@ struct ShellSessionRuntime {
 
 struct LspRuntime {
     command_tx: std::sync::mpsc::Sender<lsp::LspCommand>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct LspRuntimeKey {
+    agent_index: usize,
+    server_index: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -412,6 +424,7 @@ impl AgentState {
 pub struct App {
     config_path: PathBuf,
     config: CmdexConfig,
+    lsp_servers: Vec<LspServerConfig>,
     agents: Vec<AgentState>,
     default_chat_model: Option<String>,
     default_chat_reasoning_effort: Option<String>,
@@ -425,17 +438,18 @@ pub struct App {
     status_message: Option<String>,
     should_quit: bool,
     should_restart: bool,
-    last_mouse_scroll: Option<(ScrollDirection, Instant)>,
+    last_mouse_scroll: Option<(ScrollAxis, ScrollDirection, Instant)>,
     active_scrollbar_drag: Option<ScrollbarDragTarget>,
     active_workspace_selection_drag: bool,
     last_workspace_refresh_at: Option<Instant>,
     shell_runtimes: HashMap<ShellSessionKey, ShellSessionRuntime>,
-    lsp_runtimes: HashMap<usize, LspRuntime>,
+    lsp_runtimes: HashMap<LspRuntimeKey, LspRuntime>,
     pending_workspace_hover: Option<PendingWorkspaceHover>,
 }
 
 impl App {
     fn new(config_path: PathBuf, config: CmdexConfig) -> Self {
+        let lsp_servers = config.effective_lsp_servers();
         let default_chat_model = chat::ChatSupport::load_codex_chat_model();
         let default_chat_reasoning_effort = chat::ChatSupport::load_codex_chat_reasoning_effort();
         let default_chat_model_label = chat::ChatSupport::load_codex_chat_model_label()
@@ -464,6 +478,7 @@ impl App {
         Self {
             config_path,
             config,
+            lsp_servers,
             agents,
             default_chat_model,
             default_chat_reasoning_effort,
@@ -504,6 +519,13 @@ impl App {
 
     fn add_agent_selected(&self) -> bool {
         self.current_tab == AppTab::Chat && self.chat_sidebar_index == 0
+    }
+
+    fn lsp_server_for_path(&self, path: &std::path::Path) -> Option<(usize, &LspServerConfig)> {
+        self.lsp_servers
+            .iter()
+            .enumerate()
+            .find(|(_, server)| server.matches_path(path))
     }
 }
 

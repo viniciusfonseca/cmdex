@@ -590,6 +590,9 @@ impl WorkspaceComponent {
         }) else {
             return false;
         };
+        if app.lsp_server_for_path(&path).is_none() {
+            return false;
+        }
 
         let is_same_visible_hover = app
             .active_agent()

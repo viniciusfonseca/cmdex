@@ -8,6 +8,7 @@ use super::{
     *,
 };
 use ratatui::style::Color;
+use ratatui::{Terminal, backend::TestBackend};
 use serde_json::json;
 
 #[test]
@@ -298,6 +299,7 @@ fn shell_sidebar_labels_include_new_session_action() {
             name: "Test".to_string(),
             workspace: workspace.clone(),
         }],
+        ..CmdexConfig::default()
     };
     let mut app = App::new(PathBuf::new(), config);
     app.current_tab = AppTab::Shell;
@@ -326,6 +328,7 @@ fn shell_session_exit_event_removes_session_from_sidebar() {
             name: "Test".to_string(),
             workspace: workspace.clone(),
         }],
+        ..CmdexConfig::default()
     };
     let mut app = App::new(PathBuf::new(), config);
     app.current_tab = AppTab::Shell;
@@ -648,6 +651,7 @@ fn turn_events_track_active_turn_and_interruption_status() {
             name: "Test".to_string(),
             workspace: PathBuf::from("/tmp"),
         }],
+        ..CmdexConfig::default()
     };
     let mut app = App::new(PathBuf::new(), config);
     app.current_agent = Some(0);
@@ -785,6 +789,24 @@ fn chat_and_workspace_share_same_mouse_scroll_debounce() {
 }
 
 #[test]
+fn horizontal_mouse_scroll_uses_independent_debounce_axis() {
+    let mut app = App::new(PathBuf::new(), CmdexConfig::default());
+    let now = Instant::now();
+
+    assert!(app.should_handle_mouse_scroll_at(ScrollDirection::Down, now));
+    assert!(app.should_handle_mouse_scroll_at_axis(
+        ScrollAxis::Horizontal,
+        ScrollDirection::Down,
+        now + Duration::from_millis(10)
+    ));
+    assert!(!app.should_handle_mouse_scroll_at_axis(
+        ScrollAxis::Horizontal,
+        ScrollDirection::Down,
+        now + Duration::from_millis(15)
+    ));
+}
+
+#[test]
 fn vertical_scrollbar_track_stays_inside_container_border() {
     let area = Rect::new(10, 5, 20, 8);
     let metrics = UiSupport::vertical_scrollbar_metrics(area, 32).expect("scrollbar metrics");
@@ -868,6 +890,7 @@ fn workspace_tree_refreshes_on_tick_after_filesystem_changes() {
             name: "Test".to_string(),
             workspace: root.clone(),
         }],
+        ..CmdexConfig::default()
     };
     let mut app = App::new(PathBuf::new(), config);
     app.current_tab = AppTab::Workspace;
@@ -915,6 +938,7 @@ fn workspace_arrow_keys_move_editor_cursor_when_editor_is_focused() {
             name: "Test".to_string(),
             workspace: root.clone(),
         }],
+        ..CmdexConfig::default()
     };
     let mut app = App::new(PathBuf::new(), config);
     app.current_tab = AppTab::Workspace;
@@ -964,6 +988,7 @@ fn workspace_hover_waits_for_stationary_cursor_before_requesting_lsp() {
             name: "Test".to_string(),
             workspace: root.clone(),
         }],
+        ..CmdexConfig::default()
     };
     let mut app = App::new(PathBuf::new(), config);
     app.current_tab = AppTab::Workspace;
@@ -1091,6 +1116,7 @@ fn workspace_arrow_keys_move_sidebar_selection_when_sidebar_is_focused() {
             name: "Test".to_string(),
             workspace: root.clone(),
         }],
+        ..CmdexConfig::default()
     };
     let mut app = App::new(PathBuf::new(), config);
     app.current_tab = AppTab::Workspace;
@@ -1146,6 +1172,7 @@ fn workspace_u_shortcut_undoes_editor_changes() {
             name: "Test".to_string(),
             workspace: root.clone(),
         }],
+        ..CmdexConfig::default()
     };
     let mut app = App::new(PathBuf::new(), config);
     app.current_tab = AppTab::Workspace;
@@ -1205,6 +1232,7 @@ fn workspace_search_only_captures_text_when_sidebar_is_focused() {
             name: "Test".to_string(),
             workspace: root.clone(),
         }],
+        ..CmdexConfig::default()
     };
     let mut app = App::new(PathBuf::new(), config);
     app.current_tab = AppTab::Workspace;
@@ -1251,6 +1279,7 @@ fn workspace_mouse_drag_selects_text_in_editor() {
             name: "Test".to_string(),
             workspace: root.clone(),
         }],
+        ..CmdexConfig::default()
     };
     let mut app = App::new(PathBuf::new(), config);
     app.current_tab = AppTab::Workspace;
@@ -1350,6 +1379,7 @@ fn workspace_mouse_click_clears_existing_selection() {
             name: "Test".to_string(),
             workspace: root.clone(),
         }],
+        ..CmdexConfig::default()
     };
     let mut app = App::new(PathBuf::new(), config);
     app.current_tab = AppTab::Workspace;
@@ -1420,6 +1450,82 @@ fn workspace_mouse_click_clears_existing_selection() {
 }
 
 #[test]
+fn workspace_shift_scroll_moves_editor_horizontally() {
+    let root = std::env::temp_dir().join(format!(
+        "cmdex-app-workspace-shift-scroll-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let alpha = root.join("alpha.txt");
+    fs::write(
+        &alpha,
+        "0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz\n",
+    )
+    .unwrap();
+
+    let config = CmdexConfig {
+        agents: vec![AgentDefinition {
+            name: "Test".to_string(),
+            workspace: root.clone(),
+        }],
+        ..CmdexConfig::default()
+    };
+    let mut app = App::new(PathBuf::new(), config);
+    app.current_tab = AppTab::Workspace;
+    app.current_agent = Some(0);
+    app.chat_sidebar_index = 1;
+    TopNavigationComponent::refresh_current_tab(&mut app);
+
+    {
+        let workspace = &mut app.active_agent_mut().unwrap().workspace;
+        workspace.select(0);
+        workspace.open_editor().unwrap();
+    }
+
+    let area = Rect::new(0, 0, 40, 20);
+    let layout = app.compute_layout(area);
+    let viewport = WorkspaceEditorComponent::viewport(layout.body);
+    let gutter_width = app
+        .active_agent()
+        .unwrap()
+        .workspace
+        .editor
+        .as_ref()
+        .unwrap()
+        .gutter_width() as u16;
+    let column = viewport.x + gutter_width;
+    let row = viewport.y;
+    let (ui_tx, _ui_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    app.handle_mouse(
+        MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column,
+            row,
+            modifiers: KeyModifiers::SHIFT,
+        },
+        area,
+        &ui_tx,
+    );
+
+    let editor = app
+        .active_agent()
+        .unwrap()
+        .workspace
+        .editor
+        .as_ref()
+        .unwrap();
+    assert_eq!(editor.vertical_scroll, 0);
+    assert!(editor.horizontal_scroll > 0);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn lsp_hover_parses_marked_string_objects() {
     let hover = json!({
         "contents": {
@@ -1430,7 +1536,7 @@ fn lsp_hover_parses_marked_string_objects() {
 
     assert_eq!(
         super::lsp::parse_hover_response(&hover).as_deref(),
-        Some("rust\nfn greet()")
+        Some("```rust\nfn greet()\n```")
     );
 }
 
@@ -1455,7 +1561,7 @@ fn lsp_hover_summary_preserves_line_breaks_and_strips_code_fences() {
 
     assert_eq!(
         super::lsp::summarize_hover_text(hover).as_deref(),
-        Some("fn greet()\n\nReturns a greeting")
+        Some("```rust\nfn greet()\n```\n\nReturns a greeting")
     );
 }
 
@@ -1515,9 +1621,143 @@ fn workspace_editor_hover_popover_stays_inside_viewport() {
     assert_eq!(popup, Rect::new(28, 10, 20, 6));
 }
 
+#[test]
+fn workspace_editor_hover_popover_preserves_syntax_highlighting() {
+    let root = std::env::temp_dir().join(format!(
+        "cmdex-hover-popover-highlight-{}-{}.rs",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::write(&root, "let placeholder = 1;\n").unwrap();
+    let mut editor = WorkspaceEditorState::open(&root).unwrap();
+    let hover = "```rust\nfn greet(name: &str) -> String\n```";
+    let position = EditorPosition { row: 0, col: 3 };
+    assert!(editor.request_hover(position));
+    assert!(editor.resolve_hover(position, Some(hover.to_string())));
+
+    let backend = TestBackend::new(80, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            WorkspaceEditorComponent::draw(frame, &editor, Rect::new(0, 0, 80, 20), true);
+        })
+        .unwrap();
+
+    let buffer = terminal.backend().buffer();
+    let found_highlighted_cell =
+        buffer_contains_highlighted_text(buffer, "fn greet", ThemeRegistry::app().foreground);
+
+    assert!(found_highlighted_cell);
+
+    let _ = fs::remove_file(root);
+}
+
+#[test]
+fn workspace_editor_hover_popover_uses_editor_syntax_for_unlabeled_code_blocks() {
+    let root = std::env::temp_dir().join(format!(
+        "cmdex-hover-popover-unlabeled-{}-{}.rs",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::write(&root, "let placeholder = 1;\n").unwrap();
+    let mut editor = WorkspaceEditorState::open(&root).unwrap();
+    let hover = "```\nfn greet(name: &str) -> String\n```";
+    let position = EditorPosition { row: 0, col: 3 };
+    assert!(editor.request_hover(position));
+    assert!(editor.resolve_hover(position, Some(hover.to_string())));
+
+    let backend = TestBackend::new(80, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            WorkspaceEditorComponent::draw(frame, &editor, Rect::new(0, 0, 80, 20), true);
+        })
+        .unwrap();
+
+    let buffer = terminal.backend().buffer();
+    let found_highlighted_cell =
+        buffer_contains_highlighted_text(buffer, "fn greet", ThemeRegistry::app().foreground);
+
+    assert!(found_highlighted_cell);
+
+    let _ = fs::remove_file(root);
+}
+
+#[test]
+fn workspace_editor_hover_popover_prioritizes_editor_file_extension() {
+    let root = std::env::temp_dir().join(format!(
+        "cmdex-hover-popover-extension-priority-{}-{}.rs",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::write(&root, "let placeholder = 1;\n").unwrap();
+    let mut editor = WorkspaceEditorState::open(&root).unwrap();
+    let hover = "```typescript\nfn greet(name: &str) -> String\n```";
+    let position = EditorPosition { row: 0, col: 3 };
+    assert!(editor.request_hover(position));
+    assert!(editor.resolve_hover(position, Some(hover.to_string())));
+
+    let backend = TestBackend::new(80, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            WorkspaceEditorComponent::draw(frame, &editor, Rect::new(0, 0, 80, 20), true);
+        })
+        .unwrap();
+
+    let buffer = terminal.backend().buffer();
+    let keyword_color = ThemeRegistry::app().accent;
+    let keyword_cell = buffer_cell_for_text(buffer, "fn greet").expect("hover text should render");
+
+    assert_eq!(keyword_cell.fg, keyword_color);
+
+    let _ = fs::remove_file(root);
+}
+
 fn line_text(line: &Line<'_>) -> String {
     line.spans
         .iter()
         .map(|span| span.content.as_ref())
         .collect::<String>()
+}
+
+fn buffer_contains_highlighted_text(
+    buffer: &ratatui::buffer::Buffer,
+    needle: &str,
+    default_fg: Color,
+) -> bool {
+    buffer_cell_for_text(buffer, needle).is_some_and(|cell| cell.fg != default_fg)
+}
+
+fn buffer_cell_for_text<'a>(
+    buffer: &'a ratatui::buffer::Buffer,
+    needle: &str,
+) -> Option<&'a ratatui::buffer::Cell> {
+    let needle = needle.chars().collect::<Vec<_>>();
+    for y in 0..buffer.area.height {
+        let mut row = Vec::with_capacity(buffer.area.width as usize);
+        for x in 0..buffer.area.width {
+            row.push(buffer[(x, y)].symbol().chars().next().unwrap_or(' '));
+        }
+
+        let Some(start) = row
+            .windows(needle.len())
+            .position(|window| window == needle.as_slice())
+        else {
+            continue;
+        };
+
+        return Some(&buffer[(start as u16, y)]);
+    }
+
+    None
 }

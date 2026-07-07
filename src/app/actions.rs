@@ -223,13 +223,17 @@ impl App {
             MouseEventKind::Moved if !self.active_workspace_selection_drag => {
                 self.handle_mouse_move(mouse.column, mouse.row, layout)
             }
-            MouseEventKind::ScrollUp if self.should_handle_mouse_scroll(ScrollDirection::Up) => {
-                self.handle_scroll(mouse.column, mouse.row, layout, true)
+            MouseEventKind::ScrollUp => {
+                let horizontal = mouse.modifiers.contains(KeyModifiers::SHIFT);
+                if self.should_handle_mouse_scroll(ScrollDirection::Up, horizontal) {
+                    self.handle_scroll(mouse.column, mouse.row, layout, true, horizontal);
+                }
             }
-            MouseEventKind::ScrollDown
-                if self.should_handle_mouse_scroll(ScrollDirection::Down) =>
-            {
-                self.handle_scroll(mouse.column, mouse.row, layout, false)
+            MouseEventKind::ScrollDown => {
+                let horizontal = mouse.modifiers.contains(KeyModifiers::SHIFT);
+                if self.should_handle_mouse_scroll(ScrollDirection::Down, horizontal) {
+                    self.handle_scroll(mouse.column, mouse.row, layout, false, horizontal);
+                }
             }
             _ => {}
         }
@@ -395,8 +399,13 @@ impl App {
         }
     }
 
-    fn should_handle_mouse_scroll(&mut self, direction: ScrollDirection) -> bool {
-        self.should_handle_mouse_scroll_at(direction, Instant::now())
+    fn should_handle_mouse_scroll(&mut self, direction: ScrollDirection, horizontal: bool) -> bool {
+        let axis = if horizontal {
+            ScrollAxis::Horizontal
+        } else {
+            ScrollAxis::Vertical
+        };
+        self.should_handle_mouse_scroll_at_axis(axis, direction, Instant::now())
     }
 
     pub(super) fn should_handle_mouse_scroll_at(
@@ -404,10 +413,20 @@ impl App {
         direction: ScrollDirection,
         now: Instant,
     ) -> bool {
+        self.should_handle_mouse_scroll_at_axis(ScrollAxis::Vertical, direction, now)
+    }
+
+    pub(super) fn should_handle_mouse_scroll_at_axis(
+        &mut self,
+        axis: ScrollAxis,
+        direction: ScrollDirection,
+        now: Instant,
+    ) -> bool {
         if self
             .last_mouse_scroll
-            .is_some_and(|(last_direction, last_at)| {
-                last_direction == direction
+            .is_some_and(|(last_axis, last_direction, last_at)| {
+                last_axis == axis
+                    && last_direction == direction
                     && now
                         .checked_duration_since(last_at)
                         .is_some_and(|elapsed| elapsed < MOUSE_SCROLL_DEBOUNCE)
@@ -416,7 +435,7 @@ impl App {
             return false;
         }
 
-        self.last_mouse_scroll = Some((direction, now));
+        self.last_mouse_scroll = Some((axis, direction, now));
         true
     }
 
@@ -1119,21 +1138,40 @@ impl App {
     fn lsp_command_tx(
         &mut self,
         agent_index: usize,
+        server_index: usize,
         ui_tx: &mpsc::UnboundedSender<UiEvent>,
     ) -> anyhow::Result<std::sync::mpsc::Sender<lsp::LspCommand>> {
-        if let Some(runtime) = self.lsp_runtimes.get(&agent_index) {
+        let key = LspRuntimeKey {
+            agent_index,
+            server_index,
+        };
+        if let Some(runtime) = self.lsp_runtimes.get(&key) {
             return Ok(runtime.command_tx.clone());
         }
 
         let workspace_root = self.agents[agent_index].definition.workspace.clone();
-        let command_tx = lsp::LspRuntimeFactory::spawn(&workspace_root, ui_tx.clone())?;
+        let server = self.lsp_servers[server_index].clone();
+        let command_tx = lsp::LspRuntimeFactory::spawn(&workspace_root, server, ui_tx.clone())?;
         self.lsp_runtimes.insert(
-            agent_index,
+            key,
             LspRuntime {
                 command_tx: command_tx.clone(),
             },
         );
         Ok(command_tx)
+    }
+
+    fn lsp_server_index_for_path(&self, path: &std::path::Path) -> Option<usize> {
+        self.lsp_server_for_path(path)
+            .map(|(server_index, _)| server_index)
+    }
+
+    fn lsp_server_error_for_path(&self, path: &std::path::Path) -> String {
+        if let Some(extension) = path.extension().and_then(|extension| extension.to_str()) {
+            format!("No LSP server configured for .{} files.", extension)
+        } else {
+            "No LSP server configured for files without extension.".to_string()
+        }
     }
 
     pub(super) fn request_lsp_hover(
@@ -1144,7 +1182,12 @@ impl App {
         position: EditorPosition,
         ui_tx: &mpsc::UnboundedSender<UiEvent>,
     ) {
-        let command_tx = match self.lsp_command_tx(agent_index, ui_tx) {
+        let Some(server_index) = self.lsp_server_index_for_path(&path) else {
+            return;
+        };
+        let server_name = self.lsp_servers[server_index].name.clone();
+
+        let command_tx = match self.lsp_command_tx(agent_index, server_index, ui_tx) {
             Ok(command_tx) => command_tx,
             Err(error) => {
                 if let Some(agent) = self.agents.get_mut(agent_index) {
@@ -1165,11 +1208,14 @@ impl App {
             })
             .is_err()
         {
-            self.lsp_runtimes.remove(&agent_index);
+            self.lsp_runtimes.remove(&LspRuntimeKey {
+                agent_index,
+                server_index,
+            });
             if let Some(agent) = self.agents.get_mut(agent_index) {
                 if let Some(editor) = agent.workspace.editor.as_mut() {
                     editor.status =
-                        Some("Failed to send hover request to rust-analyzer".to_string());
+                        Some(format!("Failed to send hover request to {}", server_name));
                 }
             }
         }
@@ -1183,7 +1229,18 @@ impl App {
         position: EditorPosition,
         ui_tx: &mpsc::UnboundedSender<UiEvent>,
     ) {
-        let command_tx = match self.lsp_command_tx(agent_index, ui_tx) {
+        let Some(server_index) = self.lsp_server_index_for_path(&path) else {
+            let error_message = self.lsp_server_error_for_path(&path);
+            if let Some(agent) = self.agents.get_mut(agent_index) {
+                if let Some(editor) = agent.workspace.editor.as_mut() {
+                    editor.status = Some(error_message);
+                }
+            }
+            return;
+        };
+        let server_name = self.lsp_servers[server_index].name.clone();
+
+        let command_tx = match self.lsp_command_tx(agent_index, server_index, ui_tx) {
             Ok(command_tx) => command_tx,
             Err(error) => {
                 if let Some(agent) = self.agents.get_mut(agent_index) {
@@ -1204,11 +1261,16 @@ impl App {
             })
             .is_err()
         {
-            self.lsp_runtimes.remove(&agent_index);
+            self.lsp_runtimes.remove(&LspRuntimeKey {
+                agent_index,
+                server_index,
+            });
             if let Some(agent) = self.agents.get_mut(agent_index) {
                 if let Some(editor) = agent.workspace.editor.as_mut() {
-                    editor.status =
-                        Some("Failed to send definition request to rust-analyzer".to_string());
+                    editor.status = Some(format!(
+                        "Failed to send definition request to {}",
+                        server_name
+                    ));
                 }
             }
         }
@@ -1358,7 +1420,14 @@ impl App {
         }
     }
 
-    fn handle_scroll(&mut self, column: u16, row: u16, layout: UiLayout, up: bool) {
+    fn handle_scroll(
+        &mut self,
+        column: u16,
+        row: u16,
+        layout: UiLayout,
+        up: bool,
+        horizontal: bool,
+    ) {
         if UiSupport::rect_contains(layout.sidebar_list, column, row) {
             if up {
                 self.move_selection_up();
@@ -1373,6 +1442,26 @@ impl App {
                 .footer
                 .is_some_and(|rect| UiSupport::rect_contains(rect, column, row))
         {
+            if horizontal
+                && self.current_tab == AppTab::Workspace
+                && self
+                    .active_agent()
+                    .is_some_and(|agent| agent.workspace.editor.is_some())
+            {
+                self.clear_workspace_hover();
+                if let Some(agent) = self.active_agent_mut() {
+                    if let Some(editor) = agent.workspace.editor.as_mut() {
+                        let viewport = WorkspaceEditorComponent::viewport(layout.body);
+                        if up {
+                            editor.scroll_left(MOUSE_SCROLL_STEP);
+                        } else {
+                            editor.scroll_right(MOUSE_SCROLL_STEP, viewport.width);
+                        }
+                        return;
+                    }
+                }
+            }
+
             if self.current_tab == AppTab::Chat && !self.add_agent_selected() {
                 if up {
                     self.scroll_chat_up(layout.body, MOUSE_SCROLL_STEP);

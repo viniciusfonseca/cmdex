@@ -14,6 +14,7 @@ use tokio::sync::mpsc;
 use url::Url;
 
 use super::{EditorPosition, UiEvent};
+use crate::config::LspServerConfig;
 
 pub(super) struct LspRuntimeFactory;
 
@@ -48,6 +49,7 @@ pub(super) struct DefinitionTarget {
 
 struct LspSession {
     workspace_root: PathBuf,
+    server: LspServerConfig,
     child: Option<Child>,
     stdin: Option<BufWriter<ChildStdin>>,
     stdout: Option<BufReader<ChildStdout>>,
@@ -58,6 +60,7 @@ struct LspSession {
 impl LspRuntimeFactory {
     pub(super) fn spawn(
         workspace_root: &Path,
+        server: LspServerConfig,
         ui_tx: mpsc::UnboundedSender<UiEvent>,
     ) -> Result<std_mpsc::Sender<LspCommand>> {
         let workspace_root = workspace_root.to_path_buf();
@@ -65,14 +68,15 @@ impl LspRuntimeFactory {
 
         thread::Builder::new()
             .name(format!(
-                "cmdex-lsp-{}",
+                "cmdex-lsp-{}-{}",
+                server.name.clone(),
                 workspace_root
                     .file_name()
                     .and_then(|name| name.to_str())
                     .unwrap_or("workspace")
             ))
             .spawn(move || {
-                let mut session = LspSession::new(workspace_root);
+                let mut session = LspSession::new(workspace_root, server);
 
                 while let Ok(command) = command_rx.recv() {
                     match command {
@@ -139,9 +143,10 @@ impl LspRuntimeFactory {
 }
 
 impl LspSession {
-    fn new(workspace_root: PathBuf) -> Self {
+    fn new(workspace_root: PathBuf, server: LspServerConfig) -> Self {
         Self {
             workspace_root,
+            server,
             child: None,
             stdin: None,
             stdout: None,
@@ -194,7 +199,6 @@ impl LspSession {
 
     fn ensure_document_synced(&mut self, path: &Path, source: &str) -> Result<()> {
         self.ensure_started()?;
-        let language_id = language_id_for_path(path)?;
         let uri = file_uri(path)?;
 
         if let Some((version, changed)) = self
@@ -228,7 +232,7 @@ impl LspSession {
             json!({
                 "textDocument": {
                     "uri": uri,
-                    "languageId": language_id,
+                    "languageId": self.server.language_id.clone(),
                     "version": 1,
                     "text": source,
                 }
@@ -249,23 +253,32 @@ impl LspSession {
             return Ok(());
         }
 
-        let binary = resolve_rust_analyzer_binary()?;
-        let mut child = Command::new(&binary)
+        let command = resolve_command_path(&self.server.command)?;
+        let mut process = Command::new(&command);
+        process
             .current_dir(&self.workspace_root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .with_context(|| format!("failed to start rust-analyzer from {}", binary.display()))?;
+            .stderr(Stdio::null());
+        process.args(&self.server.args);
+        process.envs(self.server.env.iter());
+
+        let mut child = process.spawn().with_context(|| {
+            format!(
+                "failed to start LSP server '{}' from {}",
+                self.server.name,
+                command.display()
+            )
+        })?;
 
         let stdin = child
             .stdin
             .take()
-            .context("failed to open rust-analyzer stdin")?;
+            .with_context(|| format!("failed to open {} stdin", self.server.name))?;
         let stdout = child
             .stdout
             .take()
-            .context("failed to open rust-analyzer stdout")?;
+            .with_context(|| format!("failed to open {} stdout", self.server.name))?;
 
         self.stdin = Some(BufWriter::new(stdin));
         self.stdout = Some(BufReader::new(stdout));
@@ -328,7 +341,7 @@ impl LspSession {
         let stdin = self
             .stdin
             .as_mut()
-            .context("rust-analyzer stdin is unavailable")?;
+            .with_context(|| format!("{} stdin is unavailable", self.server.name))?;
         let body = serde_json::to_vec(payload)?;
         write!(stdin, "Content-Length: {}\r\n\r\n", body.len())?;
         stdin.write_all(&body)?;
@@ -340,14 +353,14 @@ impl LspSession {
         let stdout = self
             .stdout
             .as_mut()
-            .context("rust-analyzer stdout is unavailable")?;
+            .with_context(|| format!("{} stdout is unavailable", self.server.name))?;
         let mut content_length = None;
 
         loop {
             let mut header = String::new();
             let bytes = stdout.read_line(&mut header)?;
             if bytes == 0 {
-                return Err(anyhow!("rust-analyzer closed the LSP stream"));
+                return Err(anyhow!("{} closed the LSP stream", self.server.name));
             }
 
             if header == "\r\n" || header == "\n" {
@@ -392,44 +405,26 @@ impl LspSession {
     }
 }
 
-fn resolve_rust_analyzer_binary() -> Result<PathBuf> {
-    if let Some(path) = env::var_os("CMDEX_RUST_ANALYZER").or_else(|| env::var_os("RUST_ANALYZER"))
-    {
-        return Ok(PathBuf::from(path));
+fn resolve_command_path(command: &str) -> Result<PathBuf> {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("LSP command cannot be empty"));
     }
 
-    if Command::new("rust-analyzer")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
-    {
-        return Ok(PathBuf::from("rust-analyzer"));
+    if trimmed == "~" {
+        return env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow!("HOME is not set"));
     }
 
-    if let Ok(output) = Command::new("rustup")
-        .args(["which", "rust-analyzer"])
-        .output()
-    {
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty() {
-                return Ok(PathBuf::from(path));
-            }
-        }
+    if let Some(rest) = trimmed.strip_prefix("~/") {
+        return env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| home.join(rest))
+            .ok_or_else(|| anyhow!("HOME is not set"));
     }
 
-    Err(anyhow!(
-        "rust-analyzer is not available. Install it with `rustup component add rust-analyzer` or set CMDEX_RUST_ANALYZER."
-    ))
-}
-
-fn language_id_for_path(path: &Path) -> Result<&'static str> {
-    match path.extension().and_then(|extension| extension.to_str()) {
-        Some("rs") => Ok("rust"),
-        _ => Err(anyhow!("LSP is available only for Rust files.")),
-    }
+    Ok(PathBuf::from(trimmed))
 }
 
 fn file_uri(path: &Path) -> Result<String> {
@@ -441,13 +436,24 @@ fn file_uri(path: &Path) -> Result<String> {
 pub(super) fn summarize_hover_text(text: &str) -> Option<String> {
     let mut lines = Vec::new();
     let mut previous_blank = false;
+    let mut inside_code_fence = false;
 
     for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("```") {
+        let trimmed_start = line.trim_start();
+        if trimmed_start.starts_with("```") {
+            lines.push(trimmed_start.trim().to_string());
+            inside_code_fence = !inside_code_fence;
+            previous_blank = false;
             continue;
         }
 
+        if inside_code_fence {
+            lines.push(line.trim_end().to_string());
+            previous_blank = false;
+            continue;
+        }
+
+        let trimmed = line.trim();
         if trimmed.is_empty() {
             if !previous_blank && !lines.is_empty() {
                 lines.push(String::new());
@@ -513,7 +519,14 @@ fn hover_value_to_text(value: &Value) -> Option<String> {
             .get("language")
             .and_then(Value::as_str)
             .zip(map.get("value").and_then(Value::as_str))
-            .map(|(language, value)| format!("{language}\n{value}"))
+            .map(|(language, value)| {
+                let language = language.trim();
+                if language.is_empty() {
+                    format!("```\n{value}\n```")
+                } else {
+                    format!("```{language}\n{value}\n```")
+                }
+            })
             .or_else(|| map.get("value").and_then(Value::as_str).map(str::to_string)),
         _ => None,
     }
