@@ -184,6 +184,7 @@ impl WorkspaceComponent {
 
                 if handled {
                     if let Some(editor) = workspace.editor.as_mut() {
+                        editor.clear_hover();
                         editor.ensure_visible(viewport.width, viewport.height);
                     }
                 }
@@ -489,6 +490,7 @@ impl WorkspaceComponent {
 
             if handled {
                 if let Some(editor) = workspace.editor.as_mut() {
+                    editor.clear_hover();
                     editor.ensure_visible(viewport.width, viewport.height);
                 }
             }
@@ -529,6 +531,7 @@ impl WorkspaceComponent {
         let Some(editor) = agent.workspace.editor.as_mut() else {
             return false;
         };
+        editor.clear_hover();
         editor.mode = EditorMode::Normal;
         editor.set_cursor(target.row, target.col);
         let viewport = WorkspaceEditorComponent::viewport(area);
@@ -557,9 +560,76 @@ impl WorkspaceComponent {
         let Some(editor) = agent.workspace.editor.as_mut() else {
             return false;
         };
+        editor.clear_hover();
         editor.select_to(target.row, target.col);
         let viewport = WorkspaceEditorComponent::viewport(area);
         editor.ensure_visible(viewport.width, viewport.height);
+        true
+    }
+
+    pub(in crate::app) fn handle_editor_hover(
+        app: &mut App,
+        column: u16,
+        row: u16,
+        area: Rect,
+    ) -> bool {
+        let Some(agent_index) = app.current_agent else {
+            return false;
+        };
+
+        let Some((path, target, already_requested)) = ({
+            let agent = &mut app.agents[agent_index];
+            let Some(editor) = agent.workspace.editor.as_mut() else {
+                return false;
+            };
+            let Some(target) = Self::editor_symbol_position(editor, column, row, area) else {
+                return false;
+            };
+            let already_requested = editor.hover_request_position() == Some(target);
+            Some((editor.path.clone(), target, already_requested))
+        }) else {
+            return false;
+        };
+
+        let is_same_visible_hover = app
+            .active_agent()
+            .and_then(|agent| agent.workspace.editor.as_ref())
+            .and_then(|editor| editor.hover_popover())
+            .is_some_and(|(_, position)| position == target);
+        if already_requested || is_same_visible_hover {
+            return true;
+        }
+
+        app.set_pending_workspace_hover(agent_index, column, row, path, target);
+        true
+    }
+
+    pub(in crate::app) fn handle_editor_definition_click(
+        app: &mut App,
+        column: u16,
+        row: u16,
+        area: Rect,
+        ui_tx: &mpsc::UnboundedSender<UiEvent>,
+    ) -> bool {
+        let Some(agent_index) = app.current_agent else {
+            return false;
+        };
+
+        let Some((path, source, target)) = ({
+            let agent = &mut app.agents[agent_index];
+            agent.workspace.focus_editor();
+            let Some(editor) = agent.workspace.editor.as_ref() else {
+                return false;
+            };
+            let Some(target) = Self::editor_symbol_position(editor, column, row, area) else {
+                return false;
+            };
+            Some((editor.path.clone(), editor.source_text(), target))
+        }) else {
+            return false;
+        };
+
+        app.request_lsp_definition(agent_index, path, source, target, ui_tx);
         true
     }
 
@@ -603,6 +673,16 @@ impl WorkspaceComponent {
             row: target_row,
             col: target_col,
         })
+    }
+
+    fn editor_symbol_position(
+        editor: &WorkspaceEditorState,
+        column: u16,
+        row: u16,
+        area: Rect,
+    ) -> Option<EditorPosition> {
+        let target = Self::editor_position_at(editor, column, row, area, false)?;
+        editor.symbol_position_near(target.row, target.col)
     }
 
     fn copy_editor(editor: &mut WorkspaceEditorState) {

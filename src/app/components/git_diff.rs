@@ -350,7 +350,8 @@ impl GitDiffComponent {
     ) -> Vec<Line<'static>> {
         let width = usize::from(width.max(1));
 
-        lines.iter()
+        lines
+            .iter()
             .cloned()
             .map(|mut line| {
                 let Some(background) = line.style.bg else {

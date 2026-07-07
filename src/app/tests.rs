@@ -8,6 +8,7 @@ use super::{
     *,
 };
 use ratatui::style::Color;
+use serde_json::json;
 
 #[test]
 fn wrapped_text_height_matches_paragraph_word_wrapping() {
@@ -878,7 +879,8 @@ fn workspace_tree_refreshes_on_tick_after_filesystem_changes() {
     app.last_workspace_refresh_at =
         Some(Instant::now() - WORKSPACE_AUTO_REFRESH_INTERVAL - Duration::from_millis(1));
 
-    app.on_tick();
+    let (ui_tx, _ui_rx) = tokio::sync::mpsc::unbounded_channel();
+    app.on_tick(&ui_tx);
 
     assert!(
         app.active_agent()
@@ -940,6 +942,131 @@ fn workspace_arrow_keys_move_editor_cursor_when_editor_is_focused() {
     assert_eq!(workspace.editor.as_ref().unwrap().path, alpha);
     assert_eq!(workspace.editor.as_ref().unwrap().cursor_row, 1);
 
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn workspace_hover_waits_for_stationary_cursor_before_requesting_lsp() {
+    let root = std::env::temp_dir().join(format!(
+        "cmdex-app-workspace-hover-delay-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let file = root.join("main.rs");
+    fs::write(&file, "greet();\n").unwrap();
+
+    let config = CmdexConfig {
+        agents: vec![AgentDefinition {
+            name: "Test".to_string(),
+            workspace: root.clone(),
+        }],
+    };
+    let mut app = App::new(PathBuf::new(), config);
+    app.current_tab = AppTab::Workspace;
+    app.current_agent = Some(0);
+    app.chat_sidebar_index = 1;
+    TopNavigationComponent::refresh_current_tab(&mut app);
+
+    {
+        let workspace = &mut app.active_agent_mut().unwrap().workspace;
+        workspace.select(0);
+        workspace.open_editor().unwrap();
+    }
+
+    let area = Rect::new(0, 0, 120, 40);
+    let layout = app.compute_layout(area);
+    let viewport = WorkspaceEditorComponent::viewport(layout.body);
+    let gutter_width = app
+        .active_agent()
+        .unwrap()
+        .workspace
+        .editor
+        .as_ref()
+        .unwrap()
+        .gutter_width() as u16;
+    let column = viewport.x + gutter_width;
+    let row = viewport.y;
+    let (ui_tx, _ui_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    app.handle_mouse(
+        MouseEvent {
+            kind: MouseEventKind::Moved,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+        area,
+        &ui_tx,
+    );
+
+    let first_started_at = app
+        .pending_workspace_hover
+        .as_ref()
+        .expect("pending hover")
+        .started_at;
+    assert_eq!(
+        app.active_agent()
+            .unwrap()
+            .workspace
+            .editor
+            .as_ref()
+            .unwrap()
+            .hover_request_position(),
+        None
+    );
+
+    app.handle_mouse(
+        MouseEvent {
+            kind: MouseEventKind::Moved,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+        area,
+        &ui_tx,
+    );
+
+    assert_eq!(
+        app.pending_workspace_hover
+            .as_ref()
+            .expect("pending hover")
+            .started_at,
+        first_started_at
+    );
+    assert!(!app.on_tick(&ui_tx));
+    assert_eq!(
+        app.active_agent()
+            .unwrap()
+            .workspace
+            .editor
+            .as_ref()
+            .unwrap()
+            .hover_request_position(),
+        None
+    );
+
+    app.pending_workspace_hover
+        .as_mut()
+        .expect("pending hover")
+        .started_at = Instant::now() - HOVER_POPOVER_DELAY - Duration::from_millis(1);
+
+    assert!(app.on_tick(&ui_tx));
+    assert_eq!(
+        app.active_agent()
+            .unwrap()
+            .workspace
+            .editor
+            .as_ref()
+            .unwrap()
+            .hover_request_position(),
+        Some(EditorPosition { row: 0, col: 0 })
+    );
+
+    app.shutdown_lsp_sessions();
     let _ = fs::remove_dir_all(root);
 }
 
@@ -1290,6 +1417,102 @@ fn workspace_mouse_click_clears_existing_selection() {
     assert_eq!(editor.cursor_col, 3);
 
     let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn lsp_hover_parses_marked_string_objects() {
+    let hover = json!({
+        "contents": {
+            "language": "rust",
+            "value": "fn greet()"
+        }
+    });
+
+    assert_eq!(
+        super::lsp::parse_hover_response(&hover).as_deref(),
+        Some("rust\nfn greet()")
+    );
+}
+
+#[test]
+fn lsp_hover_parses_hover_arrays() {
+    let hover = json!({
+        "contents": [
+            { "value": "fn greet()" },
+            "Returns a greeting"
+        ]
+    });
+
+    assert_eq!(
+        super::lsp::parse_hover_response(&hover).as_deref(),
+        Some("fn greet()\n\nReturns a greeting")
+    );
+}
+
+#[test]
+fn lsp_hover_summary_preserves_line_breaks_and_strips_code_fences() {
+    let hover = "```rust\nfn greet()\n```\n\nReturns a greeting";
+
+    assert_eq!(
+        super::lsp::summarize_hover_text(hover).as_deref(),
+        Some("fn greet()\n\nReturns a greeting")
+    );
+}
+
+#[test]
+fn lsp_utf16_columns_round_trip_through_unicode_text() {
+    let source = "a😀b\n";
+    let position = EditorPosition { row: 0, col: 2 };
+
+    let utf16 = super::lsp::utf16_column(source, position);
+
+    assert_eq!(utf16, 3);
+    assert_eq!(super::lsp::char_column_from_utf16(source, 0, utf16), 2);
+}
+
+#[test]
+fn lsp_definition_parser_converts_utf16_offsets_into_editor_columns() {
+    let path = std::env::temp_dir().join(format!(
+        "cmdex-lsp-definition-{}-{}.rs",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::write(&path, "a😀b\n").unwrap();
+
+    let response = json!([{
+        "uri": url::Url::from_file_path(&path).unwrap().to_string(),
+        "range": {
+            "start": {
+                "line": 0,
+                "character": 3
+            },
+            "end": {
+                "line": 0,
+                "character": 4
+            }
+        }
+    }]);
+
+    let target = super::lsp::parse_definition_response(&response)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(target.path, path);
+    assert_eq!(target.position, EditorPosition { row: 0, col: 2 });
+
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn workspace_editor_hover_popover_stays_inside_viewport() {
+    let code_area = Rect::new(10, 5, 40, 12);
+
+    let popup = WorkspaceEditorComponent::hover_popover_area(code_area, 47, 15, 20, 6);
+
+    assert_eq!(popup, Rect::new(28, 10, 20, 6));
 }
 
 fn line_text(line: &Line<'_>) -> String {

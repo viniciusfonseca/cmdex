@@ -165,10 +165,12 @@ pub struct WorkspaceEditorState {
     pub command: String,
     pub dirty: bool,
     pub status: Option<String>,
+    pub hover: Option<String>,
     saved_lines: Vec<String>,
     undo_stack: Vec<EditorUndoState>,
     preferred_col: usize,
     selection_anchor: Option<EditorPosition>,
+    hover_request: Option<EditorPosition>,
     render_cache: EditorRenderCache,
 }
 

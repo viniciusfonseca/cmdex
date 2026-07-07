@@ -33,9 +33,11 @@ impl WorkspaceEditorState {
             command: String::new(),
             dirty: false,
             status: None,
+            hover: None,
             undo_stack: Vec::new(),
             preferred_col: 0,
             selection_anchor: None,
+            hover_request: None,
             render_cache: EditorRenderCache::default(),
         };
         editor.rebuild_render_cache();
@@ -363,6 +365,10 @@ impl WorkspaceEditorState {
             .unwrap_or_else(|| self.lines.get(self.cursor_row).cloned().unwrap_or_default())
     }
 
+    pub fn source_text(&self) -> String {
+        self.lines.join("\n")
+    }
+
     pub fn set_cursor(&mut self, row: usize, col: usize) {
         self.clear_selection();
         if self.mode == EditorMode::Visual {
@@ -372,6 +378,56 @@ impl WorkspaceEditorState {
         self.cursor_col = col.min(self.line_len(self.cursor_row));
         self.preferred_col = self.cursor_col;
         self.status = None;
+    }
+
+    pub fn clear_hover(&mut self) {
+        self.hover = None;
+        self.hover_request = None;
+    }
+
+    pub fn request_hover(&mut self, position: EditorPosition) -> bool {
+        if self.hover_request == Some(position) {
+            return false;
+        }
+
+        self.hover = None;
+        self.hover_request = Some(position);
+        true
+    }
+
+    pub fn resolve_hover(&mut self, position: EditorPosition, hover: Option<String>) -> bool {
+        if self.hover_request != Some(position) {
+            return false;
+        }
+
+        self.hover = hover;
+        true
+    }
+
+    pub fn hover_popover(&self) -> Option<(&str, EditorPosition)> {
+        self.hover.as_deref().zip(self.hover_request)
+    }
+
+    pub fn hover_request_position(&self) -> Option<EditorPosition> {
+        self.hover_request
+    }
+
+    pub fn symbol_position_near(&self, row: usize, col: usize) -> Option<EditorPosition> {
+        let line = self.lines.get(row)?;
+        let characters = line.chars().collect::<Vec<_>>();
+        if characters.is_empty() {
+            return None;
+        }
+
+        if col < characters.len() && Self::is_symbol_char(characters[col]) {
+            return Some(EditorPosition { row, col });
+        }
+
+        if col > 0 && col - 1 < characters.len() && Self::is_symbol_char(characters[col - 1]) {
+            return Some(EditorPosition { row, col: col - 1 });
+        }
+
+        None
     }
 
     pub fn paste_text(&mut self, text: &str) -> bool {
@@ -650,6 +706,10 @@ impl WorkspaceEditorState {
 
     fn sync_dirty_state(&mut self) {
         self.dirty = self.lines != self.saved_lines;
+    }
+
+    fn is_symbol_char(character: char) -> bool {
+        character == '_' || character.is_alphanumeric()
     }
 
     fn rebuild_render_cache(&mut self) {

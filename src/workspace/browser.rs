@@ -207,6 +207,26 @@ impl FileBrowserState {
         Ok(true)
     }
 
+    pub fn open_path_at_position(&mut self, path: &Path, row: usize, col: usize) -> Result<bool> {
+        let Some(file_index) = self.entries.iter().position(|entry| entry.path == path) else {
+            return Ok(false);
+        };
+
+        self.select_index(file_index, true)?;
+        if self.selected != file_index {
+            return Ok(false);
+        }
+
+        if let Some(editor) = self.editor.as_mut() {
+            editor.set_cursor(row, col);
+            editor.vertical_scroll = row.saturating_sub(3) as u16;
+            editor.horizontal_scroll = col.saturating_sub(8) as u16;
+        }
+        self.focus_editor();
+
+        Ok(true)
+    }
+
     pub fn sidebar_selected_row(&self) -> usize {
         self.tree_cursor.min(self.tree_rows.len().saturating_sub(1))
     }

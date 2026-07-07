@@ -1,11 +1,15 @@
-use super::{chat::ChatSupport, components::*, shell, *};
+use super::{chat::ChatSupport, components::*, lsp, shell, *};
 
 impl App {
-    pub(super) fn on_tick(&mut self) -> bool {
+    pub(super) fn on_tick(&mut self, ui_tx: &mpsc::UnboundedSender<UiEvent>) -> bool {
         let mut needs_redraw = false;
 
         if self.has_active_animation() {
             self.spinner_index = (self.spinner_index + 1) % SPINNER.len();
+            needs_redraw = true;
+        }
+
+        if self.dispatch_pending_workspace_hover(ui_tx) {
             needs_redraw = true;
         }
 
@@ -51,6 +55,12 @@ impl App {
             let _ = std::process::Command::new("kill")
                 .args(["-TERM", &pid.to_string()])
                 .status();
+        }
+    }
+
+    pub(super) fn shutdown_lsp_sessions(&mut self) {
+        for (_, runtime) in self.lsp_runtimes.drain() {
+            let _ = runtime.command_tx.send(lsp::LspCommand::Shutdown);
         }
     }
 
@@ -130,10 +140,17 @@ impl App {
     fn scroll_content_up_by(&mut self, _area: Rect, lines: u16) {
         match self.current_tab {
             AppTab::Workspace => {
-                if let Some(agent) = self.active_agent_mut() {
-                    if let Some(editor) = agent.workspace.editor.as_mut() {
-                        editor.scroll_up(lines);
-                        return;
+                let has_editor = self
+                    .active_agent()
+                    .and_then(|agent| agent.workspace.editor.as_ref())
+                    .is_some();
+                if has_editor {
+                    self.clear_workspace_hover();
+                    if let Some(agent) = self.active_agent_mut() {
+                        if let Some(editor) = agent.workspace.editor.as_mut() {
+                            editor.scroll_up(lines);
+                            return;
+                        }
                     }
                 }
                 if let Some(agent) = self.active_agent_mut() {
@@ -170,7 +187,7 @@ impl App {
                 if self.handle_scrollbar_press(mouse.column, mouse.row, layout) {
                     return;
                 }
-                self.handle_left_click(mouse.column, mouse.row, layout, ui_tx);
+                self.handle_left_click(mouse.column, mouse.row, mouse.modifiers, layout, ui_tx);
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 if self.handle_scrollbar_drag(mouse.row, layout) {
@@ -203,6 +220,9 @@ impl App {
                 }
                 self.active_workspace_selection_drag = false;
             }
+            MouseEventKind::Moved if !self.active_workspace_selection_drag => {
+                self.handle_mouse_move(mouse.column, mouse.row, layout)
+            }
             MouseEventKind::ScrollUp if self.should_handle_mouse_scroll(ScrollDirection::Up) => {
                 self.handle_scroll(mouse.column, mouse.row, layout, true)
             }
@@ -213,6 +233,16 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    fn handle_mouse_move(&mut self, column: u16, row: u16, layout: UiLayout) {
+        if self.current_tab == AppTab::Workspace
+            && WorkspaceComponent::handle_editor_hover(self, column, row, layout.body)
+        {
+            return;
+        }
+
+        self.clear_workspace_hover();
     }
 
     fn handle_scrollbar_press(&mut self, column: u16, row: u16, layout: UiLayout) -> bool {
@@ -397,11 +427,18 @@ impl App {
     fn scroll_content_down_by(&mut self, area: Rect, lines: u16) {
         match self.current_tab {
             AppTab::Workspace => {
-                if let Some(agent) = self.active_agent_mut() {
-                    if let Some(editor) = agent.workspace.editor.as_mut() {
-                        let viewport = WorkspaceEditorComponent::viewport(area);
-                        editor.scroll_down(lines, viewport.height);
-                        return;
+                let has_editor = self
+                    .active_agent()
+                    .and_then(|agent| agent.workspace.editor.as_ref())
+                    .is_some();
+                if has_editor {
+                    self.clear_workspace_hover();
+                    if let Some(agent) = self.active_agent_mut() {
+                        if let Some(editor) = agent.workspace.editor.as_mut() {
+                            let viewport = WorkspaceEditorComponent::viewport(area);
+                            editor.scroll_down(lines, viewport.height);
+                            return;
+                        }
                     }
                 }
                 if let Some(agent) = self.active_agent_mut() {
@@ -465,6 +502,9 @@ impl App {
         ui_tx: &mpsc::UnboundedSender<UiEvent>,
         area: Rect,
     ) {
+        if self.current_tab == AppTab::Workspace {
+            self.clear_workspace_hover();
+        }
         if WorkspaceComponent::handle_key(self, key, area) {
             return;
         }
@@ -569,6 +609,7 @@ impl App {
                 AddAgentField::Workspace => self.add_form.workspace.push(character),
             }
         } else if self.current_tab == AppTab::Workspace {
+            self.clear_workspace_hover();
             if let Some(agent) = self.active_agent_mut() {
                 if agent.workspace.sidebar_focused()
                     && agent.workspace.sidebar_tab == WorkspaceSidebarTab::Search
@@ -612,6 +653,7 @@ impl App {
                 }
             }
         } else if self.current_tab == AppTab::Workspace {
+            self.clear_workspace_hover();
             if let Some(agent) = self.active_agent_mut() {
                 if agent.workspace.sidebar_focused()
                     && agent.workspace.sidebar_tab == WorkspaceSidebarTab::Search
@@ -915,6 +957,260 @@ impl App {
                 }
                 self.status_message = Some(message);
             }
+            UiEvent::LspHoverResult {
+                agent_index,
+                path,
+                position,
+                contents,
+                error,
+            } => {
+                let Some(agent) = self.agents.get_mut(agent_index) else {
+                    return;
+                };
+                let Some(editor) = agent.workspace.editor.as_mut() else {
+                    return;
+                };
+                if editor.path != path {
+                    return;
+                }
+                if !editor.resolve_hover(position, contents) {
+                    return;
+                }
+                if let Some(error) = error {
+                    editor.status = Some(error);
+                }
+            }
+            UiEvent::LspDefinitionResult {
+                agent_index,
+                source_path,
+                _source_position: _,
+                target,
+                error,
+            } => {
+                let Some(agent) = self.agents.get_mut(agent_index) else {
+                    return;
+                };
+                let Some(editor) = agent.workspace.editor.as_ref() else {
+                    return;
+                };
+                if editor.path != source_path {
+                    return;
+                }
+
+                if let Some(error) = error {
+                    if let Some(editor) = agent.workspace.editor.as_mut() {
+                        editor.status = Some(error);
+                    }
+                    return;
+                }
+
+                let Some(target) = target else {
+                    if let Some(editor) = agent.workspace.editor.as_mut() {
+                        editor.status = Some("Definition not found".to_string());
+                    }
+                    return;
+                };
+
+                if !agent
+                    .workspace
+                    .entries
+                    .iter()
+                    .any(|entry| entry.path == target.path)
+                {
+                    if let Some(editor) = agent.workspace.editor.as_mut() {
+                        editor.status = Some("Definition is outside the workspace.".to_string());
+                    }
+                    return;
+                }
+
+                if let Err(error) = agent.workspace.open_path_at_position(
+                    &target.path,
+                    target.position.row,
+                    target.position.col,
+                ) {
+                    if let Some(editor) = agent.workspace.editor.as_mut() {
+                        editor.status = Some(format!("Definition lookup failed: {error}"));
+                    }
+                }
+            }
+        }
+    }
+
+    fn clear_workspace_hover(&mut self) {
+        self.pending_workspace_hover = None;
+        let Some(agent) = self.active_agent_mut() else {
+            return;
+        };
+        let Some(editor) = agent.workspace.editor.as_mut() else {
+            return;
+        };
+        editor.clear_hover();
+    }
+
+    pub(in crate::app) fn set_pending_workspace_hover(
+        &mut self,
+        agent_index: usize,
+        column: u16,
+        row: u16,
+        path: PathBuf,
+        position: EditorPosition,
+    ) {
+        let is_same_pending = self
+            .pending_workspace_hover
+            .as_ref()
+            .is_some_and(|pending| {
+                pending.agent_index == agent_index
+                    && pending.column == column
+                    && pending.row == row
+                    && pending.path == path
+                    && pending.position == position
+            });
+        if is_same_pending {
+            return;
+        }
+
+        self.clear_workspace_hover();
+        self.pending_workspace_hover = Some(PendingWorkspaceHover {
+            agent_index,
+            column,
+            row,
+            path,
+            position,
+            started_at: Instant::now(),
+        });
+    }
+
+    fn dispatch_pending_workspace_hover(&mut self, ui_tx: &mpsc::UnboundedSender<UiEvent>) -> bool {
+        let Some(pending) = self.pending_workspace_hover.clone() else {
+            return false;
+        };
+        if pending.started_at.elapsed() < HOVER_POPOVER_DELAY {
+            return false;
+        }
+
+        let Some((path, source, position)) = ({
+            let Some(agent) = self.agents.get_mut(pending.agent_index) else {
+                self.pending_workspace_hover = None;
+                return false;
+            };
+            let Some(editor) = agent.workspace.editor.as_mut() else {
+                self.pending_workspace_hover = None;
+                return false;
+            };
+            if editor.path != pending.path {
+                self.pending_workspace_hover = None;
+                return false;
+            }
+            if !editor.request_hover(pending.position) {
+                self.pending_workspace_hover = None;
+                return false;
+            }
+
+            Some((editor.path.clone(), editor.source_text(), pending.position))
+        }) else {
+            return false;
+        };
+
+        self.pending_workspace_hover = None;
+        self.request_lsp_hover(pending.agent_index, path, source, position, ui_tx);
+        true
+    }
+
+    fn lsp_command_tx(
+        &mut self,
+        agent_index: usize,
+        ui_tx: &mpsc::UnboundedSender<UiEvent>,
+    ) -> anyhow::Result<std::sync::mpsc::Sender<lsp::LspCommand>> {
+        if let Some(runtime) = self.lsp_runtimes.get(&agent_index) {
+            return Ok(runtime.command_tx.clone());
+        }
+
+        let workspace_root = self.agents[agent_index].definition.workspace.clone();
+        let command_tx = lsp::LspRuntimeFactory::spawn(&workspace_root, ui_tx.clone())?;
+        self.lsp_runtimes.insert(
+            agent_index,
+            LspRuntime {
+                command_tx: command_tx.clone(),
+            },
+        );
+        Ok(command_tx)
+    }
+
+    pub(super) fn request_lsp_hover(
+        &mut self,
+        agent_index: usize,
+        path: PathBuf,
+        source: String,
+        position: EditorPosition,
+        ui_tx: &mpsc::UnboundedSender<UiEvent>,
+    ) {
+        let command_tx = match self.lsp_command_tx(agent_index, ui_tx) {
+            Ok(command_tx) => command_tx,
+            Err(error) => {
+                if let Some(agent) = self.agents.get_mut(agent_index) {
+                    if let Some(editor) = agent.workspace.editor.as_mut() {
+                        editor.status = Some(error.to_string());
+                    }
+                }
+                return;
+            }
+        };
+
+        if command_tx
+            .send(lsp::LspCommand::Hover {
+                agent_index,
+                path,
+                source,
+                position,
+            })
+            .is_err()
+        {
+            self.lsp_runtimes.remove(&agent_index);
+            if let Some(agent) = self.agents.get_mut(agent_index) {
+                if let Some(editor) = agent.workspace.editor.as_mut() {
+                    editor.status =
+                        Some("Failed to send hover request to rust-analyzer".to_string());
+                }
+            }
+        }
+    }
+
+    pub(super) fn request_lsp_definition(
+        &mut self,
+        agent_index: usize,
+        path: PathBuf,
+        source: String,
+        position: EditorPosition,
+        ui_tx: &mpsc::UnboundedSender<UiEvent>,
+    ) {
+        let command_tx = match self.lsp_command_tx(agent_index, ui_tx) {
+            Ok(command_tx) => command_tx,
+            Err(error) => {
+                if let Some(agent) = self.agents.get_mut(agent_index) {
+                    if let Some(editor) = agent.workspace.editor.as_mut() {
+                        editor.status = Some(error.to_string());
+                    }
+                }
+                return;
+            }
+        };
+
+        if command_tx
+            .send(lsp::LspCommand::Definition {
+                agent_index,
+                path,
+                source,
+                position,
+            })
+            .is_err()
+        {
+            self.lsp_runtimes.remove(&agent_index);
+            if let Some(agent) = self.agents.get_mut(agent_index) {
+                if let Some(editor) = agent.workspace.editor.as_mut() {
+                    editor.status =
+                        Some("Failed to send definition request to rust-analyzer".to_string());
+                }
+            }
         }
     }
 
@@ -1001,6 +1297,7 @@ impl App {
         &mut self,
         column: u16,
         row: u16,
+        modifiers: KeyModifiers,
         layout: UiLayout,
         ui_tx: &mpsc::UnboundedSender<UiEvent>,
     ) {
@@ -1027,6 +1324,18 @@ impl App {
                 .active_agent()
                 .is_some_and(|agent| agent.workspace.editor.is_some())
         {
+            self.clear_workspace_hover();
+            if modifiers.contains(KeyModifiers::CONTROL)
+                && WorkspaceComponent::handle_editor_definition_click(
+                    self,
+                    column,
+                    row,
+                    layout.body,
+                    ui_tx,
+                )
+            {
+                return;
+            }
             self.active_workspace_selection_drag =
                 WorkspaceComponent::handle_editor_click(self, column, row, layout.body);
             return;

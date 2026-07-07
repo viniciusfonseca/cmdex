@@ -1,6 +1,7 @@
 mod actions;
 mod chat;
 mod components;
+mod lsp;
 mod shell;
 #[cfg(test)]
 mod tests;
@@ -61,6 +62,7 @@ const SPINNER: [&str; 8] = ["⠏", "⠛", "⠹", "⢸", "⣰", "⣤", "⣆", "�
 const CONTENT_SCROLL_STEP: u16 = 4;
 const MOUSE_SCROLL_STEP: u16 = 4;
 const MOUSE_SCROLL_DEBOUNCE: Duration = Duration::from_millis(20);
+const HOVER_POPOVER_DELAY: Duration = Duration::from_millis(300);
 const WORKSPACE_AUTO_REFRESH_INTERVAL: Duration = Duration::from_millis(750);
 const FAST_TICK_INTERVAL: Duration = Duration::from_millis(80);
 const WORKSPACE_TICK_INTERVAL: Duration = Duration::from_millis(250);
@@ -124,6 +126,20 @@ enum UiEvent {
         session_id: usize,
         message: String,
     },
+    LspHoverResult {
+        agent_index: usize,
+        path: PathBuf,
+        position: EditorPosition,
+        contents: Option<String>,
+        error: Option<String>,
+    },
+    LspDefinitionResult {
+        agent_index: usize,
+        source_path: PathBuf,
+        _source_position: EditorPosition,
+        target: Option<lsp::DefinitionTarget>,
+        error: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,6 +191,20 @@ struct ShellSessionKey {
 struct ShellSessionRuntime {
     command_tx: std::sync::mpsc::Sender<String>,
     pid: u32,
+}
+
+struct LspRuntime {
+    command_tx: std::sync::mpsc::Sender<lsp::LspCommand>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingWorkspaceHover {
+    agent_index: usize,
+    column: u16,
+    row: u16,
+    path: PathBuf,
+    position: EditorPosition,
+    started_at: Instant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -400,6 +430,8 @@ pub struct App {
     active_workspace_selection_drag: bool,
     last_workspace_refresh_at: Option<Instant>,
     shell_runtimes: HashMap<ShellSessionKey, ShellSessionRuntime>,
+    lsp_runtimes: HashMap<usize, LspRuntime>,
+    pending_workspace_hover: Option<PendingWorkspaceHover>,
 }
 
 impl App {
@@ -450,6 +482,8 @@ impl App {
             active_workspace_selection_drag: false,
             last_workspace_refresh_at: None,
             shell_runtimes: HashMap::new(),
+            lsp_runtimes: HashMap::new(),
+            pending_workspace_hover: None,
         }
     }
 
@@ -626,11 +660,12 @@ impl AppRuntime {
                     needs_redraw = true;
                 }
                 _ = &mut tick => {
-                    needs_redraw = app.on_tick();
+                    needs_redraw = app.on_tick(&ui_tx);
                 }
             }
         };
 
+        app.shutdown_lsp_sessions();
         app.shutdown_shell_sessions();
 
         Ok(exit)
