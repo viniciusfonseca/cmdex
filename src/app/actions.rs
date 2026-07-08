@@ -533,6 +533,9 @@ impl App {
         if GitDiffComponent::handle_key(self, key, ui_tx) {
             return;
         }
+        if self.current_tab == AppTab::Chat && ChatComponent::handle_queue_key(self, key) {
+            return;
+        }
 
         match key.code {
             KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {

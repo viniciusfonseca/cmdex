@@ -9,7 +9,7 @@ mod ui;
 
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     env, fs,
     path::PathBuf,
     time::{Duration, Instant},
@@ -50,6 +50,8 @@ use crate::workspace::{
     FileBrowserState, GitRemoteAction, WorkspaceEditorState, WorkspaceSidebarTab,
 };
 use tokio::process::Command;
+
+use self::components::ChatComponent;
 
 const SIDEBAR_WIDTH: u16 = 45;
 const TAB_LABELS: [(&str, AppTab); 4] = [
@@ -261,6 +263,11 @@ struct ChatMessage {
     item_id: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct QueuedChatMessage {
+    text: String,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum MessageRole {
     User,
@@ -338,6 +345,8 @@ struct AgentState {
     thinking: bool,
     shell_running: bool,
     streaming_item_id: Option<String>,
+    queued_chat_messages: VecDeque<QueuedChatMessage>,
+    queued_chat_selection: usize,
     chat_render_cache: RefCell<ChatRenderCache>,
     workspace: FileBrowserState,
     shell_tab: shell::ShellTabState,
@@ -367,6 +376,8 @@ impl AgentState {
             thinking: false,
             shell_running: false,
             streaming_item_id: None,
+            queued_chat_messages: VecDeque::new(),
+            queued_chat_selection: 0,
             chat_render_cache: RefCell::new(ChatRenderCache::default()),
             workspace: FileBrowserState::default(),
             shell_tab: shell::ShellTabState::default(),
@@ -389,6 +400,77 @@ impl AgentState {
         let mut cache = self.chat_render_cache.borrow_mut();
         cache.dirty = true;
         cache.content_height = None;
+    }
+
+    fn enqueue_chat_message(&mut self, text: String) {
+        self.queued_chat_messages
+            .push_back(QueuedChatMessage { text });
+        self.clamp_queued_chat_selection();
+    }
+
+    fn pop_next_queued_chat_message(&mut self) -> Option<String> {
+        let message = self.queued_chat_messages.pop_front()?;
+        if self.queued_chat_selection > 0 {
+            self.queued_chat_selection -= 1;
+        }
+        self.clamp_queued_chat_selection();
+        Some(message.text)
+    }
+
+    fn cancel_selected_queued_chat_message(&mut self) -> Option<String> {
+        let index = self.selected_queued_chat_index()?;
+        let message = self.queued_chat_messages.remove(index)?;
+        self.clamp_queued_chat_selection();
+        Some(message.text)
+    }
+
+    fn queued_chat_count(&self) -> usize {
+        self.queued_chat_messages.len()
+    }
+
+    fn has_queued_chat_messages(&self) -> bool {
+        !self.queued_chat_messages.is_empty()
+    }
+
+    fn selected_queued_chat_index(&self) -> Option<usize> {
+        self.has_queued_chat_messages().then_some(
+            self.queued_chat_selection
+                .min(self.queued_chat_messages.len() - 1),
+        )
+    }
+
+    fn queued_chat_messages(&self) -> &VecDeque<QueuedChatMessage> {
+        &self.queued_chat_messages
+    }
+
+    fn select_previous_queued_chat_message(&mut self) {
+        let Some(selected) = self.selected_queued_chat_index() else {
+            return;
+        };
+
+        self.queued_chat_selection = if selected == 0 {
+            self.queued_chat_messages.len() - 1
+        } else {
+            selected - 1
+        };
+    }
+
+    fn select_next_queued_chat_message(&mut self) {
+        let Some(selected) = self.selected_queued_chat_index() else {
+            return;
+        };
+
+        self.queued_chat_selection = (selected + 1) % self.queued_chat_messages.len();
+    }
+
+    fn clamp_queued_chat_selection(&mut self) {
+        if self.queued_chat_messages.is_empty() {
+            self.queued_chat_selection = 0;
+        } else {
+            self.queued_chat_selection = self
+                .queued_chat_selection
+                .min(self.queued_chat_messages.len() - 1);
+        }
     }
 
     fn chat_text(&self) -> Text<'static> {
@@ -657,6 +739,11 @@ impl AppRuntime {
                         Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
                             let (width, height) = terminal_size()?;
                             app.handle_key(key, &codex, &ui_tx, Rect::new(0, 0, width, height));
+                            ChatComponent::maybe_dispatch_queued_messages(
+                                &mut app,
+                                codex.clone(),
+                                ui_tx.clone(),
+                            );
                             needs_redraw = true;
                         }
                         Some(Ok(Event::Mouse(mouse))) => {
@@ -682,10 +769,20 @@ impl AppRuntime {
                 }
                 Some(server_event) = server_rx.recv() => {
                     app.handle_server_event(server_event);
+                    ChatComponent::maybe_dispatch_queued_messages(
+                        &mut app,
+                        codex.clone(),
+                        ui_tx.clone(),
+                    );
                     needs_redraw = true;
                 }
                 Some(ui_event) = ui_rx.recv() => {
                     app.handle_ui_event(ui_event);
+                    ChatComponent::maybe_dispatch_queued_messages(
+                        &mut app,
+                        codex.clone(),
+                        ui_tx.clone(),
+                    );
                     needs_redraw = true;
                 }
                 _ = &mut tick => {

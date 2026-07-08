@@ -67,12 +67,103 @@ impl ChatComponent {
             return;
         };
 
-        let agent = &mut app.agents[agent_index];
-        if agent.thinking || agent.shell_running {
-            app.status_message = Some("Wait for the current response to finish.".to_string());
+        if app.agents[agent_index].thinking || app.agents[agent_index].shell_running {
+            Self::enqueue_message(app, agent_index, text);
             return;
         }
 
+        app.chat_input.clear();
+        Self::dispatch_message(app, agent_index, text, codex, ui_tx);
+    }
+
+    pub(in crate::app) fn handle_queue_key(app: &mut App, key: KeyEvent) -> bool {
+        if app.current_tab != AppTab::Chat || app.add_agent_selected() {
+            return false;
+        }
+
+        let Some(agent) = app.active_agent_mut() else {
+            return false;
+        };
+        if !agent.has_queued_chat_messages() {
+            return false;
+        }
+
+        match key.code {
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => {
+                agent.select_previous_queued_chat_message();
+                true
+            }
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
+                agent.select_next_queued_chat_message();
+                true
+            }
+            KeyCode::Backspace | KeyCode::Delete if key.modifiers.contains(KeyModifiers::ALT) => {
+                let _ = agent.cancel_selected_queued_chat_message();
+                let remaining = agent.queued_chat_count();
+                agent.status = if remaining == 0 {
+                    Some("Queue is empty".to_string())
+                } else {
+                    Some(format!("{remaining} queued message(s) remaining"))
+                };
+                true
+            }
+            KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::ALT) => {
+                let _ = agent.cancel_selected_queued_chat_message();
+                let remaining = agent.queued_chat_count();
+                agent.status = if remaining == 0 {
+                    Some("Queue is empty".to_string())
+                } else {
+                    Some(format!("{remaining} queued message(s) remaining"))
+                };
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub(in crate::app) fn maybe_dispatch_queued_messages(
+        app: &mut App,
+        codex: CodexAppServer,
+        ui_tx: mpsc::UnboundedSender<UiEvent>,
+    ) {
+        let queued_agents = app
+            .agents
+            .iter()
+            .enumerate()
+            .filter_map(|(agent_index, agent)| {
+                (!agent.thinking
+                    && !agent.shell_running
+                    && agent.active_turn_id.is_none()
+                    && agent.has_queued_chat_messages())
+                .then_some(agent_index)
+            })
+            .collect::<Vec<_>>();
+
+        for agent_index in queued_agents {
+            let Some(text) = app.agents[agent_index].pop_next_queued_chat_message() else {
+                continue;
+            };
+            Self::dispatch_message(app, agent_index, text, codex.clone(), ui_tx.clone());
+        }
+    }
+
+    fn enqueue_message(app: &mut App, agent_index: usize, text: String) {
+        let agent = &mut app.agents[agent_index];
+        agent.enqueue_chat_message(text);
+        let queued = agent.queued_chat_count();
+        agent.status = Some(format!("{queued} queued message(s)"));
+        app.status_message = Some(format!("Queued {queued} message(s)"));
+        app.chat_input.clear();
+    }
+
+    fn dispatch_message(
+        app: &mut App,
+        agent_index: usize,
+        text: String,
+        codex: CodexAppServer,
+        ui_tx: mpsc::UnboundedSender<UiEvent>,
+    ) {
+        let agent = &mut app.agents[agent_index];
         agent.push_message(ChatMessage::new(MessageRole::User, text.clone(), None));
         agent.thinking = true;
         agent.status = None;
@@ -81,7 +172,6 @@ impl ChatComponent {
         let selected_model = agent.chat_model.clone();
         let selected_effort = agent.chat_reasoning_effort.clone();
         let workspace = agent.definition.workspace.clone();
-        app.chat_input.clear();
 
         tokio::spawn(async move {
             let thread_id = match existing_thread {

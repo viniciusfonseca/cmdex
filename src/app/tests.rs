@@ -1,8 +1,8 @@
 use super::{
     chat::{ChatCommand, ChatSupport, ModelCommand},
     components::{
-        ChatInputComponent, GitDiffComponent, ShellSidebarComponent, TopNavigationComponent,
-        UiSupport, WorkspaceComponent, WorkspaceEditorComponent,
+        ChatComponent, ChatInputComponent, GitDiffComponent, ShellSidebarComponent,
+        TopNavigationComponent, UiSupport, WorkspaceComponent, WorkspaceEditorComponent,
     },
     shell::{ShellOutputParser, ShellOutputRecord, ShellPresenter, ShellTabState},
     *,
@@ -641,6 +641,65 @@ fn chat_input_height_grows_with_wrapped_content() {
     assert_eq!(
         ChatInputComponent::height_for_main_area("abcdefghijk", main_area),
         4
+    );
+}
+
+#[test]
+fn queued_chat_messages_can_be_iterated_and_canceled() {
+    let config = CmdexConfig {
+        agents: vec![AgentDefinition {
+            name: "Test".to_string(),
+            workspace: PathBuf::from("/tmp"),
+        }],
+        ..CmdexConfig::default()
+    };
+    let mut app = App::new(PathBuf::new(), config);
+    app.current_tab = AppTab::Chat;
+    app.current_agent = Some(0);
+    app.chat_sidebar_index = 1;
+
+    {
+        let agent = app.active_agent_mut().unwrap();
+        agent.enqueue_chat_message("primeira mensagem".to_string());
+        agent.enqueue_chat_message("segunda mensagem".to_string());
+        agent.enqueue_chat_message("terceira mensagem".to_string());
+        assert_eq!(agent.queued_chat_count(), 3);
+        assert_eq!(agent.selected_queued_chat_index(), Some(0));
+    }
+
+    assert!(ChatComponent::handle_queue_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::ALT)
+    ));
+    assert_eq!(
+        app.active_agent().unwrap().selected_queued_chat_index(),
+        Some(1)
+    );
+
+    assert!(ChatComponent::handle_queue_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::ALT)
+    ));
+    assert_eq!(
+        app.active_agent().unwrap().selected_queued_chat_index(),
+        Some(2)
+    );
+
+    assert!(ChatComponent::handle_queue_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT)
+    ));
+
+    let agent = app.active_agent().unwrap();
+    assert_eq!(agent.queued_chat_count(), 2);
+    assert_eq!(agent.selected_queued_chat_index(), Some(1));
+    assert_eq!(
+        agent
+            .queued_chat_messages()
+            .iter()
+            .map(|message| message.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["primeira mensagem", "segunda mensagem"]
     );
 }
 
