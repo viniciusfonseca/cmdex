@@ -176,6 +176,7 @@ enum ScrollbarDragTarget {
     Chat,
     WorkspacePreview,
     WorkspaceEditor,
+    WorkspaceCompletionPopover,
     ShellOutput,
     GitDiffPreview,
 }
@@ -210,6 +211,8 @@ struct ShellSessionRuntime {
 
 struct LspRuntime {
     command_tx: std::sync::mpsc::Sender<lsp::LspCommand>,
+    server_name: String,
+    starting: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -615,6 +618,35 @@ impl App {
             .iter()
             .enumerate()
             .find(|(_, server)| server.matches_path(path))
+    }
+
+    fn has_active_workspace_lsp_startup(&self) -> bool {
+        self.active_workspace_lsp_runtime()
+            .is_some_and(|runtime| runtime.starting)
+    }
+
+    fn active_workspace_lsp_loading_label(&self) -> Option<String> {
+        let runtime = self.active_workspace_lsp_runtime()?;
+        runtime
+            .starting
+            .then(|| format!("{} {}", SPINNER[self.spinner_index], runtime.server_name))
+    }
+
+    fn active_workspace_lsp_runtime(&self) -> Option<&LspRuntime> {
+        if self.current_tab != AppTab::Workspace {
+            return None;
+        }
+
+        let agent_index = self.current_agent?;
+        let editor = self.agents.get(agent_index)?.workspace.editor.as_ref()?;
+        let server_index = self
+            .lsp_server_for_path(&editor.path)
+            .map(|(index, _)| index)?;
+
+        self.lsp_runtimes.get(&LspRuntimeKey {
+            agent_index,
+            server_index,
+        })
     }
 }
 

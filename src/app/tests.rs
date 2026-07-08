@@ -1274,6 +1274,127 @@ fn workspace_ctrl_space_requests_editor_completion() {
 }
 
 #[test]
+fn workspace_ctrl_h_toggles_shortcuts_popup() {
+    let root = std::env::temp_dir().join(format!(
+        "cmdex-app-workspace-shortcuts-toggle-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let alpha = root.join("alpha.rs");
+    fs::write(&alpha, "fn main() {}\n").unwrap();
+
+    let config = CmdexConfig {
+        agents: vec![AgentDefinition {
+            name: "Test".to_string(),
+            workspace: root.clone(),
+        }],
+        ..CmdexConfig::default()
+    };
+    let mut app = App::new(PathBuf::new(), config);
+    app.current_tab = AppTab::Workspace;
+    app.current_agent = Some(0);
+    app.chat_sidebar_index = 1;
+    TopNavigationComponent::refresh_current_tab(&mut app);
+
+    {
+        let workspace = &mut app.active_agent_mut().unwrap().workspace;
+        workspace.select(0);
+        workspace.open_editor().unwrap();
+    }
+
+    assert!(WorkspaceComponent::handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL),
+        Rect::new(0, 0, 120, 40),
+    ));
+    assert!(
+        app.active_agent()
+            .unwrap()
+            .workspace
+            .editor
+            .as_ref()
+            .unwrap()
+            .shortcuts_help_open()
+    );
+
+    assert!(WorkspaceComponent::handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL),
+        Rect::new(0, 0, 120, 40),
+    ));
+    assert!(
+        !app.active_agent()
+            .unwrap()
+            .workspace
+            .editor
+            .as_ref()
+            .unwrap()
+            .shortcuts_help_open()
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn workspace_lsp_startup_activates_spinner_and_status_label() {
+    let root = std::env::temp_dir().join(format!(
+        "cmdex-app-workspace-lsp-loading-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let alpha = root.join("alpha.rs");
+    fs::write(&alpha, "fn main() {}\n").unwrap();
+
+    let config = CmdexConfig {
+        agents: vec![AgentDefinition {
+            name: "Test".to_string(),
+            workspace: root.clone(),
+        }],
+        ..CmdexConfig::default()
+    };
+    let mut app = App::new(PathBuf::new(), config);
+    app.current_tab = AppTab::Workspace;
+    app.current_agent = Some(0);
+    app.chat_sidebar_index = 1;
+    TopNavigationComponent::refresh_current_tab(&mut app);
+
+    {
+        let workspace = &mut app.active_agent_mut().unwrap().workspace;
+        workspace.select(0);
+        workspace.open_editor().unwrap();
+    }
+
+    let (command_tx, _command_rx) = std::sync::mpsc::channel();
+    app.lsp_runtimes.insert(
+        LspRuntimeKey {
+            agent_index: 0,
+            server_index: 0,
+        },
+        LspRuntime {
+            command_tx,
+            server_name: "rust-analyzer".to_string(),
+            starting: true,
+        },
+    );
+
+    assert_eq!(app.tick_interval(), FAST_TICK_INTERVAL);
+    assert_eq!(
+        app.active_workspace_lsp_loading_label().as_deref(),
+        Some("⠏ rust-analyzer")
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn workspace_u_shortcut_undoes_editor_changes() {
     let root = std::env::temp_dir().join(format!(
         "cmdex-app-workspace-undo-{}-{}",
@@ -1570,6 +1691,273 @@ fn workspace_mouse_click_clears_existing_selection() {
 }
 
 #[test]
+fn workspace_mouse_scroll_over_completion_popover_moves_completion_selection() {
+    let root = std::env::temp_dir().join(format!(
+        "cmdex-app-workspace-completion-scroll-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let alpha = root.join("alpha.rs");
+    fs::write(&alpha, "gre\n").unwrap();
+
+    let config = CmdexConfig {
+        agents: vec![AgentDefinition {
+            name: "Test".to_string(),
+            workspace: root.clone(),
+        }],
+        ..CmdexConfig::default()
+    };
+    let mut app = App::new(PathBuf::new(), config);
+    app.current_tab = AppTab::Workspace;
+    app.current_agent = Some(0);
+    app.chat_sidebar_index = 1;
+    TopNavigationComponent::refresh_current_tab(&mut app);
+
+    {
+        let workspace = &mut app.active_agent_mut().unwrap().workspace;
+        workspace.select(0);
+        workspace.open_editor().unwrap();
+        let editor = workspace.editor.as_mut().unwrap();
+        let position = EditorPosition { row: 0, col: 3 };
+        editor.request_completion(position);
+        assert!(
+            editor.resolve_completion(
+                position,
+                (0..12)
+                    .map(|index| EditorCompletionItem {
+                        label: format!("item-{index:02}"),
+                        detail: None,
+                        insert_text: format!("item_{index:02}"),
+                        replace_start: EditorPosition { row: 0, col: 0 },
+                        replace_end: EditorPosition { row: 0, col: 3 },
+                        preselected: index == 0,
+                    })
+                    .collect()
+            )
+        );
+    }
+
+    let area = Rect::new(0, 0, 80, 20);
+    let layout = app.compute_layout(area);
+    let popup_area = WorkspaceEditorComponent::completion_popover_area(
+        app.active_agent()
+            .unwrap()
+            .workspace
+            .editor
+            .as_ref()
+            .unwrap(),
+        layout.body,
+    )
+    .expect("completion popover area");
+    let (ui_tx, _ui_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    app.handle_mouse(
+        MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: popup_area.x.saturating_add(1),
+            row: popup_area.y.saturating_add(1),
+            modifiers: KeyModifiers::NONE,
+        },
+        area,
+        &ui_tx,
+    );
+
+    let editor = app
+        .active_agent()
+        .unwrap()
+        .workspace
+        .editor
+        .as_ref()
+        .unwrap();
+    let (_, selected, _) = editor.completion_popover().expect("completion popover");
+    assert_eq!(selected, 1);
+    assert_eq!(editor.vertical_scroll, 0);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn workspace_mouse_clicks_shortcuts_popup_close_button() {
+    let root = std::env::temp_dir().join(format!(
+        "cmdex-app-workspace-shortcuts-close-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let alpha = root.join("alpha.rs");
+    fs::write(&alpha, "fn main() {}\n").unwrap();
+
+    let config = CmdexConfig {
+        agents: vec![AgentDefinition {
+            name: "Test".to_string(),
+            workspace: root.clone(),
+        }],
+        ..CmdexConfig::default()
+    };
+    let mut app = App::new(PathBuf::new(), config);
+    app.current_tab = AppTab::Workspace;
+    app.current_agent = Some(0);
+    app.chat_sidebar_index = 1;
+    TopNavigationComponent::refresh_current_tab(&mut app);
+
+    {
+        let workspace = &mut app.active_agent_mut().unwrap().workspace;
+        workspace.select(0);
+        workspace.open_editor().unwrap();
+        workspace.editor.as_mut().unwrap().open_shortcuts_help();
+    }
+
+    let area = Rect::new(0, 0, 120, 40);
+    let layout = app.compute_layout(area);
+    let close_button = WorkspaceEditorComponent::shortcuts_popup_close_button_area(layout.body);
+    let (ui_tx, _ui_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    app.handle_mouse(
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: close_button.x.saturating_add(1),
+            row: close_button.y.saturating_add(1),
+            modifiers: KeyModifiers::NONE,
+        },
+        area,
+        &ui_tx,
+    );
+
+    assert!(
+        !app.active_agent()
+            .unwrap()
+            .workspace
+            .editor
+            .as_ref()
+            .unwrap()
+            .shortcuts_help_open()
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn workspace_mouse_drag_on_completion_popover_scrollbar_updates_window() {
+    let root = std::env::temp_dir().join(format!(
+        "cmdex-app-workspace-completion-drag-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let alpha = root.join("alpha.rs");
+    fs::write(&alpha, "gre\n").unwrap();
+
+    let config = CmdexConfig {
+        agents: vec![AgentDefinition {
+            name: "Test".to_string(),
+            workspace: root.clone(),
+        }],
+        ..CmdexConfig::default()
+    };
+    let mut app = App::new(PathBuf::new(), config);
+    app.current_tab = AppTab::Workspace;
+    app.current_agent = Some(0);
+    app.chat_sidebar_index = 1;
+    TopNavigationComponent::refresh_current_tab(&mut app);
+
+    {
+        let workspace = &mut app.active_agent_mut().unwrap().workspace;
+        workspace.select(0);
+        workspace.open_editor().unwrap();
+        let editor = workspace.editor.as_mut().unwrap();
+        let position = EditorPosition { row: 0, col: 3 };
+        editor.request_completion(position);
+        assert!(
+            editor.resolve_completion(
+                position,
+                (0..12)
+                    .map(|index| EditorCompletionItem {
+                        label: format!("item-{index:02}"),
+                        detail: None,
+                        insert_text: format!("item_{index:02}"),
+                        replace_start: EditorPosition { row: 0, col: 0 },
+                        replace_end: EditorPosition { row: 0, col: 3 },
+                        preselected: index == 0,
+                    })
+                    .collect()
+            )
+        );
+    }
+
+    let area = Rect::new(0, 0, 80, 20);
+    let layout = app.compute_layout(area);
+    let metrics = WorkspaceEditorComponent::completion_popover_scrollbar_metrics(
+        app.active_agent()
+            .unwrap()
+            .workspace
+            .editor
+            .as_ref()
+            .unwrap(),
+        layout.body,
+    )
+    .expect("completion popover scrollbar metrics");
+    let track_x = metrics.track.x;
+    let track_top = metrics.track.y;
+    let track_bottom = metrics.track.y + metrics.track.height.saturating_sub(1);
+    let (ui_tx, _ui_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    app.handle_mouse(
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: track_x,
+            row: track_top,
+            modifiers: KeyModifiers::NONE,
+        },
+        area,
+        &ui_tx,
+    );
+    app.handle_mouse(
+        MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: track_x,
+            row: track_bottom,
+            modifiers: KeyModifiers::NONE,
+        },
+        area,
+        &ui_tx,
+    );
+    app.handle_mouse(
+        MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: track_x,
+            row: track_bottom,
+            modifiers: KeyModifiers::NONE,
+        },
+        area,
+        &ui_tx,
+    );
+
+    let editor = app
+        .active_agent()
+        .unwrap()
+        .workspace
+        .editor
+        .as_ref()
+        .unwrap();
+    let (_, selected, _) = editor.completion_popover().expect("completion popover");
+    assert_eq!(editor.completion_window_start(8), 4);
+    assert_eq!(selected, 4);
+    assert_eq!(editor.vertical_scroll, 0);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn workspace_shift_scroll_moves_editor_horizontally() {
     let root = std::env::temp_dir().join(format!(
         "cmdex-app-workspace-shift-scroll-{}-{}",
@@ -1686,6 +2074,16 @@ fn lsp_hover_summary_preserves_line_breaks_and_strips_code_fences() {
 }
 
 #[test]
+fn lsp_hover_summary_preserves_indented_code_blocks() {
+    let hover = "Example:\n\n    fn greet(name: &str) -> String\n";
+
+    assert_eq!(
+        super::lsp::summarize_hover_text(hover).as_deref(),
+        Some("Example:\n\n    fn greet(name: &str) -> String")
+    );
+}
+
+#[test]
 fn lsp_completion_parses_text_edits_and_snippets() {
     let completion = json!({
         "items": [{
@@ -1775,6 +2173,145 @@ fn workspace_editor_hover_popover_stays_inside_viewport() {
 }
 
 #[test]
+fn workspace_editor_shortcuts_popup_renders_content_and_close_button() {
+    let root = std::env::temp_dir().join(format!(
+        "cmdex-workspace-editor-shortcuts-popup-{}-{}.rs",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::write(&root, "fn main() {}\n").unwrap();
+    let mut editor = WorkspaceEditorState::open(&root).unwrap();
+    editor.open_shortcuts_help();
+
+    let backend = TestBackend::new(100, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            WorkspaceEditorComponent::draw(frame, &editor, Rect::new(0, 0, 100, 24), true, None);
+        })
+        .unwrap();
+
+    let buffer = terminal.backend().buffer();
+    assert!(buffer_cell_for_text(buffer, "Shortcuts").is_some());
+    assert!(buffer_cell_for_text(buffer, "Ctrl+H").is_some());
+    assert!(buffer_cell_for_text(buffer, "Close").is_some());
+
+    let _ = fs::remove_file(root);
+}
+
+#[test]
+fn workspace_editor_renders_lsp_loading_status_in_bottom_right() {
+    let root = std::env::temp_dir().join(format!(
+        "cmdex-workspace-editor-lsp-status-{}-{}.rs",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::write(&root, "fn main() {}\n").unwrap();
+    let editor = WorkspaceEditorState::open(&root).unwrap();
+
+    let backend = TestBackend::new(80, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            WorkspaceEditorComponent::draw(
+                frame,
+                &editor,
+                Rect::new(0, 0, 80, 20),
+                true,
+                Some("⠏ rust-analyzer"),
+            );
+        })
+        .unwrap();
+
+    let buffer = terminal.backend().buffer();
+    let (x, y) = buffer_text_position(buffer, "⠏ rust-analyzer").expect("loading status");
+
+    assert!(x > 55);
+    assert!(y > 15);
+
+    let _ = fs::remove_file(root);
+}
+
+#[test]
+fn workspace_editor_footer_no_longer_renders_shortcut_hints() {
+    let root = std::env::temp_dir().join(format!(
+        "cmdex-workspace-editor-footer-status-{}-{}.rs",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::write(&root, "fn main() {}\n").unwrap();
+    let editor = WorkspaceEditorState::open(&root).unwrap();
+
+    let backend = TestBackend::new(100, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            WorkspaceEditorComponent::draw(frame, &editor, Rect::new(0, 0, 100, 24), true, None);
+        })
+        .unwrap();
+
+    let buffer = terminal.backend().buffer();
+    assert!(buffer_cell_for_text(buffer, "NORMAL").is_some());
+    assert!(buffer_cell_for_text(buffer, "Ctrl+Space autocomplete").is_none());
+
+    let _ = fs::remove_file(root);
+}
+
+#[test]
+fn workspace_editor_completion_popover_renders_scrollbar_for_long_lists() {
+    let root = std::env::temp_dir().join(format!(
+        "cmdex-completion-popover-scrollbar-{}-{}.rs",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::write(&root, "gre\n").unwrap();
+    let mut editor = WorkspaceEditorState::open(&root).unwrap();
+    let position = EditorPosition { row: 0, col: 3 };
+    editor.request_completion(position);
+    assert!(
+        editor.resolve_completion(
+            position,
+            (0..12)
+                .map(|index| EditorCompletionItem {
+                    label: format!("item-{index:02}"),
+                    detail: None,
+                    insert_text: format!("item_{index:02}"),
+                    replace_start: EditorPosition { row: 0, col: 0 },
+                    replace_end: EditorPosition { row: 0, col: 3 },
+                    preselected: index == 9,
+                })
+                .collect()
+        )
+    );
+    let backend = TestBackend::new(80, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            WorkspaceEditorComponent::draw(frame, &editor, Rect::new(0, 0, 80, 20), true, None);
+        })
+        .unwrap();
+
+    let buffer = terminal.backend().buffer();
+    assert!(buffer_cell_for_text(buffer, "item-09").is_some());
+    assert!(buffer_cell_for_text(buffer, "item-00").is_none());
+    assert!(buffer_cell_for_text(buffer, "█").is_some());
+
+    let _ = fs::remove_file(root);
+}
+
+#[test]
 fn workspace_editor_hover_popover_preserves_syntax_highlighting() {
     let root = std::env::temp_dir().join(format!(
         "cmdex-hover-popover-highlight-{}-{}.rs",
@@ -1795,7 +2332,43 @@ fn workspace_editor_hover_popover_preserves_syntax_highlighting() {
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
         .draw(|frame| {
-            WorkspaceEditorComponent::draw(frame, &editor, Rect::new(0, 0, 80, 20), true);
+            WorkspaceEditorComponent::draw(frame, &editor, Rect::new(0, 0, 80, 20), true, None);
+        })
+        .unwrap();
+
+    let buffer = terminal.backend().buffer();
+    let found_highlighted_cell =
+        buffer_contains_highlighted_text(buffer, "fn greet", ThemeRegistry::app().foreground);
+
+    assert!(found_highlighted_cell);
+
+    let _ = fs::remove_file(root);
+}
+
+#[test]
+fn workspace_editor_hover_popover_highlights_indented_markdown_code_blocks() {
+    let root = std::env::temp_dir().join(format!(
+        "cmdex-hover-popover-indented-{}-{}.rs",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::write(&root, "let placeholder = 1;\n").unwrap();
+    let mut editor = WorkspaceEditorState::open(&root).unwrap();
+    let hover =
+        super::lsp::summarize_hover_text("Example:\n\n    fn greet(name: &str) -> String\n")
+            .expect("hover summary");
+    let position = EditorPosition { row: 0, col: 3 };
+    assert!(editor.request_hover(position));
+    assert!(editor.resolve_hover(position, Some(hover)));
+
+    let backend = TestBackend::new(80, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            WorkspaceEditorComponent::draw(frame, &editor, Rect::new(0, 0, 80, 20), true, None);
         })
         .unwrap();
 
@@ -1829,7 +2402,7 @@ fn workspace_editor_hover_popover_uses_editor_syntax_for_unlabeled_code_blocks()
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
         .draw(|frame| {
-            WorkspaceEditorComponent::draw(frame, &editor, Rect::new(0, 0, 80, 20), true);
+            WorkspaceEditorComponent::draw(frame, &editor, Rect::new(0, 0, 80, 20), true, None);
         })
         .unwrap();
 
@@ -1863,7 +2436,7 @@ fn workspace_editor_hover_popover_prioritizes_editor_file_extension() {
     let mut terminal = Terminal::new(backend).unwrap();
     terminal
         .draw(|frame| {
-            WorkspaceEditorComponent::draw(frame, &editor, Rect::new(0, 0, 80, 20), true);
+            WorkspaceEditorComponent::draw(frame, &editor, Rect::new(0, 0, 80, 20), true, None);
         })
         .unwrap();
 
@@ -1891,10 +2464,7 @@ fn buffer_contains_highlighted_text(
     buffer_cell_for_text(buffer, needle).is_some_and(|cell| cell.fg != default_fg)
 }
 
-fn buffer_cell_for_text<'a>(
-    buffer: &'a ratatui::buffer::Buffer,
-    needle: &str,
-) -> Option<&'a ratatui::buffer::Cell> {
+fn buffer_text_position(buffer: &ratatui::buffer::Buffer, needle: &str) -> Option<(u16, u16)> {
     let needle = needle.chars().collect::<Vec<_>>();
     for y in 0..buffer.area.height {
         let mut row = Vec::with_capacity(buffer.area.width as usize);
@@ -1909,8 +2479,16 @@ fn buffer_cell_for_text<'a>(
             continue;
         };
 
-        return Some(&buffer[(start as u16, y)]);
+        return Some((start as u16, y));
     }
 
     None
+}
+
+fn buffer_cell_for_text<'a>(
+    buffer: &'a ratatui::buffer::Buffer,
+    needle: &str,
+) -> Option<&'a ratatui::buffer::Cell> {
+    let (x, y) = buffer_text_position(buffer, needle)?;
+    Some(&buffer[(x, y)])
 }

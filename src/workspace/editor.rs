@@ -41,6 +41,8 @@ impl WorkspaceEditorState {
             hover_request: None,
             completion_request: None,
             completion_selected: 0,
+            completion_scroll: 0,
+            shortcuts_help_open: false,
             render_cache: EditorRenderCache::default(),
         };
         editor.rebuild_render_cache();
@@ -399,10 +401,27 @@ impl WorkspaceEditorState {
         self.hover_request = None;
     }
 
+    pub fn shortcuts_help_open(&self) -> bool {
+        self.shortcuts_help_open
+    }
+
+    pub fn open_shortcuts_help(&mut self) {
+        self.shortcuts_help_open = true;
+    }
+
+    pub fn close_shortcuts_help(&mut self) {
+        self.shortcuts_help_open = false;
+    }
+
+    pub fn toggle_shortcuts_help(&mut self) {
+        self.shortcuts_help_open = !self.shortcuts_help_open;
+    }
+
     pub fn clear_completion(&mut self) {
         self.completion_items.clear();
         self.completion_request = None;
         self.completion_selected = 0;
+        self.completion_scroll = 0;
     }
 
     pub fn request_hover(&mut self, position: EditorPosition) -> bool {
@@ -453,6 +472,8 @@ impl WorkspaceEditorState {
 
         self.completion_selected = items.iter().position(|item| item.preselected).unwrap_or(0);
         self.completion_items = items;
+        self.completion_scroll = 0;
+        self.ensure_completion_selection_visible(COMPLETION_POPOVER_MAX_ITEMS);
         true
     }
 
@@ -474,6 +495,28 @@ impl WorkspaceEditorState {
         self.completion_request
     }
 
+    pub fn completion_window_start(&self, max_items: usize) -> usize {
+        let visible_len = self.completion_visible_len(max_items);
+        self.clamped_completion_scroll(visible_len)
+    }
+
+    pub fn set_completion_window_start(&mut self, start: usize, max_items: usize) {
+        let visible_len = self.completion_visible_len(max_items);
+        if visible_len == 0 {
+            self.completion_scroll = 0;
+            self.completion_selected = 0;
+            return;
+        }
+
+        let start = self.clamp_completion_scroll(start, visible_len);
+        let end = start + visible_len.saturating_sub(1);
+        self.completion_scroll = start;
+        self.completion_selected = self
+            .completion_selected
+            .min(self.completion_items.len().saturating_sub(1))
+            .clamp(start, end);
+    }
+
     pub fn select_previous_completion(&mut self) {
         if self.completion_items.is_empty() {
             return;
@@ -484,6 +527,7 @@ impl WorkspaceEditorState {
         } else {
             self.completion_selected - 1
         };
+        self.ensure_completion_selection_visible(COMPLETION_POPOVER_MAX_ITEMS);
     }
 
     pub fn select_next_completion(&mut self) {
@@ -492,6 +536,7 @@ impl WorkspaceEditorState {
         }
 
         self.completion_selected = (self.completion_selected + 1) % self.completion_items.len();
+        self.ensure_completion_selection_visible(COMPLETION_POPOVER_MAX_ITEMS);
     }
 
     pub fn apply_selected_completion(&mut self) -> bool {
@@ -518,6 +563,42 @@ impl WorkspaceEditorState {
         let applied = self.paste_text(&item.insert_text);
         self.clear_completion();
         applied
+    }
+
+    fn completion_visible_len(&self, max_items: usize) -> usize {
+        self.completion_items.len().min(max_items)
+    }
+
+    fn clamped_completion_scroll(&self, visible_len: usize) -> usize {
+        if visible_len == 0 {
+            return 0;
+        }
+
+        self.clamp_completion_scroll(self.completion_scroll, visible_len)
+    }
+
+    fn clamp_completion_scroll(&self, scroll: usize, visible_len: usize) -> usize {
+        if visible_len == 0 {
+            return 0;
+        }
+
+        scroll.min(self.completion_items.len().saturating_sub(visible_len))
+    }
+
+    fn ensure_completion_selection_visible(&mut self, max_items: usize) {
+        let visible_len = self.completion_visible_len(max_items);
+        if visible_len == 0 {
+            self.completion_scroll = 0;
+            return;
+        }
+
+        let mut start = self.clamped_completion_scroll(visible_len);
+        if self.completion_selected < start {
+            start = self.completion_selected;
+        } else if self.completion_selected >= start + visible_len {
+            start = self.completion_selected + 1 - visible_len;
+        }
+        self.completion_scroll = self.clamp_completion_scroll(start, visible_len);
     }
 
     pub fn symbol_position_near(&self, row: usize, col: usize) -> Option<EditorPosition> {

@@ -1,13 +1,33 @@
 use super::super::*;
 use super::UiSupport;
 use crate::syntax::SyntaxRegistry;
+use crate::workspace::COMPLETION_POPOVER_MAX_ITEMS;
 use ratatui::style::Color;
 use std::path::Path;
 use syntect::{easy::HighlightLines, highlighting::FontStyle, parsing::SyntaxReference};
 
 pub(in crate::app) struct WorkspaceEditorComponent;
 
-const COMPLETION_POPOVER_MAX_ITEMS: usize = 8;
+const COMPLETION_POPOVER_CONTENT_WIDTH: u16 = 28;
+const SHORTCUTS_POPUP_WIDTH: u16 = 60;
+const SHORTCUTS_POPUP_HEIGHT: u16 = 16;
+const SHORTCUTS_CLOSE_BUTTON_WIDTH: u16 = 12;
+
+struct CompletionPopoverLayout {
+    popup_area: Rect,
+    content_area: Rect,
+    text_area: Rect,
+    lines: Vec<Line<'static>>,
+    start: usize,
+    needs_scrollbar: bool,
+    item_count: usize,
+}
+
+struct ShortcutsPopupLayout {
+    popup_area: Rect,
+    content_area: Rect,
+    close_button_area: Rect,
+}
 
 impl WorkspaceEditorComponent {
     pub(in crate::app) fn draw(
@@ -15,6 +35,7 @@ impl WorkspaceEditorComponent {
         editor: &WorkspaceEditorState,
         area: Rect,
         focused: bool,
+        lsp_loading: Option<&str>,
     ) {
         let mode = match editor.mode {
             EditorMode::Normal => "NORMAL",
@@ -48,7 +69,9 @@ impl WorkspaceEditorComponent {
             editor.content_height(),
             vertical_scroll,
         );
-        if !Self::render_completion_popover(frame, editor, code_area, vertical_scroll) {
+        if !editor.shortcuts_help_open()
+            && !Self::render_completion_popover(frame, editor, code_area, vertical_scroll)
+        {
             Self::render_hover_popover(frame, editor, code_area, vertical_scroll);
         }
 
@@ -59,6 +82,22 @@ impl WorkspaceEditorComponent {
                     .fg(UiSupport::theme().muted),
             );
             frame.render_widget(status_widget, status_area);
+            if let Some(lsp_loading) = lsp_loading {
+                let loading_widget = Paragraph::new(lsp_loading)
+                    .alignment(Alignment::Right)
+                    .style(
+                        Style::default()
+                            .bg(UiSupport::theme().app_bg)
+                            .fg(UiSupport::theme().accent)
+                            .add_modifier(Modifier::BOLD),
+                    );
+                frame.render_widget(loading_widget, status_area);
+            }
+        }
+
+        if editor.shortcuts_help_open() {
+            Self::render_shortcuts_popup(frame, area);
+            return;
         }
 
         if !focused {
@@ -110,6 +149,38 @@ impl WorkspaceEditorComponent {
         Self::panes(inner).0
     }
 
+    pub(in crate::app) fn completion_popover_area(
+        editor: &WorkspaceEditorState,
+        area: Rect,
+    ) -> Option<Rect> {
+        let code_area = Self::viewport(area);
+        let vertical_scroll = editor.clamped_vertical_scroll(code_area.height);
+        Self::completion_popover_layout(editor, code_area, vertical_scroll)
+            .map(|layout| layout.popup_area)
+    }
+
+    pub(in crate::app) fn completion_popover_scrollbar_metrics(
+        editor: &WorkspaceEditorState,
+        area: Rect,
+    ) -> Option<ScrollbarMetrics> {
+        let code_area = Self::viewport(area);
+        let vertical_scroll = editor.clamped_vertical_scroll(code_area.height);
+        let layout = Self::completion_popover_layout(editor, code_area, vertical_scroll)?;
+        if !layout.needs_scrollbar {
+            return None;
+        }
+
+        UiSupport::vertical_scrollbar_metrics_for_viewport(layout.content_area, layout.item_count)
+    }
+
+    pub(in crate::app) fn shortcuts_popup_area(area: Rect) -> Rect {
+        Self::shortcuts_popup_layout(area).popup_area
+    }
+
+    pub(in crate::app) fn shortcuts_popup_close_button_area(area: Rect) -> Rect {
+        Self::shortcuts_popup_layout(area).close_button_area
+    }
+
     fn panes(inner: Rect) -> (Rect, Option<Rect>) {
         if inner.height <= 1 {
             return (inner, None);
@@ -123,32 +194,99 @@ impl WorkspaceEditorComponent {
     }
 
     fn status(editor: &WorkspaceEditorState, focused: bool) -> String {
+        if editor.mode == EditorMode::Command {
+            return format!(":{}", editor.command);
+        }
+
+        if let Some(status) = editor.status.as_deref() {
+            return status.to_string();
+        }
+
         if !focused {
-            return editor
-                .status
-                .clone()
-                .unwrap_or_else(|| "SIDEBAR FOCUSED  Tab editor".to_string());
+            return "SIDEBAR FOCUSED".to_string();
         }
 
         if editor.completion_popover().is_some() {
-            return "COMPLETION  Enter/Tab apply  Esc dismiss  Up/Down select".to_string();
+            return "COMPLETION".to_string();
         }
 
         match editor.mode {
-            EditorMode::Command => format!(":{}", editor.command),
-            EditorMode::Visual => {
-                "-- VISUAL --  Esc normal  y copy  p paste  h/j/k/l move  x delete selection"
-                    .to_string()
-            }
-            EditorMode::Insert => {
-                "-- INSERT --  Ctrl+Space autocomplete  Esc normal  Enter newline  Backspace delete"
-                    .to_string()
-            }
-            EditorMode::Normal => editor.status.clone().unwrap_or_else(|| {
-                "NORMAL  Tab sidebar  arrows move  v select  y copy  p paste  u undo  Ctrl+Space autocomplete  Ctrl+click definition  i/a/o edit  x delete  :w save  :q preview"
-                    .to_string()
-            }),
+            EditorMode::Visual => "VISUAL".to_string(),
+            EditorMode::Insert => "INSERT".to_string(),
+            EditorMode::Normal => "NORMAL".to_string(),
+            EditorMode::Command => unreachable!("command mode handled above"),
         }
+    }
+
+    fn render_shortcuts_popup(frame: &mut Frame, area: Rect) {
+        let layout = Self::shortcuts_popup_layout(area);
+        frame.render_widget(Clear, layout.popup_area);
+
+        let popup_block = UiSupport::rounded_block()
+            .title("Shortcuts")
+            .style(
+                Style::default()
+                    .bg(UiSupport::theme().panel_bg)
+                    .fg(UiSupport::theme().foreground),
+            )
+            .border_style(Style::default().fg(UiSupport::theme().accent));
+        frame.render_widget(popup_block, layout.popup_area);
+
+        let content = Paragraph::new(Text::from(Self::shortcuts_help_lines()))
+            .style(
+                Style::default()
+                    .bg(UiSupport::theme().panel_bg)
+                    .fg(UiSupport::theme().foreground),
+            )
+            .wrap(Wrap { trim: false });
+        frame.render_widget(content, layout.content_area);
+
+        let close_button = Paragraph::new("Close")
+            .alignment(Alignment::Center)
+            .style(UiSupport::action_style(UiSupport::theme().foreground))
+            .block(UiSupport::panel_block());
+        frame.render_widget(close_button, layout.close_button_area);
+    }
+
+    fn shortcuts_help_lines() -> Vec<Line<'static>> {
+        let header_style = Style::default()
+            .fg(UiSupport::theme().accent)
+            .add_modifier(Modifier::BOLD);
+        let muted_style = Style::default().fg(UiSupport::theme().muted);
+
+        vec![
+            Line::from(Span::styled("Global", header_style)),
+            Line::from(vec![
+                Span::styled("Ctrl+H", Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(" open/close help  ", muted_style),
+                Span::styled("Tab", Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(" switch focus", muted_style),
+            ]),
+            Line::from(vec![
+                Span::styled("Ctrl+click", Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(" go to definition  ", muted_style),
+                Span::styled("Ctrl+Space", Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(" autocomplete", muted_style),
+            ]),
+            Line::from(vec![
+                Span::styled(
+                    "Shift+scroll",
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" horizontal scroll  ", muted_style),
+                Span::styled("mouse drag", Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(" select text", muted_style),
+            ]),
+            Line::default(),
+            Line::from(Span::styled("Normal", header_style)),
+            Line::from("arrows / h j k l move, v select, y copy, p paste"),
+            Line::from("u undo, i / a / o edit, x delete, : open command"),
+            Line::default(),
+            Line::from(Span::styled("Visual / Insert", header_style)),
+            Line::from("Visual: arrows / h j k l expand, y copy, p paste, x delete"),
+            Line::from("Insert: Esc normal, Enter new line, Backspace / Delete remove"),
+            Line::from("Home / End / PageUp / PageDown navigate"),
+        ]
     }
 
     fn render_completion_popover(
@@ -157,16 +295,53 @@ impl WorkspaceEditorComponent {
         code_area: Rect,
         vertical_scroll: u16,
     ) -> bool {
-        let Some((items, selected, position)) = editor.completion_popover() else {
+        let Some(layout) = Self::completion_popover_layout(editor, code_area, vertical_scroll)
+        else {
             return false;
         };
+
+        frame.render_widget(Clear, layout.popup_area);
+        let popup_block = UiSupport::rounded_block()
+            .style(
+                Style::default()
+                    .bg(UiSupport::theme().panel_bg)
+                    .fg(UiSupport::theme().foreground),
+            )
+            .border_style(Style::default().fg(UiSupport::theme().accent));
+        frame.render_widget(popup_block, layout.popup_area);
+
+        let popup = Paragraph::new(Text::from(layout.lines)).style(
+            Style::default()
+                .bg(UiSupport::theme().panel_bg)
+                .fg(UiSupport::theme().foreground),
+        );
+        frame.render_widget(popup, layout.text_area);
+        if layout.needs_scrollbar {
+            UiSupport::render_vertical_scrollbar_with_viewport(
+                frame,
+                layout.content_area,
+                layout.item_count,
+                layout.start as u16,
+            );
+        }
+        true
+    }
+
+    fn completion_popover_layout(
+        editor: &WorkspaceEditorState,
+        code_area: Rect,
+        vertical_scroll: u16,
+    ) -> Option<CompletionPopoverLayout> {
+        let Some((items, selected, position)) = editor.completion_popover() else {
+            return None;
+        };
         if code_area.width < 16 || code_area.height < 4 {
-            return false;
+            return None;
         }
 
         let visible_row = position.row.saturating_sub(vertical_scroll as usize) as u16;
         if visible_row >= code_area.height {
-            return false;
+            return None;
         }
 
         let gutter_width = editor.gutter_width() as u16;
@@ -181,47 +356,86 @@ impl WorkspaceEditorComponent {
         let anchor_y = code_area.y.saturating_add(visible_row);
 
         let visible_len = items.len().min(COMPLETION_POPOVER_MAX_ITEMS);
-        let start = selected
-            .saturating_sub(visible_len.saturating_sub(1))
-            .min(items.len().saturating_sub(visible_len));
+        let start = editor.completion_window_start(COMPLETION_POPOVER_MAX_ITEMS);
+        let needs_scrollbar = items.len() > visible_len;
         let lines = items[start..start + visible_len]
             .iter()
             .enumerate()
             .map(|(offset, item)| Self::completion_line(item, start + offset == selected))
             .collect::<Vec<_>>();
-        let natural_content_width = lines
-            .iter()
-            .map(|line| line.width() as u16)
-            .max()
-            .unwrap_or(1);
-        let max_content_width = code_area.width.saturating_sub(4).clamp(16, 72);
-        let content_width = natural_content_width.clamp(16, max_content_width);
+        let max_content_width = code_area
+            .width
+            .saturating_sub(if needs_scrollbar { 5 } else { 4 })
+            .max(1);
+        let content_width = COMPLETION_POPOVER_CONTENT_WIDTH.min(max_content_width);
         let popup_area = Self::hover_popover_area(
             code_area,
             anchor_x,
             anchor_y,
-            content_width.saturating_add(2),
+            content_width.saturating_add(if needs_scrollbar { 3 } else { 2 }),
             visible_len as u16 + 2,
         );
-
-        frame.render_widget(Clear, popup_area);
-        let popup = Paragraph::new(Text::from(lines))
-            .block(
-                UiSupport::rounded_block()
-                    .style(
-                        Style::default()
-                            .bg(UiSupport::theme().panel_bg)
-                            .fg(UiSupport::theme().foreground),
-                    )
-                    .border_style(Style::default().fg(UiSupport::theme().accent)),
+        let content_area = popup_area.inner(Margin {
+            vertical: 1,
+            horizontal: 1,
+        });
+        let text_area = if needs_scrollbar && content_area.width > 1 {
+            Rect::new(
+                content_area.x,
+                content_area.y,
+                content_area.width.saturating_sub(1),
+                content_area.height,
             )
-            .style(
-                Style::default()
-                    .bg(UiSupport::theme().panel_bg)
-                    .fg(UiSupport::theme().foreground),
-            );
-        frame.render_widget(popup, popup_area);
-        true
+        } else {
+            content_area
+        };
+
+        Some(CompletionPopoverLayout {
+            popup_area,
+            content_area,
+            text_area,
+            lines,
+            start,
+            needs_scrollbar,
+            item_count: items.len(),
+        })
+    }
+
+    fn shortcuts_popup_layout(area: Rect) -> ShortcutsPopupLayout {
+        let viewport = area.inner(Margin {
+            vertical: 1,
+            horizontal: 1,
+        });
+        let popup_width = SHORTCUTS_POPUP_WIDTH.min(viewport.width.max(1));
+        let popup_height = SHORTCUTS_POPUP_HEIGHT.min(viewport.height.max(1));
+        let popup_x = viewport
+            .x
+            .saturating_add(viewport.width.saturating_sub(popup_width) / 2);
+        let popup_y = viewport
+            .y
+            .saturating_add(viewport.height.saturating_sub(popup_height) / 2);
+        let popup_area = Rect::new(popup_x, popup_y, popup_width, popup_height);
+        let inner = popup_area.inner(Margin {
+            vertical: 1,
+            horizontal: 1,
+        });
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(3)])
+            .split(inner);
+        let close_button_area = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Min(1),
+                Constraint::Length(SHORTCUTS_CLOSE_BUTTON_WIDTH),
+            ])
+            .split(sections[1])[1];
+
+        ShortcutsPopupLayout {
+            popup_area,
+            content_area: sections[0],
+            close_button_area,
+        }
     }
 
     fn completion_line(item: &EditorCompletionItem, selected: bool) -> Line<'static> {
@@ -363,47 +577,164 @@ impl WorkspaceEditorComponent {
 
     fn parse_hover_blocks(hover: &str) -> Vec<HoverBlock> {
         let mut blocks = Vec::new();
-        let mut text_lines = Vec::new();
-        let mut code_lines = Vec::new();
+        let mut text_buffer = String::new();
+        let mut code_buffer = None::<String>;
         let mut code_language = None;
-        let mut inside_code = false;
 
-        for line in hover.replace("\r\n", "\n").replace('\r', "\n").split('\n') {
-            let trimmed = line.trim_start();
-            if trimmed.starts_with("```") {
-                if inside_code {
-                    Self::push_hover_text_block(&mut blocks, &mut text_lines);
-                    Self::push_hover_code_block(&mut blocks, code_language.take(), &mut code_lines);
-                } else {
-                    Self::push_hover_text_block(&mut blocks, &mut text_lines);
-                    let language = trimmed.trim_start_matches("```").trim();
-                    code_language = (!language.is_empty()).then(|| language.to_string());
+        for event in MarkdownParser::new_ext(hover, MarkdownOptions::all()) {
+            match event {
+                MarkdownEvent::Start(Tag::CodeBlock(kind)) => {
+                    Self::push_hover_text_block(&mut blocks, &mut text_buffer);
+                    code_language = match kind {
+                        CodeBlockKind::Fenced(language) => {
+                            let language = language.trim().to_string();
+                            (!language.is_empty()).then_some(language)
+                        }
+                        CodeBlockKind::Indented => None,
+                    };
+                    code_buffer = Some(String::new());
                 }
-                inside_code = !inside_code;
-                continue;
-            }
-
-            if inside_code {
-                code_lines.push(line.to_string());
-            } else {
-                text_lines.push(line.to_string());
+                MarkdownEvent::End(TagEnd::CodeBlock) => {
+                    if let Some(mut code) = code_buffer.take() {
+                        while code.ends_with(['\n', '\r']) {
+                            code.pop();
+                        }
+                        Self::push_hover_code_block(&mut blocks, code_language.take(), &mut code);
+                    }
+                }
+                MarkdownEvent::Text(text) => {
+                    if let Some(code) = code_buffer.as_mut() {
+                        code.push_str(&text);
+                    } else {
+                        Self::append_hover_text(&mut text_buffer, &text);
+                    }
+                }
+                MarkdownEvent::Code(text) => {
+                    if let Some(code) = code_buffer.as_mut() {
+                        code.push_str(&text);
+                    } else {
+                        Self::append_hover_text(&mut text_buffer, &text);
+                    }
+                }
+                MarkdownEvent::SoftBreak | MarkdownEvent::HardBreak => {
+                    if let Some(code) = code_buffer.as_mut() {
+                        code.push('\n');
+                    } else {
+                        Self::append_hover_newline(&mut text_buffer);
+                    }
+                }
+                MarkdownEvent::Rule => {
+                    if code_buffer.is_none() {
+                        Self::append_hover_paragraph_break(&mut text_buffer);
+                    }
+                }
+                MarkdownEvent::Start(Tag::Item) => {
+                    if code_buffer.is_none() {
+                        Self::append_hover_item_prefix(&mut text_buffer);
+                    }
+                }
+                MarkdownEvent::End(
+                    TagEnd::Paragraph
+                    | TagEnd::Heading(_)
+                    | TagEnd::BlockQuote(_)
+                    | TagEnd::HtmlBlock
+                    | TagEnd::FootnoteDefinition
+                    | TagEnd::DefinitionList
+                    | TagEnd::DefinitionListTitle
+                    | TagEnd::DefinitionListDefinition
+                    | TagEnd::Table
+                    | TagEnd::TableHead
+                    | TagEnd::TableRow,
+                ) => {
+                    if code_buffer.is_none() {
+                        Self::append_hover_paragraph_break(&mut text_buffer);
+                    }
+                }
+                MarkdownEvent::End(TagEnd::Item) => {
+                    if code_buffer.is_none() {
+                        Self::append_hover_newline(&mut text_buffer);
+                    }
+                }
+                MarkdownEvent::End(TagEnd::TableCell) => {
+                    if code_buffer.is_none() {
+                        Self::append_hover_text(&mut text_buffer, " ");
+                    }
+                }
+                MarkdownEvent::Html(text)
+                | MarkdownEvent::InlineHtml(text)
+                | MarkdownEvent::InlineMath(text)
+                | MarkdownEvent::DisplayMath(text) => {
+                    if let Some(code) = code_buffer.as_mut() {
+                        code.push_str(&text);
+                    } else {
+                        Self::append_hover_text(&mut text_buffer, &text);
+                    }
+                }
+                MarkdownEvent::TaskListMarker(checked) => {
+                    if code_buffer.is_none() {
+                        Self::append_hover_text(
+                            &mut text_buffer,
+                            if checked { "[x] " } else { "[ ] " },
+                        );
+                    }
+                }
+                _ => {}
             }
         }
 
-        if inside_code {
-            Self::push_hover_code_block(&mut blocks, code_language, &mut code_lines);
-        } else {
-            Self::push_hover_text_block(&mut blocks, &mut text_lines);
+        if let Some(mut code) = code_buffer.take() {
+            while code.ends_with(['\n', '\r']) {
+                code.pop();
+            }
+            Self::push_hover_code_block(&mut blocks, code_language, &mut code);
         }
+        Self::push_hover_text_block(&mut blocks, &mut text_buffer);
 
         blocks
     }
 
-    fn push_hover_text_block(blocks: &mut Vec<HoverBlock>, lines: &mut Vec<String>) {
+    fn append_hover_text(buffer: &mut String, text: &str) {
+        buffer.push_str(text);
+    }
+
+    fn append_hover_newline(buffer: &mut String) {
+        if !buffer.ends_with('\n') {
+            buffer.push('\n');
+        }
+    }
+
+    fn append_hover_paragraph_break(buffer: &mut String) {
+        if buffer.trim().is_empty() {
+            buffer.clear();
+            return;
+        }
+
+        while buffer.ends_with(['\n', ' ']) {
+            buffer.pop();
+        }
+        if !buffer.ends_with("\n\n") {
+            buffer.push_str("\n\n");
+        }
+    }
+
+    fn append_hover_item_prefix(buffer: &mut String) {
+        if !buffer.is_empty() && !buffer.ends_with(['\n', ' ']) {
+            buffer.push('\n');
+        }
+        buffer.push_str("- ");
+    }
+
+    fn push_hover_text_block(blocks: &mut Vec<HoverBlock>, text: &mut String) {
         let mut normalized = Vec::new();
         let mut previous_blank = false;
 
-        for line in lines.drain(..) {
+        for line in text
+            .replace("\r\n", "\n")
+            .replace('\r', "\n")
+            .split('\n')
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+        {
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 if !previous_blank && !normalized.is_empty() {
@@ -421,29 +752,30 @@ impl WorkspaceEditorComponent {
         }
 
         if normalized.is_empty() {
+            text.clear();
             return;
         }
 
         blocks.push(HoverBlock::Text(normalized.join("\n")));
+        text.clear();
     }
 
     fn push_hover_code_block(
         blocks: &mut Vec<HoverBlock>,
         language: Option<String>,
-        lines: &mut Vec<String>,
+        text: &mut String,
     ) {
-        while lines.last().is_some_and(String::is_empty) {
-            lines.pop();
-        }
-
-        if lines.is_empty() {
+        let trimmed = text.trim_end_matches(['\n', '\r']);
+        if trimmed.is_empty() {
+            text.clear();
             return;
         }
 
         blocks.push(HoverBlock::Code {
             language,
-            text: lines.drain(..).collect::<Vec<_>>().join("\n"),
+            text: trimmed.to_string(),
         });
+        text.clear();
     }
 
     fn highlight_hover_code(

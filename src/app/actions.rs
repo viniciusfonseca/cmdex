@@ -33,7 +33,7 @@ impl App {
 
         match self.current_tab {
             AppTab::Chat => agent.thinking || agent.shell_running,
-            AppTab::Workspace => false,
+            AppTab::Workspace => self.has_active_workspace_lsp_startup(),
             AppTab::Shell => agent
                 .shell_tab
                 .sessions
@@ -240,6 +240,11 @@ impl App {
     }
 
     fn handle_mouse_move(&mut self, column: u16, row: u16, layout: UiLayout) {
+        if self.current_tab == AppTab::Workspace && WorkspaceComponent::shortcuts_popup_open(self) {
+            self.clear_workspace_hover();
+            return;
+        }
+
         if self.current_tab == AppTab::Workspace
             && WorkspaceComponent::handle_editor_hover(self, column, row, layout.body)
         {
@@ -279,6 +284,17 @@ impl App {
         row: u16,
         layout: UiLayout,
     ) -> Option<ScrollbarDragTarget> {
+        if self.current_tab == AppTab::Workspace
+            && self
+                .active_agent()
+                .is_some_and(|agent| agent.workspace.editor.is_some())
+            && self
+                .scrollbar_metrics(ScrollbarDragTarget::WorkspaceCompletionPopover, layout)
+                .is_some_and(|metrics| UiSupport::rect_contains(metrics.track, column, row))
+        {
+            return Some(ScrollbarDragTarget::WorkspaceCompletionPopover);
+        }
+
         let target = match self.current_tab {
             AppTab::Chat if !self.add_agent_selected() => ScrollbarDragTarget::Chat,
             AppTab::Workspace => {
@@ -334,6 +350,15 @@ impl App {
                 };
                 editor.set_vertical_scroll(scroll, metrics.viewport_length as u16);
             }
+            ScrollbarDragTarget::WorkspaceCompletionPopover => {
+                let Some(agent) = self.active_agent_mut() else {
+                    return false;
+                };
+                let Some(editor) = agent.workspace.editor.as_mut() else {
+                    return false;
+                };
+                editor.set_completion_window_start(scroll as usize, metrics.viewport_length);
+            }
             ScrollbarDragTarget::ShellOutput => {
                 let Some(agent) = self.active_agent_mut() else {
                     return false;
@@ -380,6 +405,10 @@ impl App {
                     viewport,
                     editor.content_height(),
                 )
+            }
+            ScrollbarDragTarget::WorkspaceCompletionPopover => {
+                let editor = agent.workspace.editor.as_ref()?;
+                WorkspaceEditorComponent::completion_popover_scrollbar_metrics(editor, layout.body)
             }
             ScrollbarDragTarget::ShellOutput => {
                 let session = agent.shell_tab.selected_session()?;
@@ -991,6 +1020,7 @@ impl App {
                 contents,
                 error,
             } => {
+                self.mark_lsp_runtime_ready_for_path(agent_index, &path);
                 let Some(agent) = self.agents.get_mut(agent_index) else {
                     return;
                 };
@@ -1014,6 +1044,7 @@ impl App {
                 target,
                 error,
             } => {
+                self.mark_lsp_runtime_ready_for_path(agent_index, &source_path);
                 let Some(agent) = self.agents.get_mut(agent_index) else {
                     return;
                 };
@@ -1067,6 +1098,7 @@ impl App {
                 items,
                 error,
             } => {
+                self.mark_lsp_runtime_ready_for_path(agent_index, &path);
                 let Some(agent) = self.agents.get_mut(agent_index) else {
                     return;
                 };
@@ -1192,6 +1224,8 @@ impl App {
             key,
             LspRuntime {
                 command_tx: command_tx.clone(),
+                server_name: self.lsp_servers[server_index].name.clone(),
+                starting: true,
             },
         );
         Ok(command_tx)
@@ -1207,6 +1241,18 @@ impl App {
             format!("No LSP server configured for .{} files.", extension)
         } else {
             "No LSP server configured for files without extension.".to_string()
+        }
+    }
+
+    fn mark_lsp_runtime_ready_for_path(&mut self, agent_index: usize, path: &std::path::Path) {
+        let Some(server_index) = self.lsp_server_index_for_path(path) else {
+            return;
+        };
+        if let Some(runtime) = self.lsp_runtimes.get_mut(&LspRuntimeKey {
+            agent_index,
+            server_index,
+        }) {
+            runtime.starting = false;
         }
     }
 
@@ -1457,6 +1503,18 @@ impl App {
         layout: UiLayout,
         ui_tx: &mpsc::UnboundedSender<UiEvent>,
     ) {
+        if self.current_tab == AppTab::Workspace && WorkspaceComponent::shortcuts_popup_open(self) {
+            self.clear_workspace_hover();
+            if UiSupport::rect_contains(layout.body, column, row) {
+                WorkspaceComponent::handle_shortcuts_popup_click(self, column, row, layout.body);
+            } else if let Some(agent) = self.active_agent_mut() {
+                if let Some(editor) = agent.workspace.editor.as_mut() {
+                    editor.close_shortcuts_help();
+                }
+            }
+            return;
+        }
+
         if UiSupport::rect_contains(layout.tabs, column, row) {
             if let Some(tab) = TopNavigationComponent::tab_from_click(layout.tabs, column, row) {
                 TopNavigationComponent::activate_tab(self, tab, ui_tx.clone());
@@ -1481,6 +1539,9 @@ impl App {
                 .is_some_and(|agent| agent.workspace.editor.is_some())
         {
             self.clear_workspace_hover();
+            if WorkspaceComponent::handle_shortcuts_popup_click(self, column, row, layout.body) {
+                return;
+            }
             if modifiers.contains(KeyModifiers::CONTROL)
                 && WorkspaceComponent::handle_editor_definition_click(
                     self,
@@ -1522,12 +1583,29 @@ impl App {
         up: bool,
         horizontal: bool,
     ) {
+        if self.current_tab == AppTab::Workspace && WorkspaceComponent::shortcuts_popup_open(self) {
+            return;
+        }
+
         if UiSupport::rect_contains(layout.sidebar_list, column, row) {
             if up {
                 self.move_selection_up();
             } else {
                 self.move_selection_down();
             }
+            return;
+        }
+
+        if self.current_tab == AppTab::Workspace
+            && WorkspaceComponent::consume_shortcuts_popup_scroll(self, column, row, layout.body)
+        {
+            return;
+        }
+
+        if !horizontal
+            && self.current_tab == AppTab::Workspace
+            && WorkspaceComponent::handle_completion_scroll(self, column, row, layout.body, up)
+        {
             return;
         }
 

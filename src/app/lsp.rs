@@ -512,8 +512,8 @@ pub(super) fn summarize_hover_text(text: &str) -> Option<String> {
             continue;
         }
 
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
+        let trimmed_end = line.trim_end();
+        if trimmed_end.trim().is_empty() {
             if !previous_blank && !lines.is_empty() {
                 lines.push(String::new());
             }
@@ -521,7 +521,7 @@ pub(super) fn summarize_hover_text(text: &str) -> Option<String> {
             continue;
         }
 
-        lines.push(trimmed.to_string());
+        lines.push(trimmed_end.to_string());
         previous_blank = false;
     }
 

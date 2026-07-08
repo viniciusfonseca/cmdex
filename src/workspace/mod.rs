@@ -25,6 +25,7 @@ use syntect::{easy::HighlightLines, highlighting::FontStyle, parsing::SyntaxRefe
 use crate::theme::ThemeRegistry;
 
 const PREVIEW_LIMIT: usize = 200_000;
+pub(crate) const COMPLETION_POPOVER_MAX_ITEMS: usize = 8;
 
 #[derive(Debug, Clone, Default)]
 pub struct FileBrowserState {
@@ -184,6 +185,8 @@ pub struct WorkspaceEditorState {
     hover_request: Option<EditorPosition>,
     completion_request: Option<EditorPosition>,
     completion_selected: usize,
+    completion_scroll: usize,
+    shortcuts_help_open: bool,
     render_cache: EditorRenderCache,
 }
 

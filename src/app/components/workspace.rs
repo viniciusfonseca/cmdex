@@ -14,7 +14,14 @@ impl WorkspaceComponent {
         };
 
         if let Some(editor) = agent.workspace.editor.as_ref() {
-            WorkspaceEditorComponent::draw(frame, editor, area, agent.workspace.editor_focused());
+            let lsp_loading = app.active_workspace_lsp_loading_label();
+            WorkspaceEditorComponent::draw(
+                frame,
+                editor,
+                area,
+                agent.workspace.editor_focused(),
+                lsp_loading.as_deref(),
+            );
             return;
         }
 
@@ -97,7 +104,9 @@ impl WorkspaceComponent {
             let Some(editor) = agent.workspace.editor.as_mut() else {
                 return false;
             };
-            if matches!(editor.mode, EditorMode::Command | EditorMode::Visual) {
+            if editor.shortcuts_help_open()
+                || matches!(editor.mode, EditorMode::Command | EditorMode::Visual)
+            {
                 return false;
             }
 
@@ -200,6 +209,28 @@ impl WorkspaceComponent {
                     return true;
                 }
                 return false;
+            }
+
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('h') {
+                if let Some(editor) = workspace.editor.as_mut() {
+                    editor.clear_hover();
+                    editor.clear_completion();
+                    editor.toggle_shortcuts_help();
+                }
+                return true;
+            }
+
+            if workspace
+                .editor
+                .as_ref()
+                .is_some_and(WorkspaceEditorState::shortcuts_help_open)
+            {
+                if let Some(editor) = workspace.editor.as_mut() {
+                    if key.code == KeyCode::Esc {
+                        editor.close_shortcuts_help();
+                    }
+                }
+                return true;
             }
 
             if workspace.sidebar_focused() {
@@ -590,6 +621,52 @@ impl WorkspaceComponent {
         handled || saved || close
     }
 
+    pub(in crate::app) fn shortcuts_popup_open(app: &App) -> bool {
+        app.active_agent()
+            .and_then(|agent| agent.workspace.editor.as_ref())
+            .is_some_and(WorkspaceEditorState::shortcuts_help_open)
+    }
+
+    pub(in crate::app) fn handle_shortcuts_popup_click(
+        app: &mut App,
+        column: u16,
+        row: u16,
+        area: Rect,
+    ) -> bool {
+        let Some(agent) = app.active_agent_mut() else {
+            return false;
+        };
+        let Some(editor) = agent.workspace.editor.as_mut() else {
+            return false;
+        };
+        if !editor.shortcuts_help_open() {
+            return false;
+        }
+
+        let popup_area = WorkspaceEditorComponent::shortcuts_popup_area(area);
+        let close_button_area = WorkspaceEditorComponent::shortcuts_popup_close_button_area(area);
+        if !UiSupport::rect_contains(popup_area, column, row)
+            || UiSupport::rect_contains(close_button_area, column, row)
+        {
+            editor.close_shortcuts_help();
+        }
+        true
+    }
+
+    pub(in crate::app) fn consume_shortcuts_popup_scroll(
+        app: &App,
+        column: u16,
+        row: u16,
+        area: Rect,
+    ) -> bool {
+        Self::shortcuts_popup_open(app)
+            && UiSupport::rect_contains(
+                WorkspaceEditorComponent::shortcuts_popup_area(area),
+                column,
+                row,
+            )
+    }
+
     pub(in crate::app) fn handle_editor_click(
         app: &mut App,
         column: u16,
@@ -655,6 +732,10 @@ impl WorkspaceComponent {
         row: u16,
         area: Rect,
     ) -> bool {
+        if Self::shortcuts_popup_open(app) {
+            return true;
+        }
+
         let Some(agent_index) = app.current_agent else {
             return false;
         };
@@ -715,6 +796,38 @@ impl WorkspaceComponent {
         };
 
         app.request_lsp_definition(agent_index, path, source, target, ui_tx);
+        true
+    }
+
+    pub(in crate::app) fn handle_completion_scroll(
+        app: &mut App,
+        column: u16,
+        row: u16,
+        area: Rect,
+        up: bool,
+    ) -> bool {
+        let Some(agent) = app.active_agent_mut() else {
+            return false;
+        };
+        let Some(editor) = agent.workspace.editor.as_mut() else {
+            return false;
+        };
+        let Some(popup_area) = WorkspaceEditorComponent::completion_popover_area(editor, area)
+        else {
+            return false;
+        };
+        if !UiSupport::rect_contains(popup_area, column, row) {
+            return false;
+        }
+
+        if up {
+            editor.select_previous_completion();
+        } else {
+            editor.select_next_completion();
+        }
+        editor.clear_hover();
+        let viewport = WorkspaceEditorComponent::viewport(area);
+        editor.ensure_visible(viewport.width, viewport.height);
         true
     }
 
