@@ -46,8 +46,8 @@ use crate::codex::{
 use crate::config::{AgentDefinition, CmdexConfig, ConfigStore, LspServerConfig};
 use crate::theme::ThemeRegistry;
 use crate::workspace::{
-    DiffBrowserState, DiffSection, EditorMode, EditorPosition, FileBrowserState, GitRemoteAction,
-    WorkspaceEditorState, WorkspaceSidebarTab,
+    DiffBrowserState, DiffSection, EditorCompletionItem, EditorMode, EditorPosition,
+    FileBrowserState, GitRemoteAction, WorkspaceEditorState, WorkspaceSidebarTab,
 };
 use tokio::process::Command;
 
@@ -138,6 +138,13 @@ enum UiEvent {
         source_path: PathBuf,
         _source_position: EditorPosition,
         target: Option<lsp::DefinitionTarget>,
+        error: Option<String>,
+    },
+    LspCompletionResult {
+        agent_index: usize,
+        path: PathBuf,
+        position: EditorPosition,
+        items: Vec<EditorCompletionItem>,
         error: Option<String>,
     },
 }

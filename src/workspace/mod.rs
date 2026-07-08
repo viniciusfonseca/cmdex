@@ -153,6 +153,16 @@ pub struct EditorPosition {
     pub col: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditorCompletionItem {
+    pub label: String,
+    pub detail: Option<String>,
+    pub insert_text: String,
+    pub replace_start: EditorPosition,
+    pub replace_end: EditorPosition,
+    pub preselected: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkspaceEditorState {
     pub path: PathBuf,
@@ -166,11 +176,14 @@ pub struct WorkspaceEditorState {
     pub dirty: bool,
     pub status: Option<String>,
     pub hover: Option<String>,
+    completion_items: Vec<EditorCompletionItem>,
     saved_lines: Vec<String>,
     undo_stack: Vec<EditorUndoState>,
     preferred_col: usize,
     selection_anchor: Option<EditorPosition>,
     hover_request: Option<EditorPosition>,
+    completion_request: Option<EditorPosition>,
+    completion_selected: usize,
     render_cache: EditorRenderCache,
 }
 

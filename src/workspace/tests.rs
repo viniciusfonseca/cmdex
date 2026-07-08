@@ -235,6 +235,86 @@ fn editor_paste_text_replaces_selection_and_exits_visual_mode() {
 }
 
 #[test]
+fn editor_completion_applies_selected_item_over_replace_range() {
+    let path = std::env::temp_dir().join(format!(
+        "cmdex-editor-completion-apply-{}.rs",
+        std::process::id()
+    ));
+    fs::write(&path, "gre\n").unwrap();
+
+    let mut editor = WorkspaceEditorState::open(&path).unwrap();
+    editor.enter_insert_mode();
+    editor.move_right();
+    editor.move_right();
+    editor.move_right();
+
+    let position = EditorPosition { row: 0, col: 3 };
+    editor.request_completion(position);
+    assert!(editor.resolve_completion(
+        position,
+        vec![EditorCompletionItem {
+            label: "greet".to_string(),
+            detail: Some("fn(&str) -> String".to_string()),
+            insert_text: "greet(name)".to_string(),
+            replace_start: EditorPosition { row: 0, col: 0 },
+            replace_end: EditorPosition { row: 0, col: 3 },
+            preselected: true,
+        }]
+    ));
+
+    assert!(editor.apply_selected_completion());
+    assert_eq!(
+        editor.lines,
+        vec!["greet(name)".to_string(), "".to_string()]
+    );
+    assert_eq!(editor.cursor_row, 0);
+    assert_eq!(editor.cursor_col, 11);
+    assert_eq!(editor.mode, EditorMode::Insert);
+    assert!(editor.completion_popover().is_none());
+
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn editor_completion_prefers_preselected_item() {
+    let path = std::env::temp_dir().join(format!(
+        "cmdex-editor-completion-preselect-{}.rs",
+        std::process::id()
+    ));
+    fs::write(&path, "gre\n").unwrap();
+
+    let mut editor = WorkspaceEditorState::open(&path).unwrap();
+    let position = EditorPosition { row: 0, col: 3 };
+    editor.request_completion(position);
+    assert!(editor.resolve_completion(
+        position,
+        vec![
+            EditorCompletionItem {
+                label: "green".to_string(),
+                detail: None,
+                insert_text: "green".to_string(),
+                replace_start: EditorPosition { row: 0, col: 0 },
+                replace_end: EditorPosition { row: 0, col: 3 },
+                preselected: false,
+            },
+            EditorCompletionItem {
+                label: "greet".to_string(),
+                detail: None,
+                insert_text: "greet".to_string(),
+                replace_start: EditorPosition { row: 0, col: 0 },
+                replace_end: EditorPosition { row: 0, col: 3 },
+                preselected: true,
+            },
+        ]
+    ));
+
+    let (_, selected, _) = editor.completion_popover().expect("completion popover");
+    assert_eq!(selected, 1);
+
+    let _ = fs::remove_file(path);
+}
+
+#[test]
 fn editor_undo_reverts_latest_change_and_restores_clean_state() {
     let path = std::env::temp_dir().join(format!(
         "cmdex-editor-undo-clean-{}.txt",

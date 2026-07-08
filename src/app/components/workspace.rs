@@ -72,6 +72,49 @@ impl WorkspaceComponent {
         false
     }
 
+    pub(in crate::app) fn handle_completion_request(
+        app: &mut App,
+        key: KeyEvent,
+        ui_tx: &mpsc::UnboundedSender<UiEvent>,
+    ) -> bool {
+        if app.current_tab != AppTab::Workspace
+            || !key.modifiers.contains(KeyModifiers::CONTROL)
+            || !matches!(key.code, KeyCode::Char(' ') | KeyCode::Null)
+        {
+            return false;
+        }
+
+        let Some(agent_index) = app.current_agent else {
+            return false;
+        };
+
+        let Some((path, source, position)) = ({
+            let agent = &mut app.agents[agent_index];
+            if agent.workspace.sidebar_focused() {
+                return false;
+            }
+
+            let Some(editor) = agent.workspace.editor.as_mut() else {
+                return false;
+            };
+            if matches!(editor.mode, EditorMode::Command | EditorMode::Visual) {
+                return false;
+            }
+
+            editor.request_completion(editor.cursor_position());
+            Some((
+                editor.path.clone(),
+                editor.source_text(),
+                editor.cursor_position(),
+            ))
+        }) else {
+            return false;
+        };
+
+        app.request_lsp_completion(agent_index, path, source, position, ui_tx);
+        true
+    }
+
     pub(in crate::app) fn handle_key(app: &mut App, key: KeyEvent, area: Rect) -> bool {
         if app.current_tab != AppTab::Workspace {
             return false;
@@ -91,9 +134,15 @@ impl WorkspaceComponent {
             let agent = &mut app.agents[agent_index];
             let workspace = &mut agent.workspace;
             let editor_mode = workspace.editor.as_ref().map(|editor| editor.mode);
+            let completion_visible = workspace
+                .editor
+                .as_ref()
+                .and_then(|editor| editor.completion_popover())
+                .is_some();
 
             if workspace.editor.is_some()
                 && key.code == KeyCode::Tab
+                && !completion_visible
                 && matches!(editor_mode, Some(EditorMode::Normal | EditorMode::Visual))
             {
                 workspace.toggle_focus();
@@ -193,6 +242,36 @@ impl WorkspaceComponent {
 
             {
                 let editor = workspace.editor.as_mut().expect("editor checked above");
+                if editor.completion_popover().is_some() {
+                    match key.code {
+                        KeyCode::Esc => {
+                            editor.clear_completion();
+                            editor.clear_hover();
+                            editor.ensure_visible(viewport.width, viewport.height);
+                            return true;
+                        }
+                        KeyCode::Up => {
+                            editor.select_previous_completion();
+                            editor.clear_hover();
+                            editor.ensure_visible(viewport.width, viewport.height);
+                            return true;
+                        }
+                        KeyCode::Down => {
+                            editor.select_next_completion();
+                            editor.clear_hover();
+                            editor.ensure_visible(viewport.width, viewport.height);
+                            return true;
+                        }
+                        KeyCode::Enter | KeyCode::Tab => {
+                            editor.apply_selected_completion();
+                            editor.clear_hover();
+                            editor.ensure_visible(viewport.width, viewport.height);
+                            return true;
+                        }
+                        _ => editor.clear_completion(),
+                    }
+                }
+
                 match editor.mode {
                     EditorMode::Command => match key.code {
                         KeyCode::Esc => {
@@ -491,6 +570,7 @@ impl WorkspaceComponent {
             if handled {
                 if let Some(editor) = workspace.editor.as_mut() {
                     editor.clear_hover();
+                    editor.clear_completion();
                     editor.ensure_visible(viewport.width, viewport.height);
                 }
             }
@@ -532,6 +612,7 @@ impl WorkspaceComponent {
             return false;
         };
         editor.clear_hover();
+        editor.clear_completion();
         editor.mode = EditorMode::Normal;
         editor.set_cursor(target.row, target.col);
         let viewport = WorkspaceEditorComponent::viewport(area);
@@ -561,6 +642,7 @@ impl WorkspaceComponent {
             return false;
         };
         editor.clear_hover();
+        editor.clear_completion();
         editor.select_to(target.row, target.col);
         let viewport = WorkspaceEditorComponent::viewport(area);
         editor.ensure_visible(viewport.width, viewport.height);

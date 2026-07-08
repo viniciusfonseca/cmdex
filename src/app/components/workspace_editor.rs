@@ -7,6 +7,8 @@ use syntect::{easy::HighlightLines, highlighting::FontStyle, parsing::SyntaxRefe
 
 pub(in crate::app) struct WorkspaceEditorComponent;
 
+const COMPLETION_POPOVER_MAX_ITEMS: usize = 8;
+
 impl WorkspaceEditorComponent {
     pub(in crate::app) fn draw(
         frame: &mut Frame,
@@ -46,7 +48,9 @@ impl WorkspaceEditorComponent {
             editor.content_height(),
             vertical_scroll,
         );
-        Self::render_hover_popover(frame, editor, code_area, vertical_scroll);
+        if !Self::render_completion_popover(frame, editor, code_area, vertical_scroll) {
+            Self::render_hover_popover(frame, editor, code_area, vertical_scroll);
+        }
 
         if let Some(status_area) = status_area {
             let status_widget = Paragraph::new(Self::status(editor, focused)).style(
@@ -126,6 +130,10 @@ impl WorkspaceEditorComponent {
                 .unwrap_or_else(|| "SIDEBAR FOCUSED  Tab editor".to_string());
         }
 
+        if editor.completion_popover().is_some() {
+            return "COMPLETION  Enter/Tab apply  Esc dismiss  Up/Down select".to_string();
+        }
+
         match editor.mode {
             EditorMode::Command => format!(":{}", editor.command),
             EditorMode::Visual => {
@@ -133,13 +141,117 @@ impl WorkspaceEditorComponent {
                     .to_string()
             }
             EditorMode::Insert => {
-                "-- INSERT --  Esc normal  Enter newline  Backspace delete".to_string()
+                "-- INSERT --  Ctrl+Space autocomplete  Esc normal  Enter newline  Backspace delete"
+                    .to_string()
             }
             EditorMode::Normal => editor.status.clone().unwrap_or_else(|| {
-                "NORMAL  Tab sidebar  arrows move  v select  y copy  p paste  u undo  Ctrl+click definition  i/a/o edit  x delete  :w save  :q preview"
+                "NORMAL  Tab sidebar  arrows move  v select  y copy  p paste  u undo  Ctrl+Space autocomplete  Ctrl+click definition  i/a/o edit  x delete  :w save  :q preview"
                     .to_string()
             }),
         }
+    }
+
+    fn render_completion_popover(
+        frame: &mut Frame,
+        editor: &WorkspaceEditorState,
+        code_area: Rect,
+        vertical_scroll: u16,
+    ) -> bool {
+        let Some((items, selected, position)) = editor.completion_popover() else {
+            return false;
+        };
+        if code_area.width < 16 || code_area.height < 4 {
+            return false;
+        }
+
+        let visible_row = position.row.saturating_sub(vertical_scroll as usize) as u16;
+        if visible_row >= code_area.height {
+            return false;
+        }
+
+        let gutter_width = editor.gutter_width() as u16;
+        let visible_col = position
+            .col
+            .saturating_sub(editor.horizontal_scroll as usize) as u16;
+        let anchor_x = code_area
+            .x
+            .saturating_add(gutter_width)
+            .saturating_add(visible_col)
+            .min(code_area.x + code_area.width.saturating_sub(1));
+        let anchor_y = code_area.y.saturating_add(visible_row);
+
+        let visible_len = items.len().min(COMPLETION_POPOVER_MAX_ITEMS);
+        let start = selected
+            .saturating_sub(visible_len.saturating_sub(1))
+            .min(items.len().saturating_sub(visible_len));
+        let lines = items[start..start + visible_len]
+            .iter()
+            .enumerate()
+            .map(|(offset, item)| Self::completion_line(item, start + offset == selected))
+            .collect::<Vec<_>>();
+        let natural_content_width = lines
+            .iter()
+            .map(|line| line.width() as u16)
+            .max()
+            .unwrap_or(1);
+        let max_content_width = code_area.width.saturating_sub(4).clamp(16, 72);
+        let content_width = natural_content_width.clamp(16, max_content_width);
+        let popup_area = Self::hover_popover_area(
+            code_area,
+            anchor_x,
+            anchor_y,
+            content_width.saturating_add(2),
+            visible_len as u16 + 2,
+        );
+
+        frame.render_widget(Clear, popup_area);
+        let popup = Paragraph::new(Text::from(lines))
+            .block(
+                UiSupport::rounded_block()
+                    .style(
+                        Style::default()
+                            .bg(UiSupport::theme().panel_bg)
+                            .fg(UiSupport::theme().foreground),
+                    )
+                    .border_style(Style::default().fg(UiSupport::theme().accent)),
+            )
+            .style(
+                Style::default()
+                    .bg(UiSupport::theme().panel_bg)
+                    .fg(UiSupport::theme().foreground),
+            );
+        frame.render_widget(popup, popup_area);
+        true
+    }
+
+    fn completion_line(item: &EditorCompletionItem, selected: bool) -> Line<'static> {
+        let selected_style = Style::default()
+            .bg(UiSupport::theme().selection_bg)
+            .fg(UiSupport::theme().selection_fg)
+            .add_modifier(Modifier::BOLD);
+        let base_style = if selected {
+            selected_style
+        } else {
+            Style::default()
+                .bg(UiSupport::theme().panel_bg)
+                .fg(UiSupport::theme().foreground)
+        };
+        let detail_style = if selected {
+            selected_style
+        } else {
+            Style::default()
+                .bg(UiSupport::theme().panel_bg)
+                .fg(UiSupport::theme().muted)
+        };
+        let prefix = if selected { "> " } else { "  " };
+        let mut spans = vec![
+            Span::styled(prefix.to_string(), base_style),
+            Span::styled(item.label.clone(), base_style),
+        ];
+        if let Some(detail) = item.detail.as_deref() {
+            spans.push(Span::styled(format!("  {detail}"), detail_style));
+        }
+        Line::from(spans)
     }
 
     fn render_hover_popover(

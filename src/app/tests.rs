@@ -1154,6 +1154,67 @@ fn workspace_arrow_keys_move_sidebar_selection_when_sidebar_is_focused() {
 }
 
 #[test]
+fn workspace_ctrl_space_requests_editor_completion() {
+    let root = std::env::temp_dir().join(format!(
+        "cmdex-app-workspace-completion-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let main = root.join("main.rs");
+    fs::write(&main, "gre\n").unwrap();
+
+    let config = CmdexConfig {
+        agents: vec![AgentDefinition {
+            name: "Test".to_string(),
+            workspace: root.clone(),
+        }],
+        ..CmdexConfig::default()
+    };
+    let mut app = App::new(PathBuf::new(), config);
+    app.current_tab = AppTab::Workspace;
+    app.current_agent = Some(0);
+    app.chat_sidebar_index = 1;
+    TopNavigationComponent::refresh_current_tab(&mut app);
+
+    {
+        let workspace = &mut app.active_agent_mut().unwrap().workspace;
+        workspace.select(0);
+        workspace.open_editor().unwrap();
+        let editor = workspace.editor.as_mut().unwrap();
+        editor.enter_insert_mode();
+        editor.move_right();
+        editor.move_right();
+        editor.move_right();
+    }
+
+    let (ui_tx, _ui_rx) = tokio::sync::mpsc::unbounded_channel();
+    let handled = WorkspaceComponent::handle_completion_request(
+        &mut app,
+        KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL),
+        &ui_tx,
+    );
+
+    assert!(handled);
+    assert_eq!(
+        app.active_agent()
+            .unwrap()
+            .workspace
+            .editor
+            .as_ref()
+            .unwrap()
+            .completion_request_position(),
+        Some(EditorPosition { row: 0, col: 3 })
+    );
+
+    app.shutdown_lsp_sessions();
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn workspace_u_shortcut_undoes_editor_changes() {
     let root = std::env::temp_dir().join(format!(
         "cmdex-app-workspace-undo-{}-{}",
@@ -1563,6 +1624,39 @@ fn lsp_hover_summary_preserves_line_breaks_and_strips_code_fences() {
         super::lsp::summarize_hover_text(hover).as_deref(),
         Some("```rust\nfn greet()\n```\n\nReturns a greeting")
     );
+}
+
+#[test]
+fn lsp_completion_parses_text_edits_and_snippets() {
+    let completion = json!({
+        "items": [{
+            "label": "greet",
+            "detail": "fn(&str) -> String",
+            "preselect": true,
+            "textEdit": {
+                "range": {
+                    "start": { "line": 0, "character": 1 },
+                    "end": { "line": 0, "character": 4 }
+                },
+                "newText": "greet(${1:name})$0"
+            },
+            "insertTextFormat": 2
+        }]
+    });
+
+    let items = super::lsp::parse_completion_response(
+        &completion,
+        "agre\n",
+        EditorPosition { row: 0, col: 4 },
+    );
+
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].label, "greet");
+    assert_eq!(items[0].detail.as_deref(), Some("fn(&str) -> String"));
+    assert_eq!(items[0].insert_text, "greet(name)");
+    assert_eq!(items[0].replace_start, EditorPosition { row: 0, col: 1 });
+    assert_eq!(items[0].replace_end, EditorPosition { row: 0, col: 4 });
+    assert!(items[0].preselected);
 }
 
 #[test]

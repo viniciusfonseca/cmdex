@@ -523,6 +523,9 @@ impl App {
     ) {
         if self.current_tab == AppTab::Workspace {
             self.clear_workspace_hover();
+            if WorkspaceComponent::handle_completion_request(self, key, ui_tx) {
+                return;
+            }
         }
         if WorkspaceComponent::handle_key(self, key, area) {
             return;
@@ -637,6 +640,7 @@ impl App {
                     return;
                 }
                 if let Some(editor) = agent.workspace.editor.as_mut() {
+                    editor.clear_completion();
                     match editor.mode {
                         EditorMode::Insert => editor.insert_char(character),
                         EditorMode::Command => editor.command.push(character),
@@ -681,6 +685,7 @@ impl App {
                     return;
                 }
                 if let Some(editor) = agent.workspace.editor.as_mut() {
+                    editor.clear_completion();
                     match editor.mode {
                         EditorMode::Insert => editor.backspace(),
                         EditorMode::Command => {
@@ -1052,6 +1057,34 @@ impl App {
                     }
                 }
             }
+            UiEvent::LspCompletionResult {
+                agent_index,
+                path,
+                position,
+                items,
+                error,
+            } => {
+                let Some(agent) = self.agents.get_mut(agent_index) else {
+                    return;
+                };
+                let Some(editor) = agent.workspace.editor.as_mut() else {
+                    return;
+                };
+                if editor.path != path {
+                    return;
+                }
+                if !editor.resolve_completion(position, items) {
+                    return;
+                }
+                if let Some(error) = error {
+                    editor.status = Some(error);
+                    editor.clear_completion();
+                } else if editor.completion_popover().is_none() {
+                    editor.status = Some("No completion suggestions".to_string());
+                } else {
+                    editor.status = None;
+                }
+            }
         }
     }
 
@@ -1271,6 +1304,64 @@ impl App {
                         "Failed to send definition request to {}",
                         server_name
                     ));
+                }
+            }
+        }
+    }
+
+    pub(super) fn request_lsp_completion(
+        &mut self,
+        agent_index: usize,
+        path: PathBuf,
+        source: String,
+        position: EditorPosition,
+        ui_tx: &mpsc::UnboundedSender<UiEvent>,
+    ) {
+        let Some(server_index) = self.lsp_server_index_for_path(&path) else {
+            let error_message = self.lsp_server_error_for_path(&path);
+            if let Some(agent) = self.agents.get_mut(agent_index) {
+                if let Some(editor) = agent.workspace.editor.as_mut() {
+                    editor.status = Some(error_message);
+                    editor.clear_completion();
+                }
+            }
+            return;
+        };
+        let server_name = self.lsp_servers[server_index].name.clone();
+
+        let command_tx = match self.lsp_command_tx(agent_index, server_index, ui_tx) {
+            Ok(command_tx) => command_tx,
+            Err(error) => {
+                if let Some(agent) = self.agents.get_mut(agent_index) {
+                    if let Some(editor) = agent.workspace.editor.as_mut() {
+                        editor.status = Some(error.to_string());
+                        editor.clear_completion();
+                    }
+                }
+                return;
+            }
+        };
+
+        if command_tx
+            .send(lsp::LspCommand::Completion {
+                agent_index,
+                path,
+                source,
+                position,
+            })
+            .is_err()
+        {
+            self.lsp_runtimes.remove(&LspRuntimeKey {
+                agent_index,
+                server_index,
+            });
+            if let Some(agent) = self.agents.get_mut(agent_index) {
+                if let Some(editor) = agent.workspace.editor.as_mut() {
+                    editor.status = Some(format!(
+                        "Failed to send completion request to {}",
+                        server_name
+                    ));
+                    editor.clear_completion();
                 }
             }
         }

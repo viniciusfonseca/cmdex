@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use url::Url;
 
-use super::{EditorPosition, UiEvent};
+use super::{EditorCompletionItem, EditorPosition, UiEvent};
 use crate::config::LspServerConfig;
 
 pub(super) struct LspRuntimeFactory;
@@ -27,6 +27,12 @@ pub(super) enum LspCommand {
         position: EditorPosition,
     },
     Definition {
+        agent_index: usize,
+        path: PathBuf,
+        source: String,
+        position: EditorPosition,
+    },
+    Completion {
         agent_index: usize,
         path: PathBuf,
         source: String,
@@ -130,6 +136,31 @@ impl LspRuntimeFactory {
                                 });
                             }
                         },
+                        LspCommand::Completion {
+                            agent_index,
+                            path,
+                            source,
+                            position,
+                        } => match session.completion(&path, &source, position) {
+                            Ok(items) => {
+                                let _ = ui_tx.send(UiEvent::LspCompletionResult {
+                                    agent_index,
+                                    path,
+                                    position,
+                                    items,
+                                    error: None,
+                                });
+                            }
+                            Err(error) => {
+                                let _ = ui_tx.send(UiEvent::LspCompletionResult {
+                                    agent_index,
+                                    path,
+                                    position,
+                                    items: Vec::new(),
+                                    error: Some(error.to_string()),
+                                });
+                            }
+                        },
                         LspCommand::Shutdown => break,
                     }
                 }
@@ -195,6 +226,27 @@ impl LspSession {
             }),
         )?;
         parse_definition_response(&result)
+    }
+
+    fn completion(
+        &mut self,
+        path: &Path,
+        source: &str,
+        position: EditorPosition,
+    ) -> Result<Vec<EditorCompletionItem>> {
+        self.ensure_document_synced(path, source)?;
+        let uri = file_uri(path)?;
+        let result = self.request_value(
+            "textDocument/completion",
+            json!({
+                "textDocument": { "uri": uri },
+                "position": {
+                    "line": position.row,
+                    "character": utf16_column(source, position),
+                }
+            }),
+        )?;
+        Ok(parse_completion_response(&result, source, position))
     }
 
     fn ensure_document_synced(&mut self, path: &Path, source: &str) -> Result<()> {
@@ -305,28 +357,35 @@ impl LspSession {
     }
 
     fn request_value(&mut self, method: &str, params: Value) -> Result<Value> {
-        let id = self.next_request_id;
-        self.next_request_id += 1;
+        for attempt in 0..2 {
+            let id = self.next_request_id;
+            self.next_request_id += 1;
 
-        self.send_message(&json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-            "params": params,
-        }))?;
+            self.send_message(&json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": method,
+                "params": params.clone(),
+            }))?;
 
-        loop {
-            let response = self.read_message()?;
-            if response_id(&response) != Some(id) {
-                continue;
+            loop {
+                let response = self.read_message()?;
+                if response_id(&response) != Some(id) {
+                    continue;
+                }
+
+                if let Some(error) = response.get("error") {
+                    if attempt == 0 && response_error_is_retryable(error) {
+                        break;
+                    }
+                    return Err(anyhow!(response_error_message(error)));
+                }
+
+                return Ok(response.get("result").cloned().unwrap_or(Value::Null));
             }
-
-            if let Some(error) = response.get("error") {
-                return Err(anyhow!(response_error_message(error)));
-            }
-
-            return Ok(response.get("result").cloned().unwrap_or(Value::Null));
         }
+
+        Err(anyhow!("LSP request failed after retry"))
     }
 
     fn notify(&mut self, method: &str, params: Value) -> Result<()> {
@@ -502,6 +561,30 @@ pub(super) fn parse_hover_response(value: &Value) -> Option<String> {
     hover_value_to_text(value.get("contents")?)
 }
 
+pub(super) fn parse_completion_response(
+    value: &Value,
+    source: &str,
+    position: EditorPosition,
+) -> Vec<EditorCompletionItem> {
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|item| parse_completion_item(item, source, position))
+            .collect(),
+        Value::Object(map) => map
+            .get("items")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| parse_completion_item(item, source, position))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
 fn hover_value_to_text(value: &Value) -> Option<String> {
     match value {
         Value::Null => None,
@@ -530,6 +613,183 @@ fn hover_value_to_text(value: &Value) -> Option<String> {
             .or_else(|| map.get("value").and_then(Value::as_str).map(str::to_string)),
         _ => None,
     }
+}
+
+fn parse_completion_item(
+    value: &Value,
+    source: &str,
+    position: EditorPosition,
+) -> Option<EditorCompletionItem> {
+    let map = value.as_object()?;
+    let label = map.get("label")?.as_str()?.trim().to_string();
+    if label.is_empty() {
+        return None;
+    }
+
+    let detail = map
+        .get("detail")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|detail| !detail.is_empty())
+        .map(ToString::to_string);
+    let preselected = map
+        .get("preselect")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let insert_text_format = map
+        .get("insertTextFormat")
+        .and_then(Value::as_u64)
+        .unwrap_or(1);
+
+    let text_edit = map.get("textEdit");
+    let (replace_start, replace_end, edit_text) = parse_completion_text_edit(text_edit, source)
+        .unwrap_or_else(|| {
+            let default_range = default_completion_range(source, position);
+            let text = map
+                .get("insertText")
+                .and_then(Value::as_str)
+                .unwrap_or(label.as_str())
+                .to_string();
+            (default_range.0, default_range.1, text)
+        });
+    let insert_text = if insert_text_format == 2 {
+        normalize_completion_snippet(&edit_text)
+    } else {
+        edit_text
+    };
+
+    Some(EditorCompletionItem {
+        label,
+        detail,
+        insert_text,
+        replace_start,
+        replace_end,
+        preselected,
+    })
+}
+
+fn parse_completion_text_edit(
+    value: Option<&Value>,
+    source: &str,
+) -> Option<(EditorPosition, EditorPosition, String)> {
+    let map = value?.as_object()?;
+    let new_text = map.get("newText")?.as_str()?.to_string();
+    let range = map
+        .get("range")
+        .or_else(|| map.get("replace"))
+        .or_else(|| map.get("insert"))?;
+    let (start, end) = parse_lsp_range(source, range)?;
+    Some((start, end, new_text))
+}
+
+fn parse_lsp_range(source: &str, range: &Value) -> Option<(EditorPosition, EditorPosition)> {
+    let start = range.get("start")?;
+    let end = range.get("end")?;
+
+    Some((
+        EditorPosition {
+            row: start.get("line")?.as_u64()? as usize,
+            col: char_column_from_utf16(
+                source,
+                start.get("line")?.as_u64()? as usize,
+                start.get("character")?.as_u64()? as usize,
+            ),
+        },
+        EditorPosition {
+            row: end.get("line")?.as_u64()? as usize,
+            col: char_column_from_utf16(
+                source,
+                end.get("line")?.as_u64()? as usize,
+                end.get("character")?.as_u64()? as usize,
+            ),
+        },
+    ))
+}
+
+fn default_completion_range(
+    source: &str,
+    position: EditorPosition,
+) -> (EditorPosition, EditorPosition) {
+    let line = source.split('\n').nth(position.row).unwrap_or_default();
+    let characters = line.chars().collect::<Vec<_>>();
+    let mut start = position.col.min(characters.len());
+    let mut end = position.col.min(characters.len());
+
+    while start > 0 && is_completion_symbol_char(characters[start - 1]) {
+        start -= 1;
+    }
+    while end < characters.len() && is_completion_symbol_char(characters[end]) {
+        end += 1;
+    }
+
+    (
+        EditorPosition {
+            row: position.row,
+            col: start,
+        },
+        EditorPosition {
+            row: position.row,
+            col: end,
+        },
+    )
+}
+
+fn is_completion_symbol_char(character: char) -> bool {
+    character == '_' || character.is_alphanumeric()
+}
+
+fn normalize_completion_snippet(source: &str) -> String {
+    let mut output = String::new();
+    let mut characters = source.chars().peekable();
+
+    while let Some(character) = characters.next() {
+        match character {
+            '\\' => {
+                if let Some(next) = characters.next() {
+                    output.push(next);
+                }
+            }
+            '$' => match characters.peek().copied() {
+                Some('{') => {
+                    let _ = characters.next();
+                    let mut placeholder = String::new();
+                    while let Some(next) = characters.next() {
+                        if next == '}' {
+                            break;
+                        }
+                        placeholder.push(next);
+                    }
+                    output.push_str(&snippet_placeholder_text(&placeholder));
+                }
+                Some(next) if next.is_ascii_digit() => {
+                    while characters
+                        .peek()
+                        .copied()
+                        .is_some_and(|digit| digit.is_ascii_digit())
+                    {
+                        let _ = characters.next();
+                    }
+                }
+                _ => output.push(character),
+            },
+            _ => output.push(character),
+        }
+    }
+
+    output
+}
+
+fn snippet_placeholder_text(source: &str) -> String {
+    if let Some((_, rest)) = source.split_once(':') {
+        return normalize_completion_snippet(rest);
+    }
+
+    if let Some((_, rest)) = source.split_once('|') {
+        let options = rest.trim_end_matches('|');
+        return options.split(',').next().unwrap_or_default().to_string();
+    }
+
+    String::new()
 }
 
 pub(super) fn parse_definition_response(value: &Value) -> Result<Option<DefinitionTarget>> {
@@ -637,4 +897,15 @@ fn response_error_message(error: &Value) -> String {
         .and_then(Value::as_str)
         .unwrap_or("unknown LSP error")
         .to_string()
+}
+
+fn response_error_is_retryable(error: &Value) -> bool {
+    error
+        .get("code")
+        .and_then(Value::as_i64)
+        .is_some_and(|code| code == -32801)
+        || error
+            .get("message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| message.eq_ignore_ascii_case("content modified"))
 }

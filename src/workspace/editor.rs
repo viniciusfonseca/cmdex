@@ -34,10 +34,13 @@ impl WorkspaceEditorState {
             dirty: false,
             status: None,
             hover: None,
+            completion_items: Vec::new(),
             undo_stack: Vec::new(),
             preferred_col: 0,
             selection_anchor: None,
             hover_request: None,
+            completion_request: None,
+            completion_selected: 0,
             render_cache: EditorRenderCache::default(),
         };
         editor.rebuild_render_cache();
@@ -396,6 +399,12 @@ impl WorkspaceEditorState {
         self.hover_request = None;
     }
 
+    pub fn clear_completion(&mut self) {
+        self.completion_items.clear();
+        self.completion_request = None;
+        self.completion_selected = 0;
+    }
+
     pub fn request_hover(&mut self, position: EditorPosition) -> bool {
         if self.hover_request == Some(position) {
             return false;
@@ -421,6 +430,94 @@ impl WorkspaceEditorState {
 
     pub fn hover_request_position(&self) -> Option<EditorPosition> {
         self.hover_request
+    }
+
+    pub fn request_completion(&mut self, position: EditorPosition) {
+        self.clear_completion();
+        self.completion_request = Some(position);
+    }
+
+    pub fn resolve_completion(
+        &mut self,
+        position: EditorPosition,
+        items: Vec<EditorCompletionItem>,
+    ) -> bool {
+        if self.completion_request != Some(position) {
+            return false;
+        }
+
+        if items.is_empty() {
+            self.clear_completion();
+            return true;
+        }
+
+        self.completion_selected = items.iter().position(|item| item.preselected).unwrap_or(0);
+        self.completion_items = items;
+        true
+    }
+
+    pub fn completion_popover(&self) -> Option<(&[EditorCompletionItem], usize, EditorPosition)> {
+        let position = self.completion_request?;
+        if self.completion_items.is_empty() {
+            return None;
+        }
+
+        Some((
+            self.completion_items.as_slice(),
+            self.completion_selected
+                .min(self.completion_items.len().saturating_sub(1)),
+            position,
+        ))
+    }
+
+    pub fn completion_request_position(&self) -> Option<EditorPosition> {
+        self.completion_request
+    }
+
+    pub fn select_previous_completion(&mut self) {
+        if self.completion_items.is_empty() {
+            return;
+        }
+
+        self.completion_selected = if self.completion_selected == 0 {
+            self.completion_items.len().saturating_sub(1)
+        } else {
+            self.completion_selected - 1
+        };
+    }
+
+    pub fn select_next_completion(&mut self) {
+        if self.completion_items.is_empty() {
+            return;
+        }
+
+        self.completion_selected = (self.completion_selected + 1) % self.completion_items.len();
+    }
+
+    pub fn apply_selected_completion(&mut self) -> bool {
+        let Some(item) = self.completion_items.get(self.completion_selected).cloned() else {
+            return false;
+        };
+
+        let start = self.clamp_position(item.replace_start);
+        let end = self.clamp_position(item.replace_end);
+        let (start, end) = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
+
+        self.clear_selection();
+        self.cursor_row = start.row;
+        self.cursor_col = start.col;
+        self.selection_anchor = Some(start);
+        self.cursor_row = end.row;
+        self.cursor_col = end.col;
+        self.preferred_col = self.cursor_col;
+
+        let applied = self.paste_text(&item.insert_text);
+        self.clear_completion();
+        applied
     }
 
     pub fn symbol_position_near(&self, row: usize, col: usize) -> Option<EditorPosition> {
@@ -630,7 +727,7 @@ impl WorkspaceEditorState {
             .unwrap_or(0)
     }
 
-    fn cursor_position(&self) -> EditorPosition {
+    pub fn cursor_position(&self) -> EditorPosition {
         EditorPosition {
             row: self.cursor_row,
             col: self.cursor_col,
@@ -697,6 +794,14 @@ impl WorkspaceEditorState {
         self.cursor_row = self.cursor_row.min(self.lines.len().saturating_sub(1));
         self.cursor_col = self.cursor_col.min(self.line_len(self.cursor_row));
         self.preferred_col = self.cursor_col;
+    }
+
+    fn clamp_position(&self, position: EditorPosition) -> EditorPosition {
+        let row = position.row.min(self.lines.len().saturating_sub(1));
+        EditorPosition {
+            row,
+            col: position.col.min(self.line_len(row)),
+        }
     }
 
     fn push_undo_state(&mut self) {
