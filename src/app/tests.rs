@@ -1,8 +1,9 @@
 use super::{
     chat::{ChatCommand, ChatSupport, ModelCommand},
     components::{
-        ChatComponent, ChatInputComponent, GitDiffComponent, ShellSidebarComponent,
-        TopNavigationComponent, UiSupport, WorkspaceComponent, WorkspaceEditorComponent,
+        ChatComponent, ChatInputComponent, GitDiffComponent, ModelPickerAction,
+        ShellSidebarComponent, TopNavigationComponent, UiSupport, WorkspaceComponent,
+        WorkspaceEditorComponent,
     },
     shell::{ShellOutputParser, ShellOutputRecord, ShellPresenter, ShellTabState},
     *,
@@ -606,6 +607,227 @@ fn model_command_is_detected_from_chat_input() {
         Some(ChatCommand::Model(ModelCommand::ResetDefault))
     );
     assert_eq!(ChatSupport::command_from_input("/modelx"), None);
+}
+
+#[test]
+fn model_list_opens_picker_with_current_model_selected() {
+    let config = CmdexConfig {
+        agents: vec![AgentDefinition {
+            name: "Test".to_string(),
+            workspace: PathBuf::from("/tmp"),
+        }],
+        ..CmdexConfig::default()
+    };
+    let mut app = App::new(PathBuf::new(), config);
+    app.current_agent = Some(0);
+    app.chat_sidebar_index = 1;
+    app.agents[0].chat_model = Some("gpt-5.5".to_string());
+
+    app.handle_ui_event(UiEvent::ModelListLoaded {
+        agent_index: 0,
+        models: vec![
+            ModelInfo {
+                id: "gpt-5.4".to_string(),
+                model: "gpt-5.4".to_string(),
+                display_name: "GPT-5.4".to_string(),
+                is_default: true,
+                supported_reasoning_efforts: Vec::new(),
+                default_reasoning_effort: None,
+            },
+            ModelInfo {
+                id: "gpt-5.5".to_string(),
+                model: "gpt-5.5".to_string(),
+                display_name: "GPT-5.5".to_string(),
+                is_default: false,
+                supported_reasoning_efforts: Vec::new(),
+                default_reasoning_effort: None,
+            },
+        ],
+    });
+
+    let picker = app.model_picker.as_ref().expect("model picker");
+    assert_eq!(picker.selected, 1);
+    assert_eq!(picker.models.len(), 2);
+}
+
+#[test]
+fn model_picker_keyboard_navigation_returns_selected_model() {
+    let config = CmdexConfig {
+        agents: vec![AgentDefinition {
+            name: "Test".to_string(),
+            workspace: PathBuf::from("/tmp"),
+        }],
+        ..CmdexConfig::default()
+    };
+    let mut app = App::new(PathBuf::new(), config);
+    app.current_agent = Some(0);
+    app.chat_sidebar_index = 1;
+    app.model_picker = Some(ModelPickerState {
+        agent_index: 0,
+        models: vec![
+            ModelInfo {
+                id: "gpt-5.4".to_string(),
+                model: "gpt-5.4".to_string(),
+                display_name: "GPT-5.4".to_string(),
+                is_default: true,
+                supported_reasoning_efforts: Vec::new(),
+                default_reasoning_effort: None,
+            },
+            ModelInfo {
+                id: "gpt-5.5".to_string(),
+                model: "gpt-5.5".to_string(),
+                display_name: "GPT-5.5".to_string(),
+                is_default: false,
+                supported_reasoning_efforts: Vec::new(),
+                default_reasoning_effort: None,
+            },
+        ],
+        selected: 0,
+        view: ModelPickerView::Models,
+    });
+
+    assert_eq!(
+        ChatComponent::handle_model_picker_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        ),
+        ModelPickerAction::Handled
+    );
+    assert_eq!(
+        ChatComponent::handle_model_picker_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        ),
+        ModelPickerAction::Apply {
+            agent_index: 0,
+            model: "gpt-5.5".to_string(),
+            effort: None,
+        }
+    );
+    assert!(app.model_picker.is_none());
+}
+
+#[test]
+fn model_picker_selects_effort_supported_by_selected_model() {
+    let config = CmdexConfig {
+        agents: vec![AgentDefinition {
+            name: "Test".to_string(),
+            workspace: PathBuf::from("/tmp"),
+        }],
+        ..CmdexConfig::default()
+    };
+    let mut app = App::new(PathBuf::new(), config);
+    app.current_agent = Some(0);
+    app.chat_sidebar_index = 1;
+    app.agents[0].chat_reasoning_effort = Some("low".to_string());
+    app.model_picker = Some(ModelPickerState {
+        agent_index: 0,
+        models: vec![ModelInfo {
+            id: "gpt-5.5".to_string(),
+            model: "gpt-5.5".to_string(),
+            display_name: "GPT-5.5".to_string(),
+            is_default: true,
+            supported_reasoning_efforts: vec![
+                ModelReasoningEffort {
+                    reasoning_effort: "low".to_string(),
+                    description: Some("Fast".to_string()),
+                },
+                ModelReasoningEffort {
+                    reasoning_effort: "high".to_string(),
+                    description: Some("Deep".to_string()),
+                },
+            ],
+            default_reasoning_effort: Some("high".to_string()),
+        }],
+        selected: 0,
+        view: ModelPickerView::Models,
+    });
+
+    assert_eq!(
+        ChatComponent::handle_model_picker_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        ),
+        ModelPickerAction::Handled
+    );
+    assert!(matches!(
+        app.model_picker.as_ref().map(|picker| &picker.view),
+        Some(ModelPickerView::Efforts {
+            model_index: 0,
+            selected: 0
+        })
+    ));
+
+    let backend = TestBackend::new(80, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            ChatInputComponent::draw(frame, &app, Rect::new(0, 20, 80, 4));
+        })
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    assert!(buffer_cell_for_text(buffer, "Select effort").is_some());
+    assert!(buffer_cell_for_text(buffer, "low - Fast").is_some());
+
+    assert_eq!(
+        ChatComponent::handle_model_picker_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        ),
+        ModelPickerAction::Handled
+    );
+    assert_eq!(
+        ChatComponent::handle_model_picker_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        ),
+        ModelPickerAction::Apply {
+            agent_index: 0,
+            model: "gpt-5.5".to_string(),
+            effort: Some("high".to_string()),
+        }
+    );
+    assert!(app.model_picker.is_none());
+}
+
+#[test]
+fn model_picker_renders_model_names() {
+    let config = CmdexConfig {
+        agents: vec![AgentDefinition {
+            name: "Test".to_string(),
+            workspace: PathBuf::from("/tmp"),
+        }],
+        ..CmdexConfig::default()
+    };
+    let mut app = App::new(PathBuf::new(), config);
+    app.current_agent = Some(0);
+    app.chat_sidebar_index = 1;
+    app.model_picker = Some(ModelPickerState {
+        agent_index: 0,
+        models: vec![ModelInfo {
+            id: "gpt-5.5".to_string(),
+            model: "gpt-5.5".to_string(),
+            display_name: "GPT-5.5".to_string(),
+            is_default: true,
+            supported_reasoning_efforts: Vec::new(),
+            default_reasoning_effort: None,
+        }],
+        selected: 0,
+        view: ModelPickerView::Models,
+    });
+
+    let backend = TestBackend::new(80, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            ChatInputComponent::draw(frame, &app, Rect::new(0, 20, 80, 4));
+        })
+        .unwrap();
+
+    let buffer = terminal.backend().buffer();
+    assert!(buffer_cell_for_text(buffer, "Select model").is_some());
+    assert!(buffer_cell_for_text(buffer, "gpt-5.5").is_some());
+    assert!(buffer_cell_for_text(buffer, "GPT-5.5").is_some());
 }
 
 #[test]

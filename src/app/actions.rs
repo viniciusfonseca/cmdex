@@ -1,4 +1,8 @@
-use super::{chat::ChatSupport, components::*, lsp, shell, *};
+use super::{
+    chat::{ChatSupport, ModelCommand},
+    components::*,
+    lsp, shell, *,
+};
 
 impl App {
     pub(super) fn on_tick(&mut self, ui_tx: &mpsc::UnboundedSender<UiEvent>) -> bool {
@@ -550,6 +554,28 @@ impl App {
         ui_tx: &mpsc::UnboundedSender<UiEvent>,
         area: Rect,
     ) {
+        match ChatComponent::handle_model_picker_key(self, key) {
+            ModelPickerAction::NotOpen => {}
+            ModelPickerAction::Handled => return,
+            ModelPickerAction::Apply {
+                agent_index,
+                model,
+                effort,
+            } => {
+                if self.current_agent == Some(agent_index) {
+                    ChatComponent::submit_model_command(
+                        self,
+                        ModelCommand::Set {
+                            model: Some(model),
+                            effort,
+                        },
+                        codex.clone(),
+                        ui_tx.clone(),
+                    );
+                }
+                return;
+            }
+        }
         if self.current_tab == AppTab::Workspace {
             self.clear_workspace_hover();
             if WorkspaceComponent::handle_completion_request(self, key, ui_tx) {
@@ -864,6 +890,47 @@ impl App {
                     ));
                 }
                 self.status_message = Some("Model command finished".to_string());
+            }
+            UiEvent::ModelListLoaded {
+                agent_index,
+                models,
+            } => {
+                let Some(agent) = self.agents.get_mut(agent_index) else {
+                    return;
+                };
+                agent.status = Some("Select a model".to_string());
+
+                if models.is_empty() {
+                    let message =
+                        ChatComponent::format_model_list_message(&agent.chat_model_label, &models);
+                    agent.push_message(ChatMessage::new(MessageRole::System, message, None));
+                    self.status_message = Some("No models available".to_string());
+                    return;
+                }
+
+                let selected = agent
+                    .chat_model
+                    .as_deref()
+                    .and_then(|current| {
+                        models
+                            .iter()
+                            .position(|model| model.id == current || model.model == current)
+                    })
+                    .or_else(|| models.iter().position(|model| model.is_default))
+                    .unwrap_or(0);
+
+                if self.current_agent == Some(agent_index) {
+                    self.model_picker = Some(ModelPickerState {
+                        agent_index,
+                        models,
+                        selected,
+                        view: ModelPickerView::Models,
+                    });
+                    self.status_message = Some(
+                        "Use Up/Down to select a model, Enter to apply, or Esc to cancel"
+                            .to_string(),
+                    );
+                }
             }
             UiEvent::SessionLoaded {
                 agent_index,

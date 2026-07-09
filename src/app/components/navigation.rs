@@ -56,6 +56,7 @@ impl TopNavigationComponent {
 
     pub(in crate::app) fn set_tab(app: &mut App, tab: AppTab) {
         if app.current_tab != tab {
+            app.model_picker = None;
             app.current_tab = tab;
             Self::refresh_current_tab(app);
         }

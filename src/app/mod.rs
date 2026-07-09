@@ -40,8 +40,8 @@ use ratatui::{
 use tokio::{sync::mpsc, time::sleep};
 
 use crate::codex::{
-    CodexAppServer, HistoryEntryKind, ModelInfo, ServerEvent, ThreadInfo, ThreadItem,
-    WorkspaceSession,
+    CodexAppServer, HistoryEntryKind, ModelInfo, ModelReasoningEffort, ServerEvent, ThreadInfo,
+    ThreadItem, WorkspaceSession,
 };
 use crate::config::{AgentDefinition, CmdexConfig, ConfigStore, LspServerConfig};
 use crate::theme::ThemeRegistry;
@@ -80,6 +80,10 @@ enum UiEvent {
     ModelCommandResult {
         agent_index: usize,
         message: String,
+    },
+    ModelListLoaded {
+        agent_index: usize,
+        models: Vec<ModelInfo>,
     },
     SessionLoaded {
         agent_index: usize,
@@ -525,6 +529,7 @@ pub struct App {
     current_agent: Option<usize>,
     chat_sidebar_index: usize,
     chat_input: String,
+    model_picker: Option<ModelPickerState>,
     add_form: AddAgentForm,
     spinner_index: usize,
     status_message: Option<String>,
@@ -537,6 +542,20 @@ pub struct App {
     shell_runtimes: HashMap<ShellSessionKey, ShellSessionRuntime>,
     lsp_runtimes: HashMap<LspRuntimeKey, LspRuntime>,
     pending_workspace_hover: Option<PendingWorkspaceHover>,
+}
+
+#[derive(Debug, Clone)]
+struct ModelPickerState {
+    agent_index: usize,
+    models: Vec<ModelInfo>,
+    selected: usize,
+    view: ModelPickerView,
+}
+
+#[derive(Debug, Clone)]
+enum ModelPickerView {
+    Models,
+    Efforts { model_index: usize, selected: usize },
 }
 
 impl App {
@@ -579,6 +598,7 @@ impl App {
             current_agent,
             chat_sidebar_index,
             chat_input: String::new(),
+            model_picker: None,
             add_form: AddAgentForm::default(),
             spinner_index: 0,
             status_message: None,

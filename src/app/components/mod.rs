@@ -14,10 +14,18 @@ pub(super) mod workspace_editor;
 pub(super) mod workspace_sidebar;
 
 pub(super) use self::{
-    add_agent_dialog::AddAgentDialogComponent, agents_sidebar::AgentsSidebarComponent,
-    chat::ChatComponent, chat_input::ChatInputComponent, git_diff::GitDiffComponent,
-    git_diff_sidebar::GitDiffSidebarComponent, help_bar::HelpBarComponent,
-    navigation::TopNavigationComponent, shared::UiSupport, shell::ShellComponent,
-    shell_sidebar::ShellSidebarComponent, workspace::WorkspaceComponent,
-    workspace_editor::WorkspaceEditorComponent, workspace_sidebar::WorkspaceSidebarComponent,
+    add_agent_dialog::AddAgentDialogComponent,
+    agents_sidebar::AgentsSidebarComponent,
+    chat::{ChatComponent, ModelPickerAction},
+    chat_input::ChatInputComponent,
+    git_diff::GitDiffComponent,
+    git_diff_sidebar::GitDiffSidebarComponent,
+    help_bar::HelpBarComponent,
+    navigation::TopNavigationComponent,
+    shared::UiSupport,
+    shell::ShellComponent,
+    shell_sidebar::ShellSidebarComponent,
+    workspace::WorkspaceComponent,
+    workspace_editor::WorkspaceEditorComponent,
+    workspace_sidebar::WorkspaceSidebarComponent,
 };

@@ -89,6 +89,16 @@ pub struct ModelInfo {
     pub model: String,
     pub display_name: String,
     pub is_default: bool,
+    pub supported_reasoning_efforts: Vec<ModelReasoningEffort>,
+    pub default_reasoning_effort: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModelReasoningEffort {
+    #[serde(rename = "reasoningEffort")]
+    pub reasoning_effort: String,
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 #[derive(Clone)]
@@ -326,6 +336,8 @@ impl CodexAppServer {
                 model: model.model,
                 display_name: model.display_name,
                 is_default: model.is_default,
+                supported_reasoning_efforts: model.supported_reasoning_efforts,
+                default_reasoning_effort: model.default_reasoning_effort,
             }));
 
             let Some(next_cursor) = response.next_cursor else {
@@ -556,6 +568,10 @@ struct ModelListItem {
     display_name: String,
     #[serde(rename = "isDefault")]
     is_default: bool,
+    #[serde(rename = "supportedReasoningEfforts", default)]
+    supported_reasoning_efforts: Vec<ModelReasoningEffort>,
+    #[serde(rename = "defaultReasoningEffort", default)]
+    default_reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1107,6 +1123,26 @@ mod tests {
         assert!(entries[0].text.contains("```diff"));
         assert!(entries[0].text.contains("+new"));
         assert!(entries[0].text.contains("- Added `README.md`"));
+    }
+
+    #[test]
+    fn model_list_preserves_supported_reasoning_efforts() {
+        let model: ModelListItem = serde_json::from_value(json!({
+            "id": "gpt-5.5",
+            "model": "gpt-5.5",
+            "displayName": "GPT-5.5",
+            "isDefault": true,
+            "supportedReasoningEfforts": [
+                {"reasoningEffort": "low", "description": "Fast"},
+                {"reasoningEffort": "high", "description": "Deep"}
+            ],
+            "defaultReasoningEffort": "high"
+        }))
+        .unwrap();
+
+        assert_eq!(model.supported_reasoning_efforts.len(), 2);
+        assert_eq!(model.supported_reasoning_efforts[0].reasoning_effort, "low");
+        assert_eq!(model.default_reasoning_effort.as_deref(), Some("high"));
     }
 
     #[test]

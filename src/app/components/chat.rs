@@ -6,6 +6,17 @@ use super::UiSupport;
 
 pub(in crate::app) struct ChatComponent;
 
+#[derive(Debug, PartialEq, Eq)]
+pub(in crate::app) enum ModelPickerAction {
+    NotOpen,
+    Handled,
+    Apply {
+        agent_index: usize,
+        model: String,
+        effort: Option<String>,
+    },
+}
+
 impl ChatComponent {
     pub(in crate::app) fn draw(frame: &mut Frame, app: &App, area: Rect) {
         let Some(agent) = app.active_agent() else {
@@ -74,6 +85,133 @@ impl ChatComponent {
 
         app.chat_input.clear();
         Self::dispatch_message(app, agent_index, text, codex, ui_tx);
+    }
+
+    pub(in crate::app) fn handle_model_picker_key(
+        app: &mut App,
+        key: KeyEvent,
+    ) -> ModelPickerAction {
+        if app.current_tab != AppTab::Chat {
+            return ModelPickerAction::NotOpen;
+        }
+
+        let Some(mut picker) = app.model_picker.take() else {
+            return ModelPickerAction::NotOpen;
+        };
+
+        let action = match &mut picker.view {
+            super::super::ModelPickerView::Models => match key.code {
+                KeyCode::Up => {
+                    picker.selected = picker.selected.saturating_sub(1);
+                    ModelPickerAction::Handled
+                }
+                KeyCode::Down => {
+                    picker.selected = picker
+                        .selected
+                        .saturating_add(1)
+                        .min(picker.models.len().saturating_sub(1));
+                    ModelPickerAction::Handled
+                }
+                KeyCode::Esc => {
+                    app.status_message = Some("Model selection canceled".to_string());
+                    return ModelPickerAction::Handled;
+                }
+                KeyCode::Enter => {
+                    let model_index = picker.selected;
+                    let Some(model) = picker.models.get(model_index).cloned() else {
+                        app.model_picker = Some(picker);
+                        return ModelPickerAction::Handled;
+                    };
+
+                    if model.supported_reasoning_efforts.is_empty() {
+                        ModelPickerAction::Apply {
+                            agent_index: picker.agent_index,
+                            model: model.id,
+                            effort: model.default_reasoning_effort,
+                        }
+                    } else {
+                        let current_effort = app
+                            .agents
+                            .get(picker.agent_index)
+                            .and_then(|agent| agent.chat_reasoning_effort.as_deref());
+                        let selected_effort = current_effort
+                            .and_then(|current| {
+                                model
+                                    .supported_reasoning_efforts
+                                    .iter()
+                                    .position(|effort| effort.reasoning_effort == current)
+                            })
+                            .or_else(|| {
+                                model
+                                    .default_reasoning_effort
+                                    .as_deref()
+                                    .and_then(|default| {
+                                        model
+                                            .supported_reasoning_efforts
+                                            .iter()
+                                            .position(|effort| effort.reasoning_effort == default)
+                                    })
+                            })
+                            .unwrap_or(0);
+                        picker.view = super::super::ModelPickerView::Efforts {
+                            model_index,
+                            selected: selected_effort,
+                        };
+                        if let Some(agent) = app.agents.get_mut(picker.agent_index) {
+                            agent.status = Some("Select an effort".to_string());
+                        }
+                        app.status_message = Some(
+                            "Use Up/Down to select an effort, Enter to apply, or Esc to return"
+                                .to_string(),
+                        );
+                        ModelPickerAction::Handled
+                    }
+                }
+                _ => ModelPickerAction::Handled,
+            },
+            super::super::ModelPickerView::Efforts {
+                model_index,
+                selected,
+            } => {
+                let model = &picker.models[*model_index];
+                match key.code {
+                    KeyCode::Up => {
+                        *selected = selected.saturating_sub(1);
+                        ModelPickerAction::Handled
+                    }
+                    KeyCode::Down => {
+                        *selected = selected
+                            .saturating_add(1)
+                            .min(model.supported_reasoning_efforts.len().saturating_sub(1));
+                        ModelPickerAction::Handled
+                    }
+                    KeyCode::Esc => {
+                        picker.view = super::super::ModelPickerView::Models;
+                        if let Some(agent) = app.agents.get_mut(picker.agent_index) {
+                            agent.status = Some("Select a model".to_string());
+                        }
+                        app.status_message = Some("Select a model".to_string());
+                        ModelPickerAction::Handled
+                    }
+                    KeyCode::Enter => {
+                        let effort = model.supported_reasoning_efforts[*selected]
+                            .reasoning_effort
+                            .clone();
+                        ModelPickerAction::Apply {
+                            agent_index: picker.agent_index,
+                            model: picker.models[*model_index].id.clone(),
+                            effort: Some(effort),
+                        }
+                    }
+                    _ => ModelPickerAction::Handled,
+                }
+            }
+        };
+
+        if !matches!(action, ModelPickerAction::Apply { .. }) {
+            app.model_picker = Some(picker);
+        }
+        action
     }
 
     pub(in crate::app) fn handle_queue_key(app: &mut App, key: KeyEvent) -> bool {
@@ -274,17 +412,23 @@ impl ChatComponent {
 
         match command {
             ModelCommand::List => {
-                let current_label = app.agents[agent_index].chat_model_label.clone();
                 app.agents[agent_index].status = Some("Loading available models...".to_string());
                 tokio::spawn(async move {
-                    let message = match codex.list_models().await {
-                        Ok(models) => Self::format_model_list_message(&current_label, &models),
-                        Err(error) => format!("Unable to load available models.\n\n{error}"),
-                    };
-                    let _ = ui_tx.send(UiEvent::ModelCommandResult {
-                        agent_index,
-                        message,
-                    });
+                    match codex.list_models().await {
+                        Ok(models) => {
+                            let _ = ui_tx.send(UiEvent::ModelListLoaded {
+                                agent_index,
+                                models,
+                            });
+                        }
+                        Err(error) => {
+                            let message = format!("Unable to load available models.\n\n{error}");
+                            let _ = ui_tx.send(UiEvent::ModelCommandResult {
+                                agent_index,
+                                message,
+                            });
+                        }
+                    }
                 });
             }
             ModelCommand::ResetDefault => {
@@ -427,7 +571,10 @@ impl ChatComponent {
         });
     }
 
-    fn format_model_list_message(current_label: &str, models: &[ModelInfo]) -> String {
+    pub(in crate::app) fn format_model_list_message(
+        current_label: &str,
+        models: &[ModelInfo],
+    ) -> String {
         if models.is_empty() {
             return format!(
                 "Current model: `{current_label}`\n\nNo visible models were returned by the app server."

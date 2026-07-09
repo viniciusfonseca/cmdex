@@ -36,6 +36,7 @@ impl AgentsSidebarComponent {
     }
 
     pub(in crate::app) fn select_index(app: &mut App, index: usize) {
+        app.model_picker = None;
         app.chat_sidebar_index = index.min(app.agents.len());
         if app.chat_sidebar_index > 0 {
             app.current_agent = Some(app.chat_sidebar_index - 1);

@@ -49,6 +49,7 @@ impl ChatInputComponent {
         .wrap(Wrap { trim: false });
         frame.render_widget(input, area);
         Self::draw_queue_popover(frame, app, area);
+        Self::draw_model_picker(frame, app, area);
 
         let last_line = wrapped_lines
             .last()
@@ -153,6 +154,117 @@ impl ChatInputComponent {
             )
             .wrap(Wrap { trim: false });
         frame.render_widget(popup, popup_area);
+    }
+
+    fn draw_model_picker(frame: &mut Frame, app: &App, area: Rect) {
+        let Some(picker) = app.model_picker.as_ref() else {
+            return;
+        };
+        if picker.models.is_empty() {
+            return;
+        }
+
+        let (title, selected, labels) = match &picker.view {
+            super::super::ModelPickerView::Models => (
+                "Select model".to_string(),
+                picker.selected.min(picker.models.len().saturating_sub(1)),
+                picker
+                    .models
+                    .iter()
+                    .map(Self::model_label)
+                    .collect::<Vec<_>>(),
+            ),
+            super::super::ModelPickerView::Efforts {
+                model_index,
+                selected,
+            } => {
+                let model = &picker.models[*model_index];
+                (
+                    "Select effort".to_string(),
+                    (*selected).min(model.supported_reasoning_efforts.len().saturating_sub(1)),
+                    model
+                        .supported_reasoning_efforts
+                        .iter()
+                        .map(Self::effort_label)
+                        .collect::<Vec<_>>(),
+                )
+            }
+        };
+        let visible_count = labels.len().min(7);
+        let start = UiSupport::list_offset(selected, labels.len(), visible_count);
+        let popup_width = area.width.saturating_sub(2).min(72).max(1);
+        let popup_height = visible_count as u16 + 2;
+        let popup_y = area.y.saturating_sub(popup_height.saturating_sub(1));
+        let popup_area = Rect::new(area.x, popup_y, popup_width, popup_height);
+
+        let lines = labels
+            .iter()
+            .skip(start)
+            .take(visible_count)
+            .enumerate()
+            .map(|(offset, label)| {
+                let is_selected = start + offset == selected;
+                let style = if is_selected {
+                    UiSupport::selection_style()
+                } else {
+                    Style::default()
+                        .bg(UiSupport::theme().panel_bg)
+                        .fg(UiSupport::theme().foreground)
+                };
+                let prefix = if is_selected { "› " } else { "  " };
+                Line::from(Span::styled(
+                    format!(
+                        "{}{}",
+                        prefix,
+                        Self::queue_preview(label, popup_area.width.saturating_sub(4))
+                    ),
+                    style,
+                ))
+            })
+            .collect::<Vec<_>>();
+
+        frame.render_widget(Clear, popup_area);
+        let popup = Paragraph::new(Text::from(lines))
+            .block(
+                UiSupport::rounded_block()
+                    .title(title)
+                    .style(
+                        Style::default()
+                            .bg(UiSupport::theme().panel_bg)
+                            .fg(UiSupport::theme().foreground),
+                    )
+                    .border_style(Style::default().fg(UiSupport::theme().accent)),
+            )
+            .style(
+                Style::default()
+                    .bg(UiSupport::theme().panel_bg)
+                    .fg(UiSupport::theme().foreground),
+            )
+            .wrap(Wrap { trim: false });
+        frame.render_widget(popup, popup_area);
+    }
+
+    fn model_label(model: &ModelInfo) -> String {
+        let mut label = model.model.clone();
+        if model.display_name != model.model {
+            label.push_str(" - ");
+            label.push_str(&model.display_name);
+        }
+        if model.id != model.model {
+            label.push_str(" [");
+            label.push_str(&model.id);
+            label.push(']');
+        }
+        label
+    }
+
+    fn effort_label(effort: &ModelReasoningEffort) -> String {
+        effort
+            .description
+            .as_deref()
+            .filter(|description| !description.trim().is_empty())
+            .map(|description| format!("{} - {description}", effort.reasoning_effort))
+            .unwrap_or_else(|| effort.reasoning_effort.clone())
     }
 
     fn queue_preview(text: &str, width: u16) -> String {
