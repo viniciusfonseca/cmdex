@@ -69,14 +69,100 @@ impl WorkspaceComponent {
             return false;
         }
 
-        app.last_workspace_refresh_at = Some(now);
-        if let Some(agent) = app.active_agent_mut() {
-            return agent
-                .workspace
-                .refresh_if_changed(&agent.definition.workspace);
+        if app.workspace_refresh_in_flight {
+            return false;
         }
 
-        false
+        app.last_workspace_refresh_at = Some(now);
+        let Some(agent_index) = app.current_agent else {
+            return false;
+        };
+        Self::request_refresh_for_agent(app, agent_index)
+    }
+
+    pub(in crate::app) fn request_refresh_for_agent(app: &mut App, agent_index: usize) -> bool {
+        let Some(agent) = app.agents.get(agent_index) else {
+            return false;
+        };
+        let root = agent.definition.workspace.clone();
+        app.workspace_refresh_in_flight = true;
+        app.enqueue_effect(super::super::effects::AppEffect::RefreshWorkspace {
+            agent_index,
+            root,
+        });
+        true
+    }
+
+    pub(in crate::app) fn maybe_search(app: &mut App) -> bool {
+        let Some(agent_index) = app.current_agent else {
+            return false;
+        };
+        let request = {
+            let workspace = &mut app.agents[agent_index].workspace;
+            workspace.take_search_request()
+        };
+        let Some((query, generation)) = request else {
+            return false;
+        };
+
+        let entries = app.agents[agent_index].workspace.entries.clone();
+        app.enqueue_effect(super::super::effects::AppEffect::SearchWorkspace {
+            agent_index,
+            entries,
+            query,
+            generation,
+        });
+        true
+    }
+
+    pub(in crate::app) fn request_open_editor(app: &mut App, agent_index: usize) -> bool {
+        Self::request_open_editor_at(app, agent_index, None)
+    }
+
+    pub(in crate::app) fn request_open_editor_at(
+        app: &mut App,
+        agent_index: usize,
+        position: Option<EditorPosition>,
+    ) -> bool {
+        let Some(agent) = app.agents.get_mut(agent_index) else {
+            return false;
+        };
+        let Some(path) = agent
+            .workspace
+            .entries
+            .get(agent.workspace.selected)
+            .map(|entry| entry.path.clone())
+        else {
+            return false;
+        };
+        if !agent.workspace.begin_editor_load(&path) {
+            return false;
+        }
+        app.enqueue_effect(super::super::effects::AppEffect::OpenWorkspaceEditor {
+            agent_index,
+            path,
+            position,
+        });
+        true
+    }
+
+    pub(in crate::app) fn request_preview(app: &mut App, agent_index: usize) -> bool {
+        let Some(agent) = app.agents.get(agent_index) else {
+            return false;
+        };
+        let Some(path) = agent
+            .workspace
+            .entries
+            .get(agent.workspace.selected)
+            .map(|entry| entry.path.clone())
+        else {
+            return false;
+        };
+        app.enqueue_effect(super::super::effects::AppEffect::LoadWorkspacePreview {
+            agent_index,
+            path,
+        });
+        true
     }
 
     pub(in crate::app) fn handle_completion_request(
@@ -122,503 +208,6 @@ impl WorkspaceComponent {
 
         app.request_lsp_completion(agent_index, path, source, position, ui_tx);
         true
-    }
-
-    pub(in crate::app) fn handle_key(app: &mut App, key: KeyEvent, area: Rect) -> bool {
-        if app.current_tab != AppTab::Workspace {
-            return false;
-        }
-
-        let Some(agent_index) = app.current_agent else {
-            return false;
-        };
-
-        let viewport = WorkspaceEditorComponent::viewport(App::compute_layout(app, area).body);
-        let page_step = usize::from(CONTENT_SCROLL_STEP);
-        let mut saved = false;
-        let mut close = false;
-        let mut handled = false;
-
-        {
-            let agent = &mut app.agents[agent_index];
-            let workspace = &mut agent.workspace;
-            let editor_mode = workspace.editor.as_ref().map(|editor| editor.mode);
-            let completion_visible = workspace
-                .editor
-                .as_ref()
-                .and_then(|editor| editor.completion_popover())
-                .is_some();
-
-            if workspace.editor.is_some()
-                && key.code == KeyCode::Tab
-                && !completion_visible
-                && matches!(editor_mode, Some(EditorMode::Normal | EditorMode::Visual))
-            {
-                workspace.toggle_focus();
-                return true;
-            }
-
-            if workspace.sidebar_focused() && workspace.sidebar_tab == WorkspaceSidebarTab::Search {
-                match key.code {
-                    KeyCode::Esc => {
-                        workspace.set_sidebar_tab(WorkspaceSidebarTab::Files);
-                        workspace.focus_sidebar();
-                        return true;
-                    }
-                    KeyCode::Up => {
-                        workspace.search_move_up();
-                        return true;
-                    }
-                    KeyCode::Down => {
-                        workspace.search_move_down();
-                        return true;
-                    }
-                    KeyCode::Enter => {
-                        match workspace.open_selected_search_result() {
-                            Ok(true) => {
-                                if let Some(editor) = workspace.editor.as_mut() {
-                                    editor.ensure_visible(viewport.width, viewport.height);
-                                }
-                            }
-                            Ok(false) => {}
-                            Err(error) => workspace.error = Some(error.to_string()),
-                        }
-                        return true;
-                    }
-                    KeyCode::Backspace => {
-                        workspace.pop_search_char();
-                        return true;
-                    }
-                    KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        workspace.push_search_char(character);
-                        return true;
-                    }
-                    _ => {}
-                }
-            }
-
-            if workspace.editor.is_none() {
-                if key.code == KeyCode::Enter {
-                    if workspace.toggle_current_directory() {
-                        return true;
-                    }
-                    match workspace.open_editor() {
-                        Ok(()) => {}
-                        Err(error) => workspace.error = Some(error.to_string()),
-                    }
-                    return true;
-                }
-                return false;
-            }
-
-            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('h') {
-                if let Some(editor) = workspace.editor.as_mut() {
-                    editor.clear_hover();
-                    editor.clear_completion();
-                    editor.toggle_shortcuts_help();
-                }
-                return true;
-            }
-
-            if workspace
-                .editor
-                .as_ref()
-                .is_some_and(WorkspaceEditorState::shortcuts_help_open)
-            {
-                if let Some(editor) = workspace.editor.as_mut() {
-                    if key.code == KeyCode::Esc {
-                        editor.close_shortcuts_help();
-                    }
-                }
-                return true;
-            }
-
-            if workspace.sidebar_focused() {
-                match key.code {
-                    KeyCode::Up => {
-                        workspace.move_up();
-                        handled = true;
-                    }
-                    KeyCode::Down => {
-                        workspace.move_down();
-                        handled = true;
-                    }
-                    KeyCode::Enter => {
-                        if workspace.toggle_current_directory() {
-                            handled = true;
-                        } else {
-                            match workspace.open_editor() {
-                                Ok(()) => {
-                                    handled = true;
-                                }
-                                Err(error) => {
-                                    workspace.error = Some(error.to_string());
-                                    handled = true;
-                                }
-                            }
-                        }
-                    }
-                    KeyCode::Esc => handled = true,
-                    _ => {}
-                }
-
-                if handled {
-                    if let Some(editor) = workspace.editor.as_mut() {
-                        editor.clear_hover();
-                        editor.ensure_visible(viewport.width, viewport.height);
-                    }
-                }
-                return handled;
-            }
-
-            {
-                let editor = workspace.editor.as_mut().expect("editor checked above");
-                if editor.completion_popover().is_some() {
-                    match key.code {
-                        KeyCode::Esc => {
-                            editor.clear_completion();
-                            editor.clear_hover();
-                            editor.ensure_visible(viewport.width, viewport.height);
-                            return true;
-                        }
-                        KeyCode::Up => {
-                            editor.select_previous_completion();
-                            editor.clear_hover();
-                            editor.ensure_visible(viewport.width, viewport.height);
-                            return true;
-                        }
-                        KeyCode::Down => {
-                            editor.select_next_completion();
-                            editor.clear_hover();
-                            editor.ensure_visible(viewport.width, viewport.height);
-                            return true;
-                        }
-                        KeyCode::Enter | KeyCode::Tab => {
-                            editor.apply_selected_completion();
-                            editor.clear_hover();
-                            editor.ensure_visible(viewport.width, viewport.height);
-                            return true;
-                        }
-                        _ => editor.clear_completion(),
-                    }
-                }
-
-                match editor.mode {
-                    EditorMode::Command => match key.code {
-                        KeyCode::Esc => {
-                            editor.cancel_command();
-                            handled = true;
-                        }
-                        KeyCode::Backspace => {
-                            editor.command.pop();
-                            handled = true;
-                        }
-                        KeyCode::Enter => {
-                            match editor.execute_command() {
-                                Ok(result) => {
-                                    saved = result.saved;
-                                    close = result.close;
-                                }
-                                Err(error) => editor.status = Some(error.to_string()),
-                            }
-                            handled = true;
-                        }
-                        KeyCode::Char(character)
-                            if !key.modifiers.contains(KeyModifiers::CONTROL) =>
-                        {
-                            editor.command.push(character);
-                            handled = true;
-                        }
-                        _ => handled = true,
-                    },
-                    EditorMode::Visual => match key.code {
-                        KeyCode::Esc | KeyCode::Char('v') => {
-                            editor.exit_visual_mode();
-                            handled = true;
-                        }
-                        KeyCode::Char('y') => {
-                            Self::copy_editor(editor);
-                            handled = true;
-                        }
-                        KeyCode::Char('p') => {
-                            Self::paste_editor(editor);
-                            handled = true;
-                        }
-                        KeyCode::Left => {
-                            editor.extend_left();
-                            handled = true;
-                        }
-                        KeyCode::Char('h') => {
-                            editor.extend_left();
-                            handled = true;
-                        }
-                        KeyCode::Right => {
-                            editor.extend_right();
-                            handled = true;
-                        }
-                        KeyCode::Char('l') => {
-                            editor.extend_right();
-                            handled = true;
-                        }
-                        KeyCode::Up => {
-                            editor.extend_up();
-                            handled = true;
-                        }
-                        KeyCode::Char('k') => {
-                            editor.extend_up();
-                            handled = true;
-                        }
-                        KeyCode::Down => {
-                            editor.extend_down();
-                            handled = true;
-                        }
-                        KeyCode::Char('j') => {
-                            editor.extend_down();
-                            handled = true;
-                        }
-                        KeyCode::Home | KeyCode::Char('0') => {
-                            editor.extend_line_start();
-                            handled = true;
-                        }
-                        KeyCode::End | KeyCode::Char('$') => {
-                            editor.extend_line_end();
-                            handled = true;
-                        }
-                        KeyCode::PageUp => {
-                            editor.extend_page_up(page_step);
-                            handled = true;
-                        }
-                        KeyCode::PageDown => {
-                            editor.extend_page_down(page_step);
-                            handled = true;
-                        }
-                        KeyCode::Delete | KeyCode::Backspace | KeyCode::Char('x') => {
-                            if editor.has_selection() {
-                                editor.delete_selection();
-                            }
-                            editor.mode = EditorMode::Normal;
-                            handled = true;
-                        }
-                        KeyCode::Char(':') => {
-                            editor.start_command();
-                            handled = true;
-                        }
-                        _ => {}
-                    },
-                    EditorMode::Insert => match key.code {
-                        KeyCode::Esc => {
-                            editor.mode = EditorMode::Normal;
-                            handled = true;
-                        }
-                        KeyCode::Enter => {
-                            editor.insert_newline();
-                            handled = true;
-                        }
-                        KeyCode::Backspace => {
-                            editor.backspace();
-                            handled = true;
-                        }
-                        KeyCode::Delete => {
-                            editor.delete_char();
-                            handled = true;
-                        }
-                        KeyCode::Left => {
-                            editor.move_left();
-                            handled = true;
-                        }
-                        KeyCode::Right => {
-                            editor.move_right();
-                            handled = true;
-                        }
-                        KeyCode::Up => {
-                            editor.move_up();
-                            handled = true;
-                        }
-                        KeyCode::Down => {
-                            editor.move_down();
-                            handled = true;
-                        }
-                        KeyCode::Home => {
-                            editor.move_line_start();
-                            handled = true;
-                        }
-                        KeyCode::End => {
-                            editor.move_line_end();
-                            handled = true;
-                        }
-                        KeyCode::PageUp => {
-                            editor.move_page_up(page_step);
-                            handled = true;
-                        }
-                        KeyCode::PageDown => {
-                            editor.move_page_down(page_step);
-                            handled = true;
-                        }
-                        KeyCode::Tab => {
-                            for _ in 0..4 {
-                                editor.insert_char(' ');
-                            }
-                            handled = true;
-                        }
-                        _ => {}
-                    },
-                    EditorMode::Normal => match key.code {
-                        KeyCode::Esc => handled = true,
-                        KeyCode::Enter => handled = true,
-                        KeyCode::Char('y') => {
-                            Self::copy_editor(editor);
-                            handled = true;
-                        }
-                        KeyCode::Char('p') => {
-                            Self::paste_editor(editor);
-                            handled = true;
-                        }
-                        KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                            editor.extend_left();
-                            handled = true;
-                        }
-                        KeyCode::Right if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                            editor.extend_right();
-                            handled = true;
-                        }
-                        KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                            editor.extend_up();
-                            handled = true;
-                        }
-                        KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                            editor.extend_down();
-                            handled = true;
-                        }
-                        KeyCode::Home if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                            editor.extend_line_start();
-                            handled = true;
-                        }
-                        KeyCode::End if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                            editor.extend_line_end();
-                            handled = true;
-                        }
-                        KeyCode::PageUp if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                            editor.extend_page_up(page_step);
-                            handled = true;
-                        }
-                        KeyCode::PageDown if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                            editor.extend_page_down(page_step);
-                            handled = true;
-                        }
-                        KeyCode::Up => {
-                            editor.move_up();
-                            handled = true;
-                        }
-                        KeyCode::Down => {
-                            editor.move_down();
-                            handled = true;
-                        }
-                        KeyCode::Left => {
-                            editor.move_left();
-                            handled = true;
-                        }
-                        KeyCode::Right => {
-                            editor.move_right();
-                            handled = true;
-                        }
-                        KeyCode::Home => {
-                            editor.move_line_start();
-                            handled = true;
-                        }
-                        KeyCode::End => {
-                            editor.move_line_end();
-                            handled = true;
-                        }
-                        KeyCode::PageUp => {
-                            editor.move_page_up(page_step);
-                            handled = true;
-                        }
-                        KeyCode::PageDown => {
-                            editor.move_page_down(page_step);
-                            handled = true;
-                        }
-                        KeyCode::Delete => {
-                            editor.delete_char();
-                            handled = true;
-                        }
-                        KeyCode::Char('h') => {
-                            editor.move_left();
-                            handled = true;
-                        }
-                        KeyCode::Char('j') => {
-                            editor.move_down();
-                            handled = true;
-                        }
-                        KeyCode::Char('k') => {
-                            editor.move_up();
-                            handled = true;
-                        }
-                        KeyCode::Char('l') => {
-                            editor.move_right();
-                            handled = true;
-                        }
-                        KeyCode::Char('0') => {
-                            editor.move_line_start();
-                            handled = true;
-                        }
-                        KeyCode::Char('$') => {
-                            editor.move_line_end();
-                            handled = true;
-                        }
-                        KeyCode::Char('v') => {
-                            editor.enter_visual_mode();
-                            handled = true;
-                        }
-                        KeyCode::Char('u') => {
-                            editor.undo();
-                            handled = true;
-                        }
-                        KeyCode::Char('i') => {
-                            editor.enter_insert_mode();
-                            handled = true;
-                        }
-                        KeyCode::Char('a') => {
-                            editor.enter_insert_after();
-                            handled = true;
-                        }
-                        KeyCode::Char('o') => {
-                            editor.open_below();
-                            handled = true;
-                        }
-                        KeyCode::Char('x') => {
-                            editor.delete_char();
-                            handled = true;
-                        }
-                        KeyCode::Char(':') => {
-                            editor.start_command();
-                            handled = true;
-                        }
-                        _ => {}
-                    },
-                }
-            }
-
-            if handled {
-                if let Some(editor) = workspace.editor.as_mut() {
-                    editor.clear_hover();
-                    editor.clear_completion();
-                    editor.ensure_visible(viewport.width, viewport.height);
-                }
-            }
-        }
-
-        if saved {
-            let root = app.agents[agent_index].definition.workspace.clone();
-            app.agents[agent_index].git_diff.refresh(&root);
-        }
-
-        if close {
-            if let Err(error) = app.agents[agent_index].workspace.close_editor() {
-                app.agents[agent_index].workspace.error = Some(error.to_string());
-            }
-        }
-
-        handled || saved || close
     }
 
     pub(in crate::app) fn shortcuts_popup_open(app: &App) -> bool {
@@ -883,36 +472,35 @@ impl WorkspaceComponent {
         editor.symbol_position_near(target.row, target.col)
     }
 
-    fn copy_editor(editor: &mut WorkspaceEditorState) {
-        let text = editor.copy_selection_or_line();
-        let copied_chars = text.chars().count();
-
-        match Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text)) {
-            Ok(()) => {
-                if editor.mode == EditorMode::Visual {
-                    editor.exit_visual_mode();
-                }
-                editor.status = Some(format!("Copied {copied_chars} chars"));
-            }
-            Err(error) => {
-                editor.status = Some(format!("Copy failed: {error}"));
-            }
-        }
+    pub(super) fn request_copy_editor(app: &mut App, agent_index: usize) -> bool {
+        let Some(editor) = app
+            .agents
+            .get(agent_index)
+            .and_then(|agent| agent.workspace.editor.as_ref())
+        else {
+            return false;
+        };
+        app.enqueue_effect(super::super::effects::AppEffect::CopyToClipboard {
+            agent_index,
+            path: editor.path.clone(),
+            text: editor.copy_selection_or_line(),
+        });
+        true
     }
 
-    fn paste_editor(editor: &mut WorkspaceEditorState) {
-        match Clipboard::new().and_then(|mut clipboard| clipboard.get_text()) {
-            Ok(text) => {
-                let pasted_chars = text.chars().count();
-                if !editor.paste_text(&text) {
-                    editor.status = Some("Clipboard is empty".to_string());
-                    return;
-                }
-                editor.status = Some(format!("Pasted {pasted_chars} chars"));
-            }
-            Err(error) => {
-                editor.status = Some(format!("Paste failed: {error}"));
-            }
-        }
+    pub(super) fn request_paste_editor(app: &mut App, agent_index: usize) -> bool {
+        let Some(path) = app
+            .agents
+            .get(agent_index)
+            .and_then(|agent| agent.workspace.editor.as_ref())
+            .map(|editor| editor.path.clone())
+        else {
+            return false;
+        };
+        app.enqueue_effect(super::super::effects::AppEffect::PasteFromClipboard {
+            agent_index,
+            path,
+        });
+        true
     }
 }

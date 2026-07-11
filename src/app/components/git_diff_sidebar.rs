@@ -1,5 +1,5 @@
 use super::super::*;
-use super::UiSupport;
+use super::{GitDiffComponent, UiSupport};
 
 pub(in crate::app) struct GitDiffSidebarComponent;
 
@@ -43,19 +43,26 @@ impl GitDiffSidebarComponent {
         }
 
         let visible_row = row.saturating_sub(inner.y) as usize;
-        if let Some(agent) = app.active_agent_mut() {
+        let should_refresh = if let Some(agent) = app.active_agent_mut() {
             let total = agent.git_diff.visible_entries().len();
             if total == 0 {
-                return;
+                false
+            } else {
+                let offset = UiSupport::list_offset(
+                    agent.git_diff.selected_index(),
+                    total,
+                    inner.height as usize,
+                );
+                let index = (offset + visible_row).min(total.saturating_sub(1));
+                let root = agent.definition.workspace.clone();
+                agent.git_diff.select(&root, index);
+                true
             }
-            let offset = UiSupport::list_offset(
-                agent.git_diff.selected_index(),
-                total,
-                inner.height as usize,
-            );
-            let index = (offset + visible_row).min(total.saturating_sub(1));
-            let root = agent.definition.workspace.clone();
-            agent.git_diff.select(&root, index);
+        } else {
+            false
+        };
+        if should_refresh {
+            GitDiffComponent::request_refresh(app);
         }
     }
 }

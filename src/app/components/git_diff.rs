@@ -1,7 +1,6 @@
+use super::super::effects::AppEffect;
 use super::super::*;
 use super::UiSupport;
-use crate::workspace::GitDiffSupport;
-use tokio::task;
 
 pub(in crate::app) struct GitDiffComponent;
 
@@ -18,6 +17,42 @@ pub(in crate::app) struct GitDiffLayout {
 }
 
 impl GitDiffComponent {
+    pub(in crate::app) fn request_refresh(app: &mut App) -> bool {
+        let Some(agent_index) = app.current_agent else {
+            return false;
+        };
+        Self::request_refresh_for_agent(app, agent_index)
+    }
+
+    pub(in crate::app) fn request_refresh_for_agent(app: &mut App, agent_index: usize) -> bool {
+        if agent_index >= app.agents.len() {
+            return false;
+        }
+        let (root, active_section, selected_path, generation) = {
+            let agent = &mut app.agents[agent_index];
+            let selected_path = agent
+                .git_diff
+                .visible_entries()
+                .get(agent.git_diff.selected_index())
+                .map(|entry| entry.path.clone());
+            let generation = agent.git_diff.begin_refresh();
+            (
+                agent.definition.workspace.clone(),
+                agent.git_diff.active_section,
+                selected_path,
+                generation,
+            )
+        };
+        app.enqueue_effect(AppEffect::RefreshGitDiff {
+            agent_index,
+            root,
+            active_section,
+            selected_path,
+            generation,
+        });
+        true
+    }
+
     pub(in crate::app) fn draw(frame: &mut Frame, app: &App, area: Rect) {
         let Some(agent) = app.active_agent() else {
             let empty = Paragraph::new("Select or create an agent in the Chat tab.")
@@ -188,11 +223,7 @@ impl GitDiffComponent {
         }
     }
 
-    pub(in crate::app) fn handle_key(
-        app: &mut App,
-        key: KeyEvent,
-        _ui_tx: &mpsc::UnboundedSender<UiEvent>,
-    ) -> bool {
+    pub(in crate::app) fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         if app.current_tab != AppTab::GitDiff {
             return false;
         }
@@ -217,6 +248,7 @@ impl GitDiffComponent {
                         .git_diff
                         .set_active_section(&root, DiffSection::Changes);
                 }
+                Self::request_refresh(app);
                 true
             }
             KeyCode::Right if !key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -226,6 +258,7 @@ impl GitDiffComponent {
                         .git_diff
                         .set_active_section(&root, DiffSection::Staged);
                 }
+                Self::request_refresh(app);
                 true
             }
             KeyCode::Tab => {
@@ -237,6 +270,7 @@ impl GitDiffComponent {
                     };
                     agent.git_diff.set_active_section(&root, next);
                 }
+                Self::request_refresh(app);
                 true
             }
             KeyCode::Enter => {
@@ -247,13 +281,7 @@ impl GitDiffComponent {
         }
     }
 
-    pub(in crate::app) fn handle_click(
-        app: &mut App,
-        column: u16,
-        row: u16,
-        area: Rect,
-        ui_tx: &mpsc::UnboundedSender<UiEvent>,
-    ) -> bool {
+    pub(in crate::app) fn handle_click(app: &mut App, column: u16, row: u16, area: Rect) -> bool {
         let layout = Self::layout(area);
         let Some(agent) = app.active_agent() else {
             return false;
@@ -269,11 +297,12 @@ impl GitDiffComponent {
                 let root = agent.definition.workspace.clone();
                 agent.git_diff.set_active_section(&root, section);
             }
+            Self::request_refresh(app);
             return true;
         }
 
         if UiSupport::rect_contains(layout.push_button, column, row) {
-            Self::push_changes(app, ui_tx);
+            Self::push_changes(app);
             return true;
         }
 
@@ -291,7 +320,7 @@ impl GitDiffComponent {
         }
 
         if UiSupport::rect_contains(layout.pull_button, column, row) {
-            Self::pull_changes(app, ui_tx);
+            Self::pull_changes(app);
             return true;
         }
 
@@ -378,74 +407,102 @@ impl GitDiffComponent {
     }
 
     fn commit_changes(app: &mut App) {
-        let Some(agent) = app.active_agent_mut() else {
+        let Some(agent_index) = app.current_agent else {
             app.status_message = Some("Add an agent before committing changes.".to_string());
             return;
         };
-        if agent.git_diff.remote_action.is_some() {
-            agent.git_diff.error = Some("Wait for git push/pull to finish.".to_string());
+        let root = app.agents[agent_index].definition.workspace.clone();
+        let mutation = match app.agents[agent_index].git_diff.prepare_commit() {
+            Ok(mutation) => mutation,
+            Err(error) => {
+                app.agents[agent_index].git_diff.error = Some(error.to_string());
+                return;
+            }
+        };
+        if let Err(error) = app.agents[agent_index].git_diff.begin_mutation() {
+            app.agents[agent_index].git_diff.error = Some(error.to_string());
             return;
         }
-
-        let root = agent.definition.workspace.clone();
-        match agent.git_diff.commit(&root) {
-            Ok(()) => agent.workspace.refresh(&root),
-            Err(error) => agent.git_diff.error = Some(error.to_string()),
-        }
+        app.enqueue_effect(AppEffect::RunGitMutation {
+            agent_index,
+            root,
+            mutation,
+        });
     }
 
     fn stage_changes(app: &mut App) {
-        let Some(agent) = app.active_agent_mut() else {
+        let Some(agent_index) = app.current_agent else {
             app.status_message = Some("Add an agent before staging changes.".to_string());
             return;
         };
-        if agent.git_diff.remote_action.is_some() {
-            agent.git_diff.error = Some("Wait for git push/pull to finish.".to_string());
+        let root = app.agents[agent_index].definition.workspace.clone();
+        let mutation = match app.agents[agent_index].git_diff.prepare_stage(&root) {
+            Ok(mutation) => mutation,
+            Err(error) => {
+                app.agents[agent_index].git_diff.error = Some(error.to_string());
+                return;
+            }
+        };
+        if let Err(error) = app.agents[agent_index].git_diff.begin_mutation() {
+            app.agents[agent_index].git_diff.error = Some(error.to_string());
             return;
         }
-
-        let root = agent.definition.workspace.clone();
-        match agent.git_diff.stage_selected(&root) {
-            Ok(()) => agent.workspace.refresh(&root),
-            Err(error) => agent.git_diff.error = Some(error.to_string()),
-        }
+        app.enqueue_effect(AppEffect::RunGitMutation {
+            agent_index,
+            root,
+            mutation,
+        });
     }
 
     fn unstage_changes(app: &mut App) {
-        let Some(agent) = app.active_agent_mut() else {
+        let Some(agent_index) = app.current_agent else {
             app.status_message = Some("Add an agent before unstaging changes.".to_string());
             return;
         };
-        if agent.git_diff.remote_action.is_some() {
-            agent.git_diff.error = Some("Wait for git push/pull to finish.".to_string());
+        let root = app.agents[agent_index].definition.workspace.clone();
+        let mutation = match app.agents[agent_index].git_diff.prepare_unstage(&root) {
+            Ok(mutation) => mutation,
+            Err(error) => {
+                app.agents[agent_index].git_diff.error = Some(error.to_string());
+                return;
+            }
+        };
+        if let Err(error) = app.agents[agent_index].git_diff.begin_mutation() {
+            app.agents[agent_index].git_diff.error = Some(error.to_string());
             return;
         }
-
-        let root = agent.definition.workspace.clone();
-        match agent.git_diff.unstage_selected(&root) {
-            Ok(()) => agent.workspace.refresh(&root),
-            Err(error) => agent.git_diff.error = Some(error.to_string()),
-        }
+        app.enqueue_effect(AppEffect::RunGitMutation {
+            agent_index,
+            root,
+            mutation,
+        });
     }
 
     fn discard_changes(app: &mut App) {
-        let Some(agent) = app.active_agent_mut() else {
+        let Some(agent_index) = app.current_agent else {
             app.status_message = Some("Add an agent before discarding changes.".to_string());
             return;
         };
-        if agent.git_diff.remote_action.is_some() {
-            agent.git_diff.error = Some("Wait for git push/pull to finish.".to_string());
+        let root = app.agents[agent_index].definition.workspace.clone();
+        let mutation = match app.agents[agent_index].git_diff.prepare_discard(&root) {
+            Ok(mutation) => mutation,
+            Err(error) => {
+                app.agents[agent_index].git_diff.error = Some(error.to_string());
+                return;
+            }
+        };
+        if let Err(error) = app.agents[agent_index].git_diff.begin_mutation() {
+            app.agents[agent_index].git_diff.error = Some(error.to_string());
             return;
         }
-
-        let root = agent.definition.workspace.clone();
-        match agent.git_diff.discard_selected(&root) {
-            Ok(()) => agent.workspace.refresh(&root),
-            Err(error) => agent.git_diff.error = Some(error.to_string()),
-        }
+        app.enqueue_effect(AppEffect::RunGitMutation {
+            agent_index,
+            root,
+            mutation,
+        });
     }
 
-    fn push_changes(app: &mut App, ui_tx: &mpsc::UnboundedSender<UiEvent>) {
+    fn push_changes(app: &mut App) {
         let Some(agent_index) = app.current_agent else {
             app.status_message = Some("Add an agent before pushing changes.".to_string());
             return;
@@ -463,27 +520,14 @@ impl GitDiffComponent {
             }
         }
 
-        let ui_tx = ui_tx.clone();
-        task::spawn(async move {
-            let result = task::spawn_blocking(move || {
-                GitDiffSupport::run_remote_action(&root, GitRemoteAction::Push)
-            })
-            .await;
-            let (success, message) = match result {
-                Ok(Ok(output)) => (true, output),
-                Ok(Err(error)) => (false, error.to_string()),
-                Err(error) => (false, format!("git push task failed: {error}")),
-            };
-            let _ = ui_tx.send(UiEvent::GitDiffRemoteCompleted {
-                agent_index,
-                action: GitRemoteAction::Push,
-                success,
-                message,
-            });
+        app.enqueue_effect(AppEffect::RunGitRemote {
+            agent_index,
+            root,
+            action: GitRemoteAction::Push,
         });
     }
 
-    fn pull_changes(app: &mut App, ui_tx: &mpsc::UnboundedSender<UiEvent>) {
+    fn pull_changes(app: &mut App) {
         let Some(agent_index) = app.current_agent else {
             app.status_message = Some("Add an agent before pulling changes.".to_string());
             return;
@@ -501,23 +545,10 @@ impl GitDiffComponent {
             }
         }
 
-        let ui_tx = ui_tx.clone();
-        task::spawn(async move {
-            let result = task::spawn_blocking(move || {
-                GitDiffSupport::run_remote_action(&root, GitRemoteAction::Pull)
-            })
-            .await;
-            let (success, message) = match result {
-                Ok(Ok(output)) => (true, output),
-                Ok(Err(error)) => (false, error.to_string()),
-                Err(error) => (false, format!("git pull task failed: {error}")),
-            };
-            let _ = ui_tx.send(UiEvent::GitDiffRemoteCompleted {
-                agent_index,
-                action: GitRemoteAction::Pull,
-                success,
-                message,
-            });
+        app.enqueue_effect(AppEffect::RunGitRemote {
+            agent_index,
+            root,
+            action: GitRemoteAction::Pull,
         });
     }
 

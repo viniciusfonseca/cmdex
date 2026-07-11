@@ -2,6 +2,81 @@ use super::super::*;
 
 pub(in crate::app) struct UiSupport;
 
+pub(in crate::app) struct SelectableListPopover;
+
+impl SelectableListPopover {
+    pub(in crate::app) fn window(
+        selected: usize,
+        item_count: usize,
+        max_visible: usize,
+    ) -> (usize, usize) {
+        let visible = item_count.min(max_visible);
+        let start = selected
+            .saturating_sub(visible.saturating_sub(1))
+            .min(item_count.saturating_sub(visible));
+        (start, visible)
+    }
+
+    pub(in crate::app) fn area(anchor: Rect, width: u16, visible: usize) -> Rect {
+        let height = visible as u16 + 2;
+        Rect::new(
+            anchor.x,
+            anchor.y.saturating_sub(height.saturating_sub(1)),
+            width,
+            height,
+        )
+    }
+
+    pub(in crate::app) fn label_lines(
+        labels: &[String],
+        selected: usize,
+        start: usize,
+        visible: usize,
+        width: u16,
+    ) -> Vec<Line<'static>> {
+        labels
+            .iter()
+            .skip(start)
+            .take(visible)
+            .enumerate()
+            .map(|(offset, label)| {
+                let is_selected = start + offset == selected;
+                let style = if is_selected {
+                    UiSupport::selection_style()
+                } else {
+                    Style::default()
+                        .bg(UiSupport::theme().panel_bg)
+                        .fg(UiSupport::theme().foreground)
+                };
+                let prefix = if is_selected { "› " } else { "  " };
+                Line::from(Span::styled(
+                    format!(
+                        "{}{}",
+                        prefix,
+                        Self::truncate_label(label, width.saturating_sub(4))
+                    ),
+                    style,
+                ))
+            })
+            .collect()
+    }
+
+    fn truncate_label(label: &str, width: u16) -> String {
+        let compact = label.split_whitespace().collect::<Vec<_>>().join(" ");
+        let limit = usize::from(width.max(1));
+        if compact.chars().count() <= limit {
+            compact
+        } else {
+            let mut truncated = compact
+                .chars()
+                .take(limit.saturating_sub(3))
+                .collect::<String>();
+            truncated.push_str("...");
+            truncated
+        }
+    }
+}
+
 impl UiSupport {
     pub(in crate::app) fn rounded_block() -> Block<'static> {
         Block::default()

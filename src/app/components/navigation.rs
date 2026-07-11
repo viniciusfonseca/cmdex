@@ -1,5 +1,6 @@
+use super::super::effects::AppEffect;
 use super::super::*;
-use super::{ShellComponent, UiSupport};
+use super::{GitDiffComponent, ShellComponent, UiSupport};
 
 const TOP_NAV_PREFIX: &str = "CMDEX ·";
 
@@ -40,16 +41,16 @@ impl TopNavigationComponent {
         match app.current_tab {
             AppTab::Chat => {}
             AppTab::Workspace => {
-                if let Some(agent) = app.active_agent_mut() {
-                    agent.workspace.refresh(&agent.definition.workspace);
+                if let Some(agent_index) = app.current_agent {
+                    let root = app.agents[agent_index].definition.workspace.clone();
+                    app.workspace_refresh_in_flight = true;
+                    app.enqueue_effect(AppEffect::RefreshWorkspace { agent_index, root });
                 }
                 app.last_workspace_refresh_at = Some(Instant::now());
             }
             AppTab::Shell => {}
             AppTab::GitDiff => {
-                if let Some(agent) = app.active_agent_mut() {
-                    agent.git_diff.refresh(&agent.definition.workspace);
-                }
+                GitDiffComponent::request_refresh(app);
             }
         }
     }

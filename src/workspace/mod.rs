@@ -1,31 +1,36 @@
 mod browser;
 mod diff;
 mod editor;
+mod editor_commands;
+pub(crate) mod editor_keymap;
+mod editor_overlays;
+mod git_repository;
 mod render;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use diff::GitDiffSupport;
+pub(crate) use diff::GitDiffLoadResult;
+pub(crate) use git_repository::GitRepository;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
-    process::Command,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
 use ignore::WalkBuilder;
 use ratatui::{
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
 };
-use syntect::{easy::HighlightLines, highlighting::FontStyle, parsing::SyntaxReference};
 
 use crate::theme::ThemeRegistry;
 
 const PREVIEW_LIMIT: usize = 200_000;
 pub(crate) const COMPLETION_POPOVER_MAX_ITEMS: usize = 8;
+const SEARCH_DEBOUNCE: Duration = Duration::from_millis(80);
 
 #[derive(Debug, Clone, Default)]
 pub struct FileBrowserState {
@@ -46,6 +51,10 @@ pub struct FileBrowserState {
     search_rows: Vec<WorkspaceSearchRow>,
     search_selected_row: usize,
     search_match_count: usize,
+    search_generation: u64,
+    search_requested_at: Option<Instant>,
+    search_in_flight: bool,
+    editor_load_in_flight: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,6 +108,12 @@ enum WorkspaceSearchRow {
 }
 
 #[derive(Debug, Clone, Default)]
+pub(crate) struct WorkspaceSearchSnapshot {
+    rows: Vec<WorkspaceSearchRow>,
+    match_count: usize,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct DiffBrowserState {
     pub changes: Vec<DiffEntry>,
     pub staged: Vec<DiffEntry>,
@@ -112,6 +127,9 @@ pub struct DiffBrowserState {
     pub status: Option<String>,
     pub error: Option<String>,
     pub remote_action: Option<GitRemoteAction>,
+    pub mutation_running: bool,
+    pub refresh_generation: u64,
+    pub refresh_in_flight: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -127,6 +145,14 @@ pub enum GitRemoteAction {
     Pull,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitMutation {
+    Commit(String),
+    Stage(String),
+    Unstage(String),
+    Discard { path: String, untracked: bool },
+}
+
 #[derive(Debug, Clone)]
 pub struct DiffEntry {
     pub label: String,
@@ -140,6 +166,46 @@ pub enum EditorMode {
     Visual,
     Insert,
     Command,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditorDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditorCommand {
+    Move {
+        direction: EditorDirection,
+        extend: bool,
+    },
+    MoveLineStart {
+        extend: bool,
+    },
+    MoveLineEnd {
+        extend: bool,
+    },
+    MovePage {
+        lines: usize,
+        extend: bool,
+        up: bool,
+    },
+    EnterInsert,
+    EnterVisual,
+    ExitVisual,
+    StartCommand,
+    DeleteChar,
+    Backspace,
+    InsertNewline,
+    InsertTab,
+    OpenBelow,
+    Undo,
+    EnterInsertAfter,
+    ExitInsert,
+    DeleteSelection,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,6 +231,21 @@ pub struct EditorCompletionItem {
 }
 
 #[derive(Debug, Clone)]
+enum EditorOverlay {
+    None,
+    ShortcutsHelp,
+    Completion(EditorCompletionState),
+}
+
+#[derive(Debug, Clone)]
+struct EditorCompletionState {
+    items: Vec<EditorCompletionItem>,
+    request_position: EditorPosition,
+    selected: usize,
+    scroll: usize,
+}
+
+#[derive(Debug, Clone)]
 pub struct WorkspaceEditorState {
     pub path: PathBuf,
     pub lines: Vec<String>,
@@ -177,16 +258,12 @@ pub struct WorkspaceEditorState {
     pub dirty: bool,
     pub status: Option<String>,
     pub hover: Option<String>,
-    completion_items: Vec<EditorCompletionItem>,
     saved_lines: Vec<String>,
     undo_stack: Vec<EditorUndoState>,
     preferred_col: usize,
     selection_anchor: Option<EditorPosition>,
     hover_request: Option<EditorPosition>,
-    completion_request: Option<EditorPosition>,
-    completion_selected: usize,
-    completion_scroll: usize,
-    shortcuts_help_open: bool,
+    overlay: EditorOverlay,
     render_cache: EditorRenderCache,
 }
 

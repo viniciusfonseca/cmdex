@@ -1,34 +1,54 @@
 use super::{render::*, *};
 
+#[path = "browser_loading.rs"]
+mod browser_loading;
+#[path = "browser_support.rs"]
+mod browser_support;
+
 pub(super) struct WorkspaceBrowserSupport;
 
 impl FileBrowserState {
-    pub fn refresh(&mut self, root: &Path) {
-        match WorkspaceBrowserSupport::build_file_entries(root)
-            .and_then(|entries| self.apply_entries(entries))
+    pub(crate) fn scan_entries(root: &Path) -> Result<Vec<FileEntry>> {
+        browser_support::WorkspaceIndex::scan(root)
+    }
+
+    pub(crate) fn apply_scanned_entries(&mut self, entries: Vec<FileEntry>) -> Result<bool> {
+        if entries == self.entries {
+            return Ok(false);
+        }
+        self.apply_entries(entries)?;
+        Ok(true)
+    }
+
+    pub(crate) fn apply_scanned_entries_without_io(
+        &mut self,
+        entries: Vec<FileEntry>,
+    ) -> Result<bool> {
+        if entries == self.entries {
+            return Ok(false);
+        }
+
+        let keep_dirty_editor = self.reconcile_entries(entries);
+        if !keep_dirty_editor
+            && self.editor.as_ref().is_some_and(|editor| {
+                self.entries
+                    .get(self.selected)
+                    .is_none_or(|entry| editor.path != entry.path)
+            })
         {
-            Ok(()) => {}
-            Err(error) => self.reset_with_error(error),
+            self.editor = None;
+            self.focus_sidebar();
         }
+        self.preview_title = self
+            .entries
+            .get(self.selected)
+            .map(|entry| entry.path.display().to_string())
+            .unwrap_or_else(|| "Workspace".to_string());
+        self.preview = WorkspaceRenderer::plain_preview_lines("Loading preview...");
+        Ok(true)
     }
 
-    pub fn refresh_if_changed(&mut self, root: &Path) -> bool {
-        match WorkspaceBrowserSupport::build_file_entries(root).and_then(|entries| {
-            if entries == self.entries {
-                Ok(false)
-            } else {
-                self.apply_entries(entries)?;
-                Ok(true)
-            }
-        }) {
-            Ok(changed) => changed,
-            Err(error) => {
-                self.reset_with_error(error);
-                true
-            }
-        }
-    }
-
+    #[allow(dead_code)]
     pub fn move_up(&mut self) {
         if self.tree_rows.is_empty() {
             return;
@@ -36,6 +56,14 @@ impl FileBrowserState {
         let _ = self.select_tree_row(self.tree_cursor.saturating_sub(1), true);
     }
 
+    pub(crate) fn move_up_without_io(&mut self) -> bool {
+        if self.tree_rows.is_empty() {
+            return false;
+        }
+        self.select_tree_row_without_io(self.tree_cursor.saturating_sub(1))
+    }
+
+    #[allow(dead_code)]
     pub fn move_down(&mut self) {
         if self.tree_rows.is_empty() {
             return;
@@ -46,6 +74,23 @@ impl FileBrowserState {
         );
     }
 
+    pub(crate) fn move_down_without_io(&mut self) -> bool {
+        if self.tree_rows.is_empty() {
+            return false;
+        }
+        self.select_tree_row_without_io(
+            (self.tree_cursor + 1).min(self.tree_rows.len().saturating_sub(1)),
+        )
+    }
+
+    pub(crate) fn select_without_io(&mut self, index: usize) -> bool {
+        if self.entries.is_empty() {
+            return false;
+        }
+        self.select_index_without_io(index.min(self.entries.len().saturating_sub(1)))
+    }
+
+    #[allow(dead_code)]
     pub fn select(&mut self, index: usize) {
         if self.entries.is_empty() {
             return;
@@ -61,6 +106,7 @@ impl FileBrowserState {
         self.content_scroll = self.content_scroll.saturating_add(lines);
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn open_editor(&mut self) -> Result<()> {
         if self.entries.is_empty() {
             return Ok(());
@@ -72,20 +118,6 @@ impl FileBrowserState {
         self.focus_editor();
         self.error = None;
         Ok(())
-    }
-
-    pub fn close_editor(&mut self) -> Result<()> {
-        self.editor = None;
-        self.focus_sidebar();
-        self.content_scroll = 0;
-        self.update_preview()
-    }
-
-    pub fn sidebar_labels(&self) -> Vec<String> {
-        self.tree_rows
-            .iter()
-            .map(|row| row.label.clone())
-            .collect::<Vec<_>>()
     }
 
     pub fn sidebar_items(&self) -> Vec<Line<'static>> {
@@ -155,12 +187,69 @@ impl FileBrowserState {
 
     pub fn push_search_char(&mut self, character: char) {
         self.search_query.push(character);
-        self.refresh_search_results();
+        self.request_search();
     }
 
     pub fn pop_search_char(&mut self) {
         self.search_query.pop();
-        self.refresh_search_results();
+        self.request_search();
+    }
+
+    pub(crate) fn take_search_request(&mut self) -> Option<(String, u64)> {
+        if self.search_query.trim().is_empty() {
+            self.search_requested_at = None;
+            self.search_in_flight = false;
+            return None;
+        }
+        if self.search_in_flight
+            || self
+                .search_requested_at
+                .is_none_or(|requested| requested.elapsed() < SEARCH_DEBOUNCE)
+        {
+            return None;
+        }
+
+        self.search_requested_at = None;
+        self.search_in_flight = true;
+        Some((self.search_query.clone(), self.search_generation))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn search_generation(&self) -> u64 {
+        self.search_generation
+    }
+
+    pub(crate) fn search_entries(
+        entries: &[FileEntry],
+        query: &str,
+    ) -> Result<WorkspaceSearchSnapshot> {
+        WorkspaceBrowserSupport::build_search_snapshot(entries, query)
+    }
+
+    pub(crate) fn apply_search_snapshot(
+        &mut self,
+        generation: u64,
+        query: &str,
+        snapshot: WorkspaceSearchSnapshot,
+    ) -> bool {
+        if generation != self.search_generation || query != self.search_query {
+            self.search_in_flight = false;
+            self.search_requested_at = Some(Instant::now());
+            return false;
+        }
+
+        let previous_target = self.selected_search_target();
+        self.search_rows = snapshot.rows;
+        self.search_match_count = snapshot.match_count;
+        self.search_in_flight = false;
+        self.search_requested_at = None;
+        self.search_selected_row = previous_target
+            .and_then(|(file_index, line_number)| {
+                self.find_search_match_row(file_index, line_number)
+            })
+            .or_else(|| self.first_search_match_row())
+            .unwrap_or(0);
+        true
     }
 
     pub fn search_move_up(&mut self) {
@@ -186,6 +275,7 @@ impl FileBrowserState {
         }
     }
 
+    #[allow(dead_code)]
     pub fn open_selected_search_result(&mut self) -> Result<bool> {
         let Some((file_index, line_number)) = self.selected_search_target() else {
             return Ok(false);
@@ -207,6 +297,18 @@ impl FileBrowserState {
         Ok(true)
     }
 
+    pub(crate) fn open_selected_search_result_without_io(&mut self) -> Option<EditorPosition> {
+        let (file_index, line_number) = self.selected_search_target()?;
+        if !self.select_index_without_io(file_index) {
+            return None;
+        }
+        Some(EditorPosition {
+            row: line_number.saturating_sub(1),
+            col: 0,
+        })
+    }
+
+    #[allow(dead_code)]
     pub fn open_path_at_position(&mut self, path: &Path, row: usize, col: usize) -> Result<bool> {
         let Some(file_index) = self.entries.iter().position(|entry| entry.path == path) else {
             return Ok(false);
@@ -227,10 +329,17 @@ impl FileBrowserState {
         Ok(true)
     }
 
+    pub(crate) fn open_path_at_position_without_io(&mut self, path: &Path) -> Option<PathBuf> {
+        let file_index = self.entries.iter().position(|entry| entry.path == path)?;
+        self.select_index_without_io(file_index)
+            .then(|| path.to_path_buf())
+    }
+
     pub fn sidebar_selected_row(&self) -> usize {
         self.tree_cursor.min(self.tree_rows.len().saturating_sub(1))
     }
 
+    #[allow(dead_code)]
     pub fn select_sidebar_row(&mut self, row: usize) {
         let Some(row_kind) = self.tree_rows.get(row).map(|entry| entry.kind.clone()) else {
             return;
@@ -250,6 +359,21 @@ impl FileBrowserState {
         }
     }
 
+    pub(crate) fn select_sidebar_row_without_io(&mut self, row: usize) -> bool {
+        let Some(row_kind) = self.tree_rows.get(row).map(|entry| entry.kind.clone()) else {
+            return false;
+        };
+
+        match row_kind {
+            FileTreeRowKind::Directory { .. } => {
+                self.tree_cursor = row;
+                self.toggle_directory_at_row(row);
+                false
+            }
+            FileTreeRowKind::File { file_index } => self.select_without_io(file_index),
+        }
+    }
+
     pub fn toggle_current_directory(&mut self) -> bool {
         if self.tree_rows.is_empty() {
             return false;
@@ -258,7 +382,17 @@ impl FileBrowserState {
         self.toggle_directory_at_row(self.tree_cursor)
     }
 
+    #[allow(dead_code)]
     fn select_index(&mut self, index: usize, auto_open: bool) -> Result<()> {
+        if !self.select_index_without_io(index) {
+            return Ok(());
+        }
+
+        self.update_preview()?;
+        self.sync_editor_to_selection(auto_open)
+    }
+
+    fn select_index_without_io(&mut self, index: usize) -> bool {
         let index = index.min(self.entries.len().saturating_sub(1));
         if index != self.selected && self.editor.as_ref().is_some_and(|editor| editor.dirty) {
             if let Some(editor) = self.editor.as_mut() {
@@ -266,7 +400,7 @@ impl FileBrowserState {
                 editor.status =
                     Some("Unsaved changes. Use :w, :q or :q! before switching files.".to_string());
             }
-            return Ok(());
+            return false;
         }
 
         self.selected = index;
@@ -275,11 +409,28 @@ impl FileBrowserState {
         if let Some(row) = self.row_for_file(index) {
             self.tree_cursor = row;
         }
-        self.update_preview()?;
-        self.sync_editor_to_selection(auto_open)
+        let selected_path = self.entries.get(self.selected).map(|entry| &entry.path);
+        if self
+            .editor
+            .as_ref()
+            .is_some_and(|editor| Some(&editor.path) != selected_path && !editor.dirty)
+        {
+            self.editor = None;
+            self.focus_sidebar();
+        }
+        true
     }
 
     fn apply_entries(&mut self, entries: Vec<FileEntry>) -> Result<()> {
+        let keep_dirty_editor = self.reconcile_entries(entries);
+        self.update_preview()?;
+        if !keep_dirty_editor {
+            self.sync_editor_to_selection(true)?;
+        }
+        Ok(())
+    }
+
+    fn reconcile_entries(&mut self, entries: Vec<FileEntry>) -> bool {
         let previous_selected = self.selected;
         let previous_selected_path = self
             .entries
@@ -311,7 +462,7 @@ impl FileBrowserState {
         {
             self.tree_cursor = row;
         }
-        self.refresh_search_results();
+        self.request_search();
         self.content_scroll = if previous_selected_path.as_ref().is_some_and(|path| {
             self.entries
                 .get(self.selected)
@@ -322,12 +473,7 @@ impl FileBrowserState {
             0
         };
         self.error = None;
-        self.update_preview()?;
-        if keep_dirty_editor {
-            Ok(())
-        } else {
-            self.sync_editor_to_selection(true)
-        }
+        keep_dirty_editor
     }
 
     fn resolve_selected_index(
@@ -344,6 +490,7 @@ impl FileBrowserState {
             .unwrap_or_else(|| fallback_index.min(self.entries.len().saturating_sub(1)))
     }
 
+    #[allow(dead_code)]
     fn select_tree_row(&mut self, row: usize, auto_open: bool) -> Result<()> {
         if self.tree_rows.is_empty() {
             return Ok(());
@@ -366,6 +513,29 @@ impl FileBrowserState {
         }
 
         Ok(())
+    }
+
+    fn select_tree_row_without_io(&mut self, row: usize) -> bool {
+        if self.tree_rows.is_empty() {
+            return false;
+        }
+
+        let target_row = row.min(self.tree_rows.len().saturating_sub(1));
+        let previous_row = self.tree_cursor;
+        self.tree_cursor = target_row;
+
+        if let Some(file_index) = self
+            .tree_rows
+            .get(target_row)
+            .and_then(FileTreeRow::file_index)
+        {
+            if !self.select_index_without_io(file_index) {
+                self.tree_cursor = previous_row;
+                return false;
+            }
+            return true;
+        }
+        false
     }
 
     fn toggle_directory_at_row(&mut self, row: usize) -> bool {
@@ -422,60 +592,13 @@ impl FileBrowserState {
         self.known_dirs = directory_paths;
     }
 
-    fn refresh_search_results(&mut self) {
-        let previous_target = self.selected_search_target();
+    fn request_search(&mut self) {
+        self.search_generation = self.search_generation.wrapping_add(1);
+        self.search_requested_at = Some(Instant::now());
+        self.search_in_flight = false;
         self.search_rows.clear();
         self.search_selected_row = 0;
         self.search_match_count = 0;
-
-        let query = self.search_query.trim();
-        if query.is_empty() {
-            return;
-        }
-
-        for (file_index, entry) in self.entries.iter().enumerate() {
-            let Ok(bytes) = fs::read(&entry.path) else {
-                continue;
-            };
-            if bytes.contains(&0) {
-                continue;
-            }
-
-            let source = WorkspaceRenderer::normalize_newlines(&String::from_utf8_lossy(&bytes));
-            let mut matches = Vec::new();
-            for (line_index, line) in source.lines().enumerate() {
-                if line.contains(query) {
-                    matches.push(WorkspaceSearchRow::Match {
-                        label: format!(
-                            "  {}: {}",
-                            line_index + 1,
-                            WorkspaceBrowserSupport::search_result_excerpt(line)
-                        ),
-                        file_index,
-                        line_number: line_index + 1,
-                    });
-                }
-            }
-
-            if !matches.is_empty() {
-                self.search_match_count += matches.len();
-                self.search_rows.push(WorkspaceSearchRow::FileHeader {
-                    label: entry.relative_path.display().to_string(),
-                });
-                self.search_rows.extend(matches);
-            }
-        }
-
-        if let Some((file_index, line_number)) = previous_target {
-            if let Some(row) = self.find_search_match_row(file_index, line_number) {
-                self.search_selected_row = row;
-                return;
-            }
-        }
-
-        if let Some(row) = self.first_search_match_row() {
-            self.search_selected_row = row;
-        }
     }
 
     fn row_for_file(&self, file_index: usize) -> Option<usize> {
@@ -596,289 +719,4 @@ impl FileBrowserState {
         self.preview = WorkspaceRenderer::read_text_preview(&entry.path)?;
         Ok(())
     }
-
-    fn reset_with_error(&mut self, error: anyhow::Error) {
-        self.entries.clear();
-        self.tree_rows.clear();
-        self.selected = 0;
-        self.tree_cursor = 0;
-        self.focus = WorkspaceFocus::Sidebar;
-        self.sidebar_tab = WorkspaceSidebarTab::Files;
-        self.search_query.clear();
-        self.collapsed_dirs.clear();
-        self.known_dirs.clear();
-        self.search_rows.clear();
-        self.search_selected_row = 0;
-        self.search_match_count = 0;
-        self.preview_title = "Workspace".to_string();
-        self.preview = WorkspaceRenderer::plain_preview_lines("Unable to load workspace.");
-        self.error = Some(error.to_string());
-    }
-}
-
-impl FileTreeRow {
-    pub(super) fn styled_label(&self) -> Line<'static> {
-        if self.branch_prefix_len == 0 || self.branch_prefix_len >= self.label.len() {
-            return Line::from(self.label.clone());
-        }
-
-        let (branch, label) = self.label.split_at(self.branch_prefix_len);
-        Line::from(vec![
-            Span::styled(
-                branch.to_string(),
-                Style::default().fg(ThemeRegistry::app().line_number),
-            ),
-            Span::raw(label.to_string()),
-        ])
-    }
-
-    pub(super) fn file_index(&self) -> Option<usize> {
-        match self.kind {
-            FileTreeRowKind::Directory { .. } => None,
-            FileTreeRowKind::File { file_index } => Some(file_index),
-        }
-    }
-
-    pub(super) fn directory_state(&self) -> Option<(&PathBuf, bool)> {
-        match &self.kind {
-            FileTreeRowKind::Directory {
-                relative_path,
-                expanded,
-            } => Some((relative_path, *expanded)),
-            FileTreeRowKind::File { .. } => None,
-        }
-    }
-
-    pub(super) fn directory_path(&self) -> Option<&PathBuf> {
-        match &self.kind {
-            FileTreeRowKind::Directory { relative_path, .. } => Some(relative_path),
-            FileTreeRowKind::File { .. } => None,
-        }
-    }
-}
-
-impl WorkspaceSearchRow {
-    fn label(&self) -> &str {
-        match self {
-            Self::FileHeader { label } | Self::Match { label, .. } => label,
-        }
-    }
-
-    fn is_match(&self) -> bool {
-        matches!(self, Self::Match { .. })
-    }
-
-    fn target(&self) -> Option<(usize, usize)> {
-        match self {
-            Self::FileHeader { .. } => None,
-            Self::Match {
-                file_index,
-                line_number,
-                ..
-            } => Some((*file_index, *line_number)),
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-struct FileTreeNode {
-    directories: BTreeMap<String, FileTreeNode>,
-    files: Vec<(String, usize)>,
-}
-
-impl WorkspaceBrowserSupport {
-    pub(super) fn build_file_entries(root: &Path) -> Result<Vec<FileEntry>> {
-        let mut entries = Vec::new();
-        let walker = WalkBuilder::new(root)
-            .hidden(false)
-            .git_ignore(true)
-            .git_global(true)
-            .git_exclude(true)
-            .build();
-
-        for result in walker {
-            let entry = result.with_context(|| format!("failed to walk {}", root.display()))?;
-            let path = entry.path();
-            if path == root {
-                continue;
-            }
-            if Self::contains_git_component(path) {
-                continue;
-            }
-
-            let relative = path
-                .strip_prefix(root)
-                .with_context(|| format!("failed to make {} relative", path.display()))?;
-            if entry.file_type().is_some_and(|kind| kind.is_dir()) {
-                continue;
-            }
-
-            entries.push(FileEntry {
-                path: path.to_path_buf(),
-                relative_path: relative.to_path_buf(),
-            });
-        }
-
-        entries.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
-        Ok(entries)
-    }
-
-    fn collect_directory_paths(entries: &[FileEntry]) -> BTreeSet<PathBuf> {
-        let mut directories = BTreeSet::new();
-
-        for entry in entries {
-            let mut ancestor = entry.relative_path.parent();
-            while let Some(path) = ancestor {
-                if path.as_os_str().is_empty() {
-                    break;
-                }
-                directories.insert(path.to_path_buf());
-                ancestor = path.parent();
-            }
-        }
-
-        directories
-    }
-
-    pub(super) fn build_file_tree_rows(
-        entries: &[FileEntry],
-        collapsed_dirs: &BTreeSet<PathBuf>,
-    ) -> (Vec<FileTreeRow>, Vec<Option<usize>>) {
-        let mut root = FileTreeNode::default();
-
-        for (index, entry) in entries.iter().enumerate() {
-            let components = entry
-                .relative_path
-                .components()
-                .map(|component| component.as_os_str().to_string_lossy().to_string())
-                .collect::<Vec<_>>();
-            if components.is_empty() {
-                continue;
-            }
-
-            let mut node = &mut root;
-            for directory in &components[..components.len().saturating_sub(1)] {
-                node = node.directories.entry(directory.clone()).or_default();
-            }
-
-            if let Some(file_name) = components.last() {
-                node.files.push((file_name.clone(), index));
-            }
-        }
-
-        let mut rows = Vec::new();
-        let mut file_rows = vec![None; entries.len()];
-        Self::append_tree_rows(
-            &root,
-            Path::new(""),
-            &[],
-            collapsed_dirs,
-            &mut rows,
-            &mut file_rows,
-        );
-        (rows, file_rows)
-    }
-
-    fn append_tree_rows(
-        node: &FileTreeNode,
-        base_path: &Path,
-        ancestor_has_more: &[bool],
-        collapsed_dirs: &BTreeSet<PathBuf>,
-        rows: &mut Vec<FileTreeRow>,
-        file_rows: &mut [Option<usize>],
-    ) {
-        let directories = node
-            .directories
-            .iter()
-            .map(|(name, child)| (TreeChild::Directory(name), child))
-            .collect::<Vec<_>>();
-        let files = node
-            .files
-            .iter()
-            .map(|(name, index)| (TreeChild::File(name, *index), node))
-            .collect::<Vec<_>>();
-
-        let children = directories.into_iter().chain(files).collect::<Vec<_>>();
-
-        for (position, (child, child_node)) in children.iter().enumerate() {
-            let is_last = position + 1 == children.len();
-            let mut label = Self::tree_row_prefix(ancestor_has_more);
-            label.push_str(if is_last { " └─ " } else { " ├─ " });
-            let mut branch_prefix_len = label.len();
-
-            match child {
-                TreeChild::Directory(name) => {
-                    let relative_path = if base_path.as_os_str().is_empty() {
-                        PathBuf::from(name)
-                    } else {
-                        base_path.join(name)
-                    };
-                    let expanded = !collapsed_dirs.contains(&relative_path);
-                    label.push_str(if expanded { "▾ " } else { "▸ " });
-                    branch_prefix_len = label.len();
-                    label.push_str(name);
-                    rows.push(FileTreeRow {
-                        label,
-                        branch_prefix_len,
-                        kind: FileTreeRowKind::Directory {
-                            relative_path: relative_path.clone(),
-                            expanded,
-                        },
-                    });
-
-                    if expanded {
-                        let mut next_prefix = ancestor_has_more.to_vec();
-                        next_prefix.push(!is_last);
-                        Self::append_tree_rows(
-                            child_node,
-                            &relative_path,
-                            &next_prefix,
-                            collapsed_dirs,
-                            rows,
-                            file_rows,
-                        );
-                    }
-                }
-                TreeChild::File(name, file_index) => {
-                    label.push_str(name);
-                    file_rows[*file_index] = Some(rows.len());
-                    rows.push(FileTreeRow {
-                        label,
-                        branch_prefix_len,
-                        kind: FileTreeRowKind::File {
-                            file_index: *file_index,
-                        },
-                    });
-                }
-            }
-        }
-    }
-
-    fn tree_row_prefix(ancestor_has_more: &[bool]) -> String {
-        ancestor_has_more
-            .iter()
-            .map(|has_more| if *has_more { " │ " } else { "   " })
-            .collect::<Vec<_>>()
-            .join("")
-    }
-
-    pub(super) fn contains_git_component(path: &Path) -> bool {
-        path.components()
-            .any(|component| component.as_os_str() == ".git")
-    }
-
-    fn search_result_excerpt(line: &str) -> String {
-        let collapsed = line.replace('\t', " ").trim().to_string();
-        let chars = collapsed.chars().collect::<Vec<_>>();
-        if chars.len() <= 120 {
-            collapsed
-        } else {
-            chars[..117].iter().collect::<String>() + "..."
-        }
-    }
-}
-
-enum TreeChild<'a> {
-    Directory(&'a str),
-    File(&'a str, usize),
 }

@@ -4,6 +4,11 @@ const UNDO_LIMIT: usize = 256;
 
 impl WorkspaceEditorState {
     pub fn open(path: &Path) -> Result<Self> {
+        let source = Self::read_source(path)?;
+        Self::from_source(path, source)
+    }
+
+    pub(crate) fn read_source(path: &Path) -> Result<String> {
         let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
         if bytes.contains(&0) {
             return Err(anyhow::anyhow!("Binary files cannot be edited in-app."));
@@ -15,7 +20,12 @@ impl WorkspaceEditorState {
             ));
         }
 
-        let source = WorkspaceRenderer::normalize_newlines(&String::from_utf8_lossy(&bytes));
+        Ok(WorkspaceRenderer::normalize_newlines(
+            &String::from_utf8_lossy(&bytes),
+        ))
+    }
+
+    pub(crate) fn from_source(path: &Path, source: String) -> Result<Self> {
         let mut lines = WorkspaceRenderer::split_preserving_lines(&source);
         if lines.is_empty() {
             lines.push(String::new());
@@ -34,15 +44,11 @@ impl WorkspaceEditorState {
             dirty: false,
             status: None,
             hover: None,
-            completion_items: Vec::new(),
             undo_stack: Vec::new(),
             preferred_col: 0,
             selection_anchor: None,
             hover_request: None,
-            completion_request: None,
-            completion_selected: 0,
-            completion_scroll: 0,
-            shortcuts_help_open: false,
+            overlay: EditorOverlay::None,
             render_cache: EditorRenderCache::default(),
         };
         editor.rebuild_render_cache();
@@ -401,206 +407,6 @@ impl WorkspaceEditorState {
         self.hover_request = None;
     }
 
-    pub fn shortcuts_help_open(&self) -> bool {
-        self.shortcuts_help_open
-    }
-
-    pub fn open_shortcuts_help(&mut self) {
-        self.shortcuts_help_open = true;
-    }
-
-    pub fn close_shortcuts_help(&mut self) {
-        self.shortcuts_help_open = false;
-    }
-
-    pub fn toggle_shortcuts_help(&mut self) {
-        self.shortcuts_help_open = !self.shortcuts_help_open;
-    }
-
-    pub fn clear_completion(&mut self) {
-        self.completion_items.clear();
-        self.completion_request = None;
-        self.completion_selected = 0;
-        self.completion_scroll = 0;
-    }
-
-    pub fn request_hover(&mut self, position: EditorPosition) -> bool {
-        if self.hover_request == Some(position) {
-            return false;
-        }
-
-        self.hover = None;
-        self.hover_request = Some(position);
-        true
-    }
-
-    pub fn resolve_hover(&mut self, position: EditorPosition, hover: Option<String>) -> bool {
-        if self.hover_request != Some(position) {
-            return false;
-        }
-
-        self.hover = hover;
-        true
-    }
-
-    pub fn hover_popover(&self) -> Option<(&str, EditorPosition)> {
-        self.hover.as_deref().zip(self.hover_request)
-    }
-
-    pub fn hover_request_position(&self) -> Option<EditorPosition> {
-        self.hover_request
-    }
-
-    pub fn request_completion(&mut self, position: EditorPosition) {
-        self.clear_completion();
-        self.completion_request = Some(position);
-    }
-
-    pub fn resolve_completion(
-        &mut self,
-        position: EditorPosition,
-        items: Vec<EditorCompletionItem>,
-    ) -> bool {
-        if self.completion_request != Some(position) {
-            return false;
-        }
-
-        if items.is_empty() {
-            self.clear_completion();
-            return true;
-        }
-
-        self.completion_selected = items.iter().position(|item| item.preselected).unwrap_or(0);
-        self.completion_items = items;
-        self.completion_scroll = 0;
-        self.ensure_completion_selection_visible(COMPLETION_POPOVER_MAX_ITEMS);
-        true
-    }
-
-    pub fn completion_popover(&self) -> Option<(&[EditorCompletionItem], usize, EditorPosition)> {
-        let position = self.completion_request?;
-        if self.completion_items.is_empty() {
-            return None;
-        }
-
-        Some((
-            self.completion_items.as_slice(),
-            self.completion_selected
-                .min(self.completion_items.len().saturating_sub(1)),
-            position,
-        ))
-    }
-
-    pub fn completion_request_position(&self) -> Option<EditorPosition> {
-        self.completion_request
-    }
-
-    pub fn completion_window_start(&self, max_items: usize) -> usize {
-        let visible_len = self.completion_visible_len(max_items);
-        self.clamped_completion_scroll(visible_len)
-    }
-
-    pub fn set_completion_window_start(&mut self, start: usize, max_items: usize) {
-        let visible_len = self.completion_visible_len(max_items);
-        if visible_len == 0 {
-            self.completion_scroll = 0;
-            self.completion_selected = 0;
-            return;
-        }
-
-        let start = self.clamp_completion_scroll(start, visible_len);
-        let end = start + visible_len.saturating_sub(1);
-        self.completion_scroll = start;
-        self.completion_selected = self
-            .completion_selected
-            .min(self.completion_items.len().saturating_sub(1))
-            .clamp(start, end);
-    }
-
-    pub fn select_previous_completion(&mut self) {
-        if self.completion_items.is_empty() {
-            return;
-        }
-
-        self.completion_selected = if self.completion_selected == 0 {
-            self.completion_items.len().saturating_sub(1)
-        } else {
-            self.completion_selected - 1
-        };
-        self.ensure_completion_selection_visible(COMPLETION_POPOVER_MAX_ITEMS);
-    }
-
-    pub fn select_next_completion(&mut self) {
-        if self.completion_items.is_empty() {
-            return;
-        }
-
-        self.completion_selected = (self.completion_selected + 1) % self.completion_items.len();
-        self.ensure_completion_selection_visible(COMPLETION_POPOVER_MAX_ITEMS);
-    }
-
-    pub fn apply_selected_completion(&mut self) -> bool {
-        let Some(item) = self.completion_items.get(self.completion_selected).cloned() else {
-            return false;
-        };
-
-        let start = self.clamp_position(item.replace_start);
-        let end = self.clamp_position(item.replace_end);
-        let (start, end) = if start <= end {
-            (start, end)
-        } else {
-            (end, start)
-        };
-
-        self.clear_selection();
-        self.cursor_row = start.row;
-        self.cursor_col = start.col;
-        self.selection_anchor = Some(start);
-        self.cursor_row = end.row;
-        self.cursor_col = end.col;
-        self.preferred_col = self.cursor_col;
-
-        let applied = self.paste_text(&item.insert_text);
-        self.clear_completion();
-        applied
-    }
-
-    fn completion_visible_len(&self, max_items: usize) -> usize {
-        self.completion_items.len().min(max_items)
-    }
-
-    fn clamped_completion_scroll(&self, visible_len: usize) -> usize {
-        if visible_len == 0 {
-            return 0;
-        }
-
-        self.clamp_completion_scroll(self.completion_scroll, visible_len)
-    }
-
-    fn clamp_completion_scroll(&self, scroll: usize, visible_len: usize) -> usize {
-        if visible_len == 0 {
-            return 0;
-        }
-
-        scroll.min(self.completion_items.len().saturating_sub(visible_len))
-    }
-
-    fn ensure_completion_selection_visible(&mut self, max_items: usize) {
-        let visible_len = self.completion_visible_len(max_items);
-        if visible_len == 0 {
-            self.completion_scroll = 0;
-            return;
-        }
-
-        let mut start = self.clamped_completion_scroll(visible_len);
-        if self.completion_selected < start {
-            start = self.completion_selected;
-        } else if self.completion_selected >= start + visible_len {
-            start = self.completion_selected + 1 - visible_len;
-        }
-        self.completion_scroll = self.clamp_completion_scroll(start, visible_len);
-    }
-
     pub fn symbol_position_near(&self, row: usize, col: usize) -> Option<EditorPosition> {
         let line = self.lines.get(row)?;
         let characters = line.chars().collect::<Vec<_>>();
@@ -815,7 +621,7 @@ impl WorkspaceEditorState {
         }
     }
 
-    fn clear_selection(&mut self) {
+    pub(super) fn clear_selection(&mut self) {
         self.selection_anchor = None;
     }
 
@@ -877,7 +683,7 @@ impl WorkspaceEditorState {
         self.preferred_col = self.cursor_col;
     }
 
-    fn clamp_position(&self, position: EditorPosition) -> EditorPosition {
+    pub(super) fn clamp_position(&self, position: EditorPosition) -> EditorPosition {
         let row = position.row.min(self.lines.len().saturating_sub(1));
         EditorPosition {
             row,

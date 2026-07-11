@@ -1,17 +1,19 @@
 use super::super::chat::ChatSupport;
 use super::super::*;
-use super::UiSupport;
+use super::{SelectableListPopover, UiSupport};
 
 pub(in crate::app) struct ChatInputComponent;
 
 impl ChatInputComponent {
     pub(in crate::app) fn draw(frame: &mut Frame, app: &App, area: Rect) {
         let shell_mode = ChatSupport::input_is_shell(&app.chat_input);
-        let thinking = app.active_agent().is_some_and(|agent| agent.thinking);
-        let shell_running = app.active_agent().is_some_and(|agent| agent.shell_running);
+        let thinking = app.active_agent().is_some_and(|agent| agent.chat.thinking);
+        let shell_running = app
+            .active_agent()
+            .is_some_and(|agent| agent.chat.shell_running);
         let queued = app
             .active_agent()
-            .map(|agent| agent.queued_chat_count())
+            .map(|agent| agent.chat.queued_chat_count())
             .unwrap_or(0);
         let title = if shell_running {
             format!(
@@ -94,46 +96,26 @@ impl ChatInputComponent {
         let Some(agent) = app.active_agent() else {
             return;
         };
-        if !agent.has_queued_chat_messages() {
+        if !agent.chat.has_queued_chat_messages() {
             return;
         }
 
-        let items = agent.queued_chat_messages();
-        let selected = agent.selected_queued_chat_index().unwrap_or(0);
-        let visible_count = items.len().min(5);
-        let start = selected
-            .saturating_sub(visible_count.saturating_sub(1))
-            .min(items.len().saturating_sub(visible_count));
-        let max_width = area.width.saturating_sub(2).clamp(1, 72);
-        let popup_height = visible_count as u16 + 2;
-        let popup_y = area.y.saturating_sub(popup_height.saturating_sub(1));
-        let popup_area = Rect::new(area.x, popup_y, max_width, popup_height);
-
-        let lines = items
+        let items = agent.chat.queued_chat_messages();
+        let selected = agent.chat.selected_queued_chat_index().unwrap_or(0);
+        let labels = items
             .iter()
-            .skip(start)
-            .take(visible_count)
-            .enumerate()
-            .map(|(offset, item)| {
-                let is_selected = start + offset == selected;
-                let style = if is_selected {
-                    UiSupport::selection_style()
-                } else {
-                    Style::default()
-                        .bg(UiSupport::theme().panel_bg)
-                        .fg(UiSupport::theme().foreground)
-                };
-                let prefix = if is_selected { "› " } else { "  " };
-                Line::from(Span::styled(
-                    format!(
-                        "{}{}",
-                        prefix,
-                        Self::queue_preview(&item.text, popup_area.width.saturating_sub(4))
-                    ),
-                    style,
-                ))
-            })
+            .map(|item| item.text.clone())
             .collect::<Vec<_>>();
+        let (start, visible_count) = SelectableListPopover::window(selected, labels.len(), 5);
+        let max_width = area.width.saturating_sub(2).clamp(1, 72);
+        let popup_area = SelectableListPopover::area(area, max_width, visible_count);
+        let lines = SelectableListPopover::label_lines(
+            &labels,
+            selected,
+            start,
+            visible_count,
+            popup_area.width,
+        );
 
         frame.render_widget(Clear, popup_area);
         let popup = Paragraph::new(Text::from(lines))
@@ -190,38 +172,16 @@ impl ChatInputComponent {
                 )
             }
         };
-        let visible_count = labels.len().min(7);
-        let start = UiSupport::list_offset(selected, labels.len(), visible_count);
-        let popup_width = area.width.saturating_sub(2).min(72).max(1);
-        let popup_height = visible_count as u16 + 2;
-        let popup_y = area.y.saturating_sub(popup_height.saturating_sub(1));
-        let popup_area = Rect::new(area.x, popup_y, popup_width, popup_height);
-
-        let lines = labels
-            .iter()
-            .skip(start)
-            .take(visible_count)
-            .enumerate()
-            .map(|(offset, label)| {
-                let is_selected = start + offset == selected;
-                let style = if is_selected {
-                    UiSupport::selection_style()
-                } else {
-                    Style::default()
-                        .bg(UiSupport::theme().panel_bg)
-                        .fg(UiSupport::theme().foreground)
-                };
-                let prefix = if is_selected { "› " } else { "  " };
-                Line::from(Span::styled(
-                    format!(
-                        "{}{}",
-                        prefix,
-                        Self::queue_preview(label, popup_area.width.saturating_sub(4))
-                    ),
-                    style,
-                ))
-            })
-            .collect::<Vec<_>>();
+        let (start, visible_count) = SelectableListPopover::window(selected, labels.len(), 7);
+        let popup_width = area.width.saturating_sub(2).clamp(1, 72);
+        let popup_area = SelectableListPopover::area(area, popup_width, visible_count);
+        let lines = SelectableListPopover::label_lines(
+            &labels,
+            selected,
+            start,
+            visible_count,
+            popup_area.width,
+        );
 
         frame.render_widget(Clear, popup_area);
         let popup = Paragraph::new(Text::from(lines))
@@ -265,21 +225,6 @@ impl ChatInputComponent {
             .filter(|description| !description.trim().is_empty())
             .map(|description| format!("{} - {description}", effort.reasoning_effort))
             .unwrap_or_else(|| effort.reasoning_effort.clone())
-    }
-
-    fn queue_preview(text: &str, width: u16) -> String {
-        let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
-        let limit = usize::from(width.max(1));
-        if compact.chars().count() <= limit {
-            compact
-        } else {
-            let mut truncated = compact
-                .chars()
-                .take(limit.saturating_sub(1))
-                .collect::<String>();
-            truncated.push('…');
-            truncated
-        }
     }
 
     pub(in crate::app) fn wrapped_lines(input: &str, width: u16) -> Vec<String> {

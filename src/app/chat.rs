@@ -24,21 +24,21 @@ pub(super) enum ModelCommand {
 }
 
 impl ChatSupport {
-    pub(super) fn build_text(agent: &AgentState) -> Text<'static> {
-        if agent.messages.is_empty() {
+    pub(super) fn build_text(chat: &ChatState) -> Text<'static> {
+        if chat.messages.is_empty() {
             return Text::from(vec![Line::from("No messages yet.")]);
         }
 
         let mut used = 0usize;
         let mut chunks = Vec::new();
 
-        for message in agent.messages.iter().rev() {
+        for message in chat.messages.iter().rev() {
             let available = CHAT_RENDER_LINE_LIMIT.saturating_sub(used);
             if available == 0 {
                 break;
             }
 
-            let message_lines = Self::message_lines(message, &agent.definition.name);
+            let message_lines = Self::message_lines(message, &chat.agent_name);
             let lines = if message_lines.len() <= available {
                 message_lines
             } else if chunks.is_empty() {
@@ -58,19 +58,15 @@ impl ChatSupport {
         Text::from(lines)
     }
 
-    pub(super) fn lines(agent: &AgentState) -> Vec<Line<'static>> {
-        agent.chat_text().lines
-    }
-
-    pub(super) fn max_scroll(agent: &AgentState, area: Rect) -> u16 {
+    pub(super) fn max_scroll(chat: &ChatState, area: Rect) -> u16 {
         let inner_height = area.height.saturating_sub(2) as usize;
-        let content_height = agent.chat_content_height(area);
+        let content_height = chat.chat_content_height(area);
 
         content_height.saturating_sub(inner_height) as u16
     }
 
-    pub(super) fn content_height(agent: &AgentState, area: Rect) -> usize {
-        agent.chat_content_height(area)
+    pub(super) fn content_height(chat: &ChatState, area: Rect) -> usize {
+        chat.chat_content_height(area)
     }
 
     pub(super) fn command_from_input(input: &str) -> Option<ChatCommand> {
@@ -119,17 +115,17 @@ impl ChatSupport {
         )
     }
 
-    pub(super) fn render_state(agent: &AgentState, area: Rect) -> ChatRenderState {
-        let mut text = agent.chat_text();
+    pub(super) fn render_state(chat: &ChatState, area: Rect) -> ChatRenderState {
+        let mut text = chat.chat_text();
         let inner_height = area.height.saturating_sub(2) as usize;
         if inner_height == 0 {
             return ChatRenderState {
                 text,
-                content_height: agent.chat_content_height(area),
+                content_height: chat.chat_content_height(area),
             };
         }
 
-        let content_height = agent.chat_content_height(area);
+        let content_height = chat.chat_content_height(area);
         if content_height >= inner_height {
             return ChatRenderState {
                 text,
@@ -143,10 +139,6 @@ impl ChatSupport {
             text: Text::from(padded),
             content_height,
         }
-    }
-
-    pub(super) fn padded_lines(agent: &AgentState, area: Rect) -> Vec<Line<'static>> {
-        Self::render_state(agent, area).text.lines
     }
 
     fn message_lines(message: &ChatMessage, agent_name: &str) -> Vec<Line<'static>> {

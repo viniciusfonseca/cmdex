@@ -515,7 +515,9 @@ fn workspace_tree_starts_collapsed_by_default() {
     fs::write(root.join("src/ui/mod.rs"), "").unwrap();
 
     let mut browser = FileBrowserState::default();
-    browser.refresh(&root);
+    browser
+        .apply_scanned_entries(FileBrowserState::scan_entries(&root).unwrap())
+        .unwrap();
 
     assert_eq!(
         browser
@@ -530,7 +532,7 @@ fn workspace_tree_starts_collapsed_by_default() {
 }
 
 #[test]
-fn refresh_if_changed_preserves_selected_file_and_updates_tree_rows() {
+fn applying_scanned_entries_preserves_selected_file_and_updates_tree_rows() {
     let root = std::env::temp_dir().join(format!(
         "cmdex-workspace-refresh-{}-{}",
         std::process::id(),
@@ -545,32 +547,77 @@ fn refresh_if_changed_preserves_selected_file_and_updates_tree_rows() {
     fs::write(&selected, "b").unwrap();
 
     let mut browser = FileBrowserState::default();
-    browser.refresh(&root);
+    browser
+        .apply_scanned_entries(FileBrowserState::scan_entries(&root).unwrap())
+        .unwrap();
 
     assert_eq!(browser.entries[browser.selected].path, selected);
 
     fs::write(&added, "a").unwrap();
-    browser.refresh_if_changed(&root);
+    browser
+        .apply_scanned_entries(FileBrowserState::scan_entries(&root).unwrap())
+        .unwrap();
 
     assert_eq!(browser.entries[browser.selected].path, selected);
     assert!(
         browser
-            .sidebar_labels()
+            .tree_rows
             .iter()
+            .map(|row| row.label.as_str())
             .any(|label| label.contains("a.txt"))
     );
 
     fs::remove_file(&added).unwrap();
-    browser.refresh_if_changed(&root);
+    browser
+        .apply_scanned_entries(FileBrowserState::scan_entries(&root).unwrap())
+        .unwrap();
 
     assert!(
         !browser
-            .sidebar_labels()
+            .tree_rows
             .iter()
+            .map(|row| row.label.as_str())
             .any(|label| label.contains("a.txt"))
     );
 
     let _ = fs::remove_file(selected);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn stale_workspace_search_results_do_not_replace_newer_query() {
+    let root = std::env::temp_dir().join(format!(
+        "cmdex-workspace-search-generation-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let path = root.join("source.txt");
+    fs::write(&path, "alpha\nbeta\n").unwrap();
+
+    let mut browser = FileBrowserState {
+        entries: vec![FileEntry {
+            path: path.clone(),
+            relative_path: PathBuf::from("source.txt"),
+        }],
+        ..Default::default()
+    };
+    browser.push_search_char('a');
+    let first_generation = browser.search_generation();
+    browser.push_search_char('b');
+    let second_generation = browser.search_generation();
+
+    let first = FileBrowserState::search_entries(&browser.entries, "a").unwrap();
+    assert!(!browser.apply_search_snapshot(first_generation, "a", first));
+    assert_eq!(browser.search_total_rows(), 0);
+
+    let second = FileBrowserState::search_entries(&browser.entries, "ab").unwrap();
+    assert!(browser.apply_search_snapshot(second_generation, "ab", second));
+    assert_eq!(browser.search_match_count(), 0);
+
     let _ = fs::remove_dir_all(root);
 }
 
@@ -674,6 +721,27 @@ fn git_remote_action_state_blocks_concurrent_actions_and_clears_on_failure() {
 
     assert_eq!(diff.remote_action, None);
     assert_eq!(diff.error.as_deref(), Some("push failed"));
+}
+
+#[test]
+fn git_refresh_generation_ignores_stale_snapshots() {
+    let mut diff = DiffBrowserState::default();
+    let first_generation = diff.begin_refresh();
+    let second_generation = diff.begin_refresh();
+    let result = GitDiffLoadResult {
+        changes: Vec::new(),
+        staged: Vec::new(),
+        active_section: DiffSection::Changes,
+        selected_path: None,
+        preview_title: "Git Diff".to_string(),
+        preview: vec![Line::from("latest")],
+    };
+
+    assert!(!diff.apply_load_result(first_generation, Some(result.clone()), None,));
+    assert!(diff.refresh_in_flight);
+    assert!(diff.apply_load_result(second_generation, Some(result), None));
+    assert!(!diff.refresh_in_flight);
+    assert_eq!(diff.preview[0].spans[0].content, "latest");
 }
 
 #[test]

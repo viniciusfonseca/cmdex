@@ -26,7 +26,7 @@ impl AppUi {
         TopNavigationComponent::draw(frame, app, frame_layout[0]);
         Self::draw_main(frame, app, root[1]);
         Self::draw_sidebar(frame, app, root[0]);
-        HelpBarComponent::draw(frame, frame_layout[2]);
+        StatusBarComponent::draw(frame, app, frame_layout[2]);
     }
 
     fn draw_main(frame: &mut Frame, app: &App, area: Rect) {
@@ -55,6 +55,81 @@ impl AppUi {
             AppTab::Workspace => WorkspaceSidebarComponent::draw(frame, app, area),
             AppTab::Shell => ShellSidebarComponent::draw(frame, app, area),
             AppTab::GitDiff => GitDiffSidebarComponent::draw(frame, app, area),
+        }
+    }
+}
+
+impl App {
+    pub(in crate::app) fn compute_layout(&self, area: Rect) -> UiLayout {
+        let frame = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
+            .split(area);
+
+        let root = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(40)])
+            .split(frame[1]);
+
+        if self.current_tab == AppTab::Chat && !self.add_agent_selected() {
+            let input_height = ChatInputComponent::height_for_main_area(&self.chat_input, root[1]);
+            let main = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(10), Constraint::Length(input_height)])
+                .split(root[1]);
+
+            UiLayout {
+                sidebar_list: root[0],
+                tabs: frame[0],
+                body: main[0],
+                footer: Some(main[1]),
+                add_name: None,
+                add_workspace: None,
+            }
+        } else if self.current_tab == AppTab::Shell {
+            UiLayout {
+                sidebar_list: root[0],
+                tabs: frame[0],
+                body: root[1],
+                footer: None,
+                add_name: None,
+                add_workspace: None,
+            }
+        } else if self.current_tab == AppTab::Chat {
+            let outer = UiSupport::rounded_block().title("New Agent");
+            let inner = outer.inner(root[1]);
+            let fields = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Length(3),
+                    Constraint::Length(3),
+                    Constraint::Min(3),
+                ])
+                .margin(1)
+                .split(inner);
+
+            UiLayout {
+                sidebar_list: root[0],
+                tabs: frame[0],
+                body: root[1],
+                footer: None,
+                add_name: Some(fields[1]),
+                add_workspace: Some(fields[2]),
+            }
+        } else {
+            UiLayout {
+                sidebar_list: root[0],
+                tabs: frame[0],
+                body: root[1],
+                footer: None,
+                add_name: None,
+                add_workspace: None,
+            }
         }
     }
 }

@@ -5,12 +5,34 @@ use super::{
         ShellSidebarComponent, TopNavigationComponent, UiSupport, WorkspaceComponent,
         WorkspaceEditorComponent,
     },
+    effects::AppEffect,
     shell::{ShellOutputParser, ShellOutputRecord, ShellPresenter, ShellTabState},
     *,
 };
+use crossterm::event::{Event, KeyEventKind, KeyEventState};
 use ratatui::style::Color;
 use ratatui::{Terminal, backend::TestBackend};
 use serde_json::json;
+
+#[test]
+fn app_input_normalizes_terminal_events_and_filters_non_input_events() {
+    let key = KeyEvent {
+        code: KeyCode::Char('x'),
+        modifiers: KeyModifiers::NONE,
+        kind: KeyEventKind::Press,
+        state: KeyEventState::NONE,
+    };
+
+    assert!(matches!(
+        AppInput::from_terminal_event(Event::Key(key)),
+        Some(AppInput::Key(_))
+    ));
+    assert!(matches!(
+        AppInput::from_terminal_event(Event::Paste("text".to_string())),
+        Some(AppInput::Paste(text)) if text == "text"
+    ));
+    assert!(AppInput::from_terminal_event(Event::Resize(80, 24)).is_none());
+}
 
 #[test]
 fn wrapped_text_height_matches_paragraph_word_wrapping() {
@@ -47,6 +69,43 @@ fn git_diff_remote_button_label_shows_spinner_only_for_active_action() {
         ),
         "Pull"
     );
+}
+
+#[test]
+fn git_mutations_are_enqueued_instead_of_running_in_the_input_handler() {
+    let config = CmdexConfig {
+        agents: vec![AgentDefinition {
+            name: "Test".to_string(),
+            workspace: PathBuf::from("/tmp"),
+        }],
+        ..CmdexConfig::default()
+    };
+    let mut app = App::new(PathBuf::new(), config);
+    app.current_agent = Some(0);
+    app.current_tab = AppTab::GitDiff;
+    app.agents[0]
+        .git_diff
+        .changes
+        .push(crate::workspace::DiffEntry {
+            label: "[M] file.rs".to_string(),
+            path: PathBuf::from("/tmp/file.rs"),
+            status: "M".to_string(),
+        });
+
+    GitDiffComponent::handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+    );
+
+    assert!(app.agents[0].git_diff.mutation_running);
+    assert!(matches!(
+        app.take_effects().as_slice(),
+        [AppEffect::RunGitMutation {
+            agent_index: 0,
+            root,
+            mutation: GitMutation::Stage(path),
+        }] if root == &PathBuf::from("/tmp") && path == "file.rs"
+    ));
 }
 
 #[test]
@@ -368,14 +427,11 @@ fn top_navigation_clicks_ignore_cmdex_prefix_and_hit_tabs() {
 }
 
 #[test]
-fn alt_r_requests_restart() {
-    let mut app = App::new(PathBuf::new(), CmdexConfig::default());
-
-    app.should_restart = true;
-    app.should_quit = true;
-
-    assert!(app.should_restart);
-    assert!(app.should_quit);
+fn app_outcome_carries_restart_exit() {
+    assert_eq!(
+        super::input::AppOutcome::Exit(AppExit::Restart).exit(),
+        Some(AppExit::Restart)
+    );
 }
 
 #[test]
@@ -389,7 +445,7 @@ fn chat_max_scroll_uses_wrapped_height_for_last_message() {
         None,
         "default",
     );
-    agent.messages.push(ChatMessage::new(
+    agent.chat.messages.push(ChatMessage::new(
         MessageRole::Assistant,
         "abc def ghi",
         None,
@@ -397,7 +453,7 @@ fn chat_max_scroll_uses_wrapped_height_for_last_message() {
 
     let area = Rect::new(0, 0, 8, 5);
 
-    assert_eq!(ChatSupport::max_scroll(&agent, area), 2);
+    assert_eq!(ChatSupport::max_scroll(&agent.chat, area), 2);
 }
 
 #[test]
@@ -411,24 +467,24 @@ fn chat_scroll_height_matches_rendered_width_without_extra_tail_space() {
         None,
         "default",
     );
-    agent.messages.push(ChatMessage::new(
+    agent.chat.messages.push(ChatMessage::new(
         MessageRole::Assistant,
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         None,
     ));
 
     let area = Rect::new(0, 0, 10, 5);
-    let text = Text::from(ChatSupport::lines(&agent));
+    let text = ChatSupport::build_text(&agent.chat);
     let expected_content_height =
         UiSupport::wrapped_text_height(&text, area.width.saturating_sub(2));
 
     assert!(UiSupport::scrollable_text_height(&text, area) > expected_content_height);
     assert_eq!(
-        ChatSupport::content_height(&agent, area),
+        ChatSupport::content_height(&agent.chat, area),
         expected_content_height
     );
     assert_eq!(
-        ChatSupport::max_scroll(&agent, area),
+        ChatSupport::max_scroll(&agent.chat, area),
         expected_content_height.saturating_sub(area.height.saturating_sub(2) as usize) as u16
     );
 }
@@ -444,13 +500,13 @@ fn chat_appends_single_blank_line_after_final_message() {
         None,
         "default",
     );
-    agent.messages.push(ChatMessage::new(
+    agent.chat.messages.push(ChatMessage::new(
         MessageRole::Assistant,
         "final message",
         None,
     ));
 
-    let lines = ChatSupport::lines(&agent);
+    let lines = ChatSupport::build_text(&agent.chat).lines;
 
     assert_eq!(lines.len(), 3);
     assert_eq!(line_text(&lines[0]), "Test:");
@@ -470,13 +526,15 @@ fn chat_keeps_a_single_blank_line_between_messages() {
         "default",
     );
     agent
+        .chat
         .messages
         .push(ChatMessage::new(MessageRole::User, "one", None));
     agent
+        .chat
         .messages
         .push(ChatMessage::new(MessageRole::Assistant, "two", None));
 
-    let lines = ChatSupport::lines(&agent);
+    let lines = ChatSupport::build_text(&agent.chat).lines;
 
     assert_eq!(line_text(&lines[0]), "You:");
     assert_eq!(line_text(&lines[1]), "one");
@@ -497,14 +555,14 @@ fn chat_bottom_aligns_short_content_with_one_blank_line_after_last_message() {
         None,
         "default",
     );
-    agent.messages.push(ChatMessage::new(
+    agent.chat.messages.push(ChatMessage::new(
         MessageRole::Assistant,
         "final message",
         None,
     ));
 
     let area = Rect::new(0, 0, 20, 8);
-    let lines = ChatSupport::padded_lines(&agent, area);
+    let lines = ChatSupport::render_state(&agent.chat, area).text.lines;
 
     assert_eq!(lines.len(), 6);
     assert!(line_text(&lines[0]).is_empty());
@@ -546,14 +604,14 @@ fn chat_limits_rendered_lines_to_ten_thousand() {
     );
 
     for index in 0..4_000 {
-        agent.messages.push(ChatMessage::new(
+        agent.chat.messages.push(ChatMessage::new(
             MessageRole::Assistant,
             format!("message {index}"),
             None,
         ));
     }
 
-    let lines = ChatSupport::lines(&agent);
+    let lines = ChatSupport::build_text(&agent.chat).lines;
 
     assert_eq!(lines.len(), 9_999);
     assert_eq!(line_text(&lines[0]), "Test:");
@@ -573,6 +631,67 @@ fn shell_command_is_detected_from_chat_input() {
     );
     assert_eq!(ChatSupport::shell_command_from_input("hello > world"), None);
     assert_eq!(ChatSupport::shell_command_from_input(">"), None);
+}
+
+#[test]
+fn chat_shell_submission_enqueues_effect_without_spawning_runtime_work() {
+    let config = CmdexConfig {
+        agents: vec![AgentDefinition {
+            name: "Test".to_string(),
+            workspace: PathBuf::from("/tmp"),
+        }],
+        ..CmdexConfig::default()
+    };
+    let mut app = App::new(PathBuf::new(), config);
+    app.current_agent = Some(0);
+    app.chat_sidebar_index = 1;
+
+    ChatComponent::submit_shell_command(&mut app, "printf hello".to_string());
+
+    assert!(app.agents[0].chat.shell_running);
+    assert!(matches!(
+        app.take_effects().as_slice(),
+        [AppEffect::RunShell {
+            agent_index: 0,
+            command,
+            workspace,
+        }] if command == "printf hello" && workspace == &PathBuf::from("/tmp")
+    ));
+}
+
+#[test]
+fn chat_codex_commands_enqueue_effects_without_spawning_runtime_work() {
+    let config = CmdexConfig {
+        agents: vec![AgentDefinition {
+            name: "Test".to_string(),
+            workspace: PathBuf::from("/tmp"),
+        }],
+        ..CmdexConfig::default()
+    };
+    let mut app = App::new(PathBuf::new(), config);
+    app.current_agent = Some(0);
+    app.chat_sidebar_index = 1;
+    app.chat_input = "hello".to_string();
+
+    ChatComponent::submit_message(&mut app);
+
+    assert!(app.agents[0].chat.thinking);
+    assert!(matches!(
+        app.take_effects().as_slice(),
+        [AppEffect::StartChatTurn {
+            agent_index: 0,
+            text,
+            workspace,
+            ..
+        }] if text == "hello" && workspace == &PathBuf::from("/tmp")
+    ));
+
+    app.chat_input = "/model".to_string();
+    ChatComponent::submit_message(&mut app);
+    assert!(matches!(
+        app.take_effects().as_slice(),
+        [AppEffect::ListModels { agent_index: 0 }]
+    ));
 }
 
 #[test]
@@ -621,7 +740,7 @@ fn model_list_opens_picker_with_current_model_selected() {
     let mut app = App::new(PathBuf::new(), config);
     app.current_agent = Some(0);
     app.chat_sidebar_index = 1;
-    app.agents[0].chat_model = Some("gpt-5.5".to_string());
+    app.agents[0].chat.chat_model = Some("gpt-5.5".to_string());
 
     app.handle_ui_event(UiEvent::ModelListLoaded {
         agent_index: 0,
@@ -719,7 +838,7 @@ fn model_picker_selects_effort_supported_by_selected_model() {
     let mut app = App::new(PathBuf::new(), config);
     app.current_agent = Some(0);
     app.chat_sidebar_index = 1;
-    app.agents[0].chat_reasoning_effort = Some("low".to_string());
+    app.agents[0].chat.chat_reasoning_effort = Some("low".to_string());
     app.model_picker = Some(ModelPickerState {
         agent_index: 0,
         models: vec![ModelInfo {
@@ -882,11 +1001,17 @@ fn queued_chat_messages_can_be_iterated_and_canceled() {
 
     {
         let agent = app.active_agent_mut().unwrap();
-        agent.enqueue_chat_message("primeira mensagem".to_string());
-        agent.enqueue_chat_message("segunda mensagem".to_string());
-        agent.enqueue_chat_message("terceira mensagem".to_string());
-        assert_eq!(agent.queued_chat_count(), 3);
-        assert_eq!(agent.selected_queued_chat_index(), Some(0));
+        agent
+            .chat
+            .enqueue_chat_message("primeira mensagem".to_string());
+        agent
+            .chat
+            .enqueue_chat_message("segunda mensagem".to_string());
+        agent
+            .chat
+            .enqueue_chat_message("terceira mensagem".to_string());
+        assert_eq!(agent.chat.queued_chat_count(), 3);
+        assert_eq!(agent.chat.selected_queued_chat_index(), Some(0));
     }
 
     assert!(ChatComponent::handle_queue_key(
@@ -894,7 +1019,10 @@ fn queued_chat_messages_can_be_iterated_and_canceled() {
         KeyEvent::new(KeyCode::Down, KeyModifiers::ALT)
     ));
     assert_eq!(
-        app.active_agent().unwrap().selected_queued_chat_index(),
+        app.active_agent()
+            .unwrap()
+            .chat
+            .selected_queued_chat_index(),
         Some(1)
     );
 
@@ -903,7 +1031,10 @@ fn queued_chat_messages_can_be_iterated_and_canceled() {
         KeyEvent::new(KeyCode::Down, KeyModifiers::ALT)
     ));
     assert_eq!(
-        app.active_agent().unwrap().selected_queued_chat_index(),
+        app.active_agent()
+            .unwrap()
+            .chat
+            .selected_queued_chat_index(),
         Some(2)
     );
 
@@ -913,10 +1044,11 @@ fn queued_chat_messages_can_be_iterated_and_canceled() {
     ));
 
     let agent = app.active_agent().unwrap();
-    assert_eq!(agent.queued_chat_count(), 2);
-    assert_eq!(agent.selected_queued_chat_index(), Some(1));
+    assert_eq!(agent.chat.queued_chat_count(), 2);
+    assert_eq!(agent.chat.selected_queued_chat_index(), Some(1));
     assert_eq!(
         agent
+            .chat
             .queued_chat_messages()
             .iter()
             .map(|message| message.text.as_str())
@@ -937,15 +1069,15 @@ fn turn_events_track_active_turn_and_interruption_status() {
     let mut app = App::new(PathBuf::new(), config);
     app.current_agent = Some(0);
     app.chat_sidebar_index = 1;
-    app.agents[0].thread_id = Some("thread-1".to_string());
+    app.agents[0].chat.thread_id = Some("thread-1".to_string());
 
     app.handle_server_event(ServerEvent::TurnStarted {
         thread_id: "thread-1".to_string(),
         turn_id: "turn-1".to_string(),
     });
 
-    assert_eq!(app.agents[0].active_turn_id.as_deref(), Some("turn-1"));
-    assert!(app.agents[0].thinking);
+    assert_eq!(app.agents[0].chat.active_turn_id.as_deref(), Some("turn-1"));
+    assert!(app.agents[0].chat.thinking);
 
     app.handle_server_event(ServerEvent::TurnCompleted {
         thread_id: "thread-1".to_string(),
@@ -953,8 +1085,8 @@ fn turn_events_track_active_turn_and_interruption_status() {
         interrupted: true,
     });
 
-    assert_eq!(app.agents[0].active_turn_id, None);
-    assert!(!app.agents[0].thinking);
+    assert_eq!(app.agents[0].chat.active_turn_id, None);
+    assert!(!app.agents[0].chat.thinking);
     assert_eq!(app.agents[0].status.as_deref(), Some("Response canceled"));
 }
 
@@ -1025,20 +1157,33 @@ fn debounces_repeated_mouse_scroll_events() {
     let mut app = App::new(PathBuf::new(), CmdexConfig::default());
     let now = Instant::now();
 
-    assert!(app.should_handle_mouse_scroll_at(ScrollDirection::Down, now));
-    assert!(
-        !app.should_handle_mouse_scroll_at(ScrollDirection::Down, now + Duration::from_millis(10))
-    );
-    assert!(
-        app.should_handle_mouse_scroll_at(ScrollDirection::Down, now + Duration::from_millis(25))
-    );
+    assert!(app.should_handle_mouse_scroll_at_axis(
+        ScrollAxis::Vertical,
+        ScrollDirection::Down,
+        now,
+    ));
+    assert!(!app.should_handle_mouse_scroll_at_axis(
+        ScrollAxis::Vertical,
+        ScrollDirection::Down,
+        now + Duration::from_millis(10),
+    ));
+    assert!(app.should_handle_mouse_scroll_at_axis(
+        ScrollAxis::Vertical,
+        ScrollDirection::Down,
+        now + Duration::from_millis(25),
+    ));
 
     let mut other_direction = App::new(PathBuf::new(), CmdexConfig::default());
-    assert!(other_direction.should_handle_mouse_scroll_at(ScrollDirection::Down, now));
-    assert!(
-        other_direction
-            .should_handle_mouse_scroll_at(ScrollDirection::Up, now + Duration::from_millis(10))
-    );
+    assert!(other_direction.should_handle_mouse_scroll_at_axis(
+        ScrollAxis::Vertical,
+        ScrollDirection::Down,
+        now,
+    ));
+    assert!(other_direction.should_handle_mouse_scroll_at_axis(
+        ScrollAxis::Vertical,
+        ScrollDirection::Up,
+        now + Duration::from_millis(10),
+    ));
 }
 
 #[test]
@@ -1048,25 +1193,37 @@ fn chat_and_workspace_share_same_mouse_scroll_debounce() {
     let now = Instant::now();
     workspace_app.current_tab = AppTab::Workspace;
 
-    assert!(chat_app.should_handle_mouse_scroll_at(ScrollDirection::Down, now));
-    assert!(
-        !chat_app
-            .should_handle_mouse_scroll_at(ScrollDirection::Down, now + Duration::from_millis(10))
-    );
-    assert!(
-        chat_app
-            .should_handle_mouse_scroll_at(ScrollDirection::Down, now + Duration::from_millis(25))
-    );
+    assert!(chat_app.should_handle_mouse_scroll_at_axis(
+        ScrollAxis::Vertical,
+        ScrollDirection::Down,
+        now,
+    ));
+    assert!(!chat_app.should_handle_mouse_scroll_at_axis(
+        ScrollAxis::Vertical,
+        ScrollDirection::Down,
+        now + Duration::from_millis(10),
+    ));
+    assert!(chat_app.should_handle_mouse_scroll_at_axis(
+        ScrollAxis::Vertical,
+        ScrollDirection::Down,
+        now + Duration::from_millis(25),
+    ));
 
-    assert!(workspace_app.should_handle_mouse_scroll_at(ScrollDirection::Down, now));
-    assert!(
-        !workspace_app
-            .should_handle_mouse_scroll_at(ScrollDirection::Down, now + Duration::from_millis(10))
-    );
-    assert!(
-        workspace_app
-            .should_handle_mouse_scroll_at(ScrollDirection::Down, now + Duration::from_millis(25))
-    );
+    assert!(workspace_app.should_handle_mouse_scroll_at_axis(
+        ScrollAxis::Vertical,
+        ScrollDirection::Down,
+        now,
+    ));
+    assert!(!workspace_app.should_handle_mouse_scroll_at_axis(
+        ScrollAxis::Vertical,
+        ScrollDirection::Down,
+        now + Duration::from_millis(10),
+    ));
+    assert!(workspace_app.should_handle_mouse_scroll_at_axis(
+        ScrollAxis::Vertical,
+        ScrollDirection::Down,
+        now + Duration::from_millis(25),
+    ));
 }
 
 #[test]
@@ -1074,7 +1231,11 @@ fn horizontal_mouse_scroll_uses_independent_debounce_axis() {
     let mut app = App::new(PathBuf::new(), CmdexConfig::default());
     let now = Instant::now();
 
-    assert!(app.should_handle_mouse_scroll_at(ScrollDirection::Down, now));
+    assert!(app.should_handle_mouse_scroll_at_axis(
+        ScrollAxis::Vertical,
+        ScrollDirection::Down,
+        now,
+    ));
     assert!(app.should_handle_mouse_scroll_at_axis(
         ScrollAxis::Horizontal,
         ScrollDirection::Down,
@@ -1185,15 +1346,24 @@ fn workspace_tree_refreshes_on_tick_after_filesystem_changes() {
 
     let (ui_tx, _ui_rx) = tokio::sync::mpsc::unbounded_channel();
     app.on_tick(&ui_tx);
+    assert!(app.workspace_refresh_in_flight);
+    let entries = FileBrowserState::scan_entries(&root).unwrap();
+    app.handle_ui_event(UiEvent::WorkspaceEntriesLoaded {
+        agent_index: 0,
+        entries,
+        error: None,
+    });
 
     assert!(
         app.active_agent()
             .unwrap()
             .workspace
-            .sidebar_labels()
+            .tree_rows
             .iter()
+            .map(|row| row.label.as_str())
             .any(|label| label.contains("beta.txt"))
     );
+    assert!(!app.workspace_refresh_in_flight);
 
     let _ = fs::remove_dir_all(root);
 }
@@ -1404,6 +1574,7 @@ fn workspace_arrow_keys_move_sidebar_selection_when_sidebar_is_focused() {
     app.current_agent = Some(0);
     app.chat_sidebar_index = 1;
     TopNavigationComponent::refresh_current_tab(&mut app);
+    let _ = app.take_effects();
 
     {
         let workspace = &mut app.active_agent_mut().unwrap().workspace;
@@ -1429,7 +1600,15 @@ fn workspace_arrow_keys_move_sidebar_selection_when_sidebar_is_focused() {
     let workspace = &app.active_agent().unwrap().workspace;
     assert_eq!(workspace.selected, 1);
     assert!(workspace.sidebar_focused());
-    assert_eq!(workspace.editor.as_ref().unwrap().path, zeta);
+    assert!(workspace.editor.is_none());
+    assert!(matches!(
+        app.take_effects().as_slice(),
+        [AppEffect::OpenWorkspaceEditor {
+            path,
+            position: None,
+            ..
+        }] if path == &zeta
+    ));
 
     let _ = fs::remove_dir_all(root);
 }
@@ -1480,15 +1659,14 @@ fn workspace_ctrl_space_requests_editor_completion() {
     );
 
     assert!(handled);
-    assert_eq!(
-        app.active_agent()
+    assert!(
+        app.active_agent_mut()
             .unwrap()
             .workspace
             .editor
-            .as_ref()
+            .as_mut()
             .unwrap()
-            .completion_request_position(),
-        Some(EditorPosition { row: 0, col: 3 })
+            .resolve_completion(EditorPosition { row: 0, col: 3 }, Vec::new())
     );
 
     app.shutdown_lsp_sessions();
@@ -1709,6 +1887,9 @@ fn workspace_search_only_captures_text_when_sidebar_is_focused() {
         for character in "needle".chars() {
             workspace.push_search_char(character);
         }
+        let snapshot = FileBrowserState::search_entries(&workspace.entries, "needle").unwrap();
+        let generation = workspace.search_generation();
+        assert!(workspace.apply_search_snapshot(generation, "needle", snapshot));
         assert!(workspace.open_selected_search_result().unwrap());
         workspace.editor.as_mut().unwrap().enter_insert_mode();
         assert!(workspace.editor_focused());
@@ -2033,7 +2214,7 @@ fn workspace_mouse_clicks_shortcuts_popup_close_button() {
         let workspace = &mut app.active_agent_mut().unwrap().workspace;
         workspace.select(0);
         workspace.open_editor().unwrap();
-        workspace.editor.as_mut().unwrap().open_shortcuts_help();
+        workspace.editor.as_mut().unwrap().toggle_shortcuts_help();
     }
 
     let area = Rect::new(0, 0, 120, 40);
@@ -2406,7 +2587,7 @@ fn workspace_editor_shortcuts_popup_renders_content_and_close_button() {
     ));
     fs::write(&root, "fn main() {}\n").unwrap();
     let mut editor = WorkspaceEditorState::open(&root).unwrap();
-    editor.open_shortcuts_help();
+    editor.toggle_shortcuts_help();
 
     let backend = TestBackend::new(100, 24);
     let mut terminal = Terminal::new(backend).unwrap();

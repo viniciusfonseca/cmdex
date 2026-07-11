@@ -1,10 +1,7 @@
 use super::super::*;
 use super::UiSupport;
-use crate::syntax::SyntaxRegistry;
 use crate::workspace::COMPLETION_POPOVER_MAX_ITEMS;
-use ratatui::style::Color;
 use std::path::Path;
-use syntect::{easy::HighlightLines, highlighting::FontStyle, parsing::SyntaxReference};
 
 pub(in crate::app) struct WorkspaceEditorComponent;
 
@@ -248,47 +245,6 @@ impl WorkspaceEditorComponent {
         frame.render_widget(close_button, layout.close_button_area);
     }
 
-    fn shortcuts_help_lines() -> Vec<Line<'static>> {
-        let header_style = Style::default()
-            .fg(UiSupport::theme().accent)
-            .add_modifier(Modifier::BOLD);
-        let muted_style = Style::default().fg(UiSupport::theme().muted);
-
-        vec![
-            Line::from(Span::styled("Global", header_style)),
-            Line::from(vec![
-                Span::styled("Ctrl+H", Style::default().add_modifier(Modifier::BOLD)),
-                Span::styled(" open/close help  ", muted_style),
-                Span::styled("Tab", Style::default().add_modifier(Modifier::BOLD)),
-                Span::styled(" switch focus", muted_style),
-            ]),
-            Line::from(vec![
-                Span::styled("Ctrl+click", Style::default().add_modifier(Modifier::BOLD)),
-                Span::styled(" go to definition  ", muted_style),
-                Span::styled("Ctrl+Space", Style::default().add_modifier(Modifier::BOLD)),
-                Span::styled(" autocomplete", muted_style),
-            ]),
-            Line::from(vec![
-                Span::styled(
-                    "Shift+scroll",
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(" horizontal scroll  ", muted_style),
-                Span::styled("mouse drag", Style::default().add_modifier(Modifier::BOLD)),
-                Span::styled(" select text", muted_style),
-            ]),
-            Line::default(),
-            Line::from(Span::styled("Normal", header_style)),
-            Line::from("arrows / h j k l move, v select, y copy, p paste"),
-            Line::from("u undo, i / a / o edit, x delete, : open command"),
-            Line::default(),
-            Line::from(Span::styled("Visual / Insert", header_style)),
-            Line::from("Visual: arrows / h j k l expand, y copy, p paste, x delete"),
-            Line::from("Insert: Esc normal, Enter new line, Backspace / Delete remove"),
-            Line::from("Home / End / PageUp / PageDown navigate"),
-        ]
-    }
-
     fn render_completion_popover(
         frame: &mut Frame,
         editor: &WorkspaceEditorState,
@@ -332,9 +288,7 @@ impl WorkspaceEditorComponent {
         code_area: Rect,
         vertical_scroll: u16,
     ) -> Option<CompletionPopoverLayout> {
-        let Some((items, selected, position)) = editor.completion_popover() else {
-            return None;
-        };
+        let (items, selected, position) = editor.completion_popover()?;
         if code_area.width < 16 || code_area.height < 4 {
             return None;
         }
@@ -783,91 +737,7 @@ impl WorkspaceEditorComponent {
         language: Option<&str>,
         path: &Path,
     ) -> Vec<Line<'static>> {
-        let syntax = Self::hover_syntax(language, source, path);
-        match syntax {
-            Some(syntax) => {
-                let mut highlighter = HighlightLines::new(syntax, ThemeRegistry::syntax());
-                source
-                    .split('\n')
-                    .map(|line| {
-                        if line.is_empty() {
-                            return Line::default();
-                        }
-
-                        match highlighter.highlight_line(line, SyntaxRegistry::set()) {
-                            Ok(ranges) => Line::from(
-                                ranges
-                                    .into_iter()
-                                    .map(|(style, text)| {
-                                        Span::styled(
-                                            text.to_string(),
-                                            Self::to_ratatui_style(style),
-                                        )
-                                    })
-                                    .collect::<Vec<_>>(),
-                            ),
-                            Err(_) => Line::from(line.to_string()),
-                        }
-                    })
-                    .collect()
-            }
-            None => source
-                .split('\n')
-                .map(|line| {
-                    if line.is_empty() {
-                        Line::default()
-                    } else {
-                        Line::from(line.to_string())
-                    }
-                })
-                .collect(),
-        }
-    }
-
-    fn hover_syntax(
-        language: Option<&str>,
-        source: &str,
-        path: &Path,
-    ) -> Option<&'static SyntaxReference> {
-        let language = language.unwrap_or_default().trim();
-        path.extension()
-            .and_then(|extension| extension.to_str())
-            .and_then(|extension| SyntaxRegistry::set().find_syntax_by_extension(extension))
-            .or_else(|| SyntaxRegistry::set().find_syntax_by_token(language))
-            .or_else(|| SyntaxRegistry::set().find_syntax_by_name(language))
-            .or_else(|| SyntaxRegistry::set().find_syntax_by_extension(language))
-            .or_else(|| {
-                source
-                    .lines()
-                    .next()
-                    .and_then(|line| SyntaxRegistry::set().find_syntax_by_first_line(line))
-            })
-    }
-
-    fn to_ratatui_style(style: syntect::highlighting::Style) -> Style {
-        let mut modifiers = Modifier::empty();
-        if style.font_style.contains(FontStyle::BOLD) {
-            modifiers |= Modifier::BOLD;
-        }
-        if style.font_style.contains(FontStyle::ITALIC) {
-            modifiers |= Modifier::ITALIC;
-        }
-        if style.font_style.contains(FontStyle::UNDERLINE) {
-            modifiers |= Modifier::UNDERLINED;
-        }
-
-        Style::default()
-            .fg(Color::Rgb(
-                style.foreground.r,
-                style.foreground.g,
-                style.foreground.b,
-            ))
-            .bg(Color::Rgb(
-                style.background.r,
-                style.background.g,
-                style.background.b,
-            ))
-            .add_modifier(modifiers)
+        crate::syntax::SyntaxRegistry::highlight_path_or_language(path, language, source)
     }
 
     pub(in crate::app) fn hover_popover_area(

@@ -11,7 +11,11 @@ pub(super) mod shell;
 pub(super) mod shell_sidebar;
 pub(super) mod workspace;
 pub(super) mod workspace_editor;
+pub(super) mod workspace_editor_input;
+pub(super) mod workspace_editor_shortcuts;
+pub(super) mod workspace_keys;
 pub(super) mod workspace_sidebar;
+pub(super) mod workspace_sidebar_input;
 
 pub(super) use self::{
     add_agent_dialog::AddAgentDialogComponent,
@@ -20,9 +24,9 @@ pub(super) use self::{
     chat_input::ChatInputComponent,
     git_diff::GitDiffComponent,
     git_diff_sidebar::GitDiffSidebarComponent,
-    help_bar::HelpBarComponent,
+    help_bar::StatusBarComponent,
     navigation::TopNavigationComponent,
-    shared::UiSupport,
+    shared::{SelectableListPopover, UiSupport},
     shell::ShellComponent,
     shell_sidebar::ShellSidebarComponent,
     workspace::WorkspaceComponent,

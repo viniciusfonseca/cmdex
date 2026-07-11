@@ -1,5 +1,6 @@
 use super::super::{
     chat::{ChatCommand, ChatSupport, ModelCommand},
+    effects::AppEffect,
     *,
 };
 use super::UiSupport;
@@ -33,15 +34,15 @@ impl ChatComponent {
             format!("Chat - {}", agent.definition.name)
         };
 
-        let render_state = ChatSupport::render_state(agent, area);
+        let render_state = ChatSupport::render_state(&agent.chat, area);
         let inner_height = area.height.saturating_sub(2);
         let max_scroll = render_state
             .content_height
             .saturating_sub(inner_height as usize) as u16;
-        let scroll = if agent.chat_follow_output {
+        let scroll = if agent.chat.chat_follow_output {
             max_scroll
         } else {
-            agent.chat_scroll.min(max_scroll)
+            agent.chat.chat_scroll.min(max_scroll)
         };
 
         let chat = Paragraph::new(render_state.text)
@@ -53,18 +54,14 @@ impl ChatComponent {
         UiSupport::render_vertical_scrollbar(frame, area, render_state.content_height, scroll);
     }
 
-    pub(in crate::app) fn submit_message(
-        app: &mut App,
-        codex: CodexAppServer,
-        ui_tx: mpsc::UnboundedSender<UiEvent>,
-    ) {
+    pub(in crate::app) fn submit_message(app: &mut App) {
         if let Some(command) = ChatSupport::command_from_input(&app.chat_input) {
-            Self::submit_chat_command(app, command, codex, ui_tx);
+            Self::submit_chat_command(app, command);
             return;
         }
 
         if let Some(command) = ChatSupport::shell_command_from_input(&app.chat_input) {
-            Self::submit_shell_command(app, command, ui_tx);
+            Self::submit_shell_command(app, command);
             return;
         }
 
@@ -78,13 +75,13 @@ impl ChatComponent {
             return;
         };
 
-        if app.agents[agent_index].thinking || app.agents[agent_index].shell_running {
+        if app.agents[agent_index].chat.thinking || app.agents[agent_index].chat.shell_running {
             Self::enqueue_message(app, agent_index, text);
             return;
         }
 
         app.chat_input.clear();
-        Self::dispatch_message(app, agent_index, text, codex, ui_tx);
+        Self::dispatch_message(app, agent_index, text);
     }
 
     pub(in crate::app) fn handle_model_picker_key(
@@ -133,7 +130,7 @@ impl ChatComponent {
                         let current_effort = app
                             .agents
                             .get(picker.agent_index)
-                            .and_then(|agent| agent.chat_reasoning_effort.as_deref());
+                            .and_then(|agent| agent.chat.chat_reasoning_effort.as_deref());
                         let selected_effort = current_effort
                             .and_then(|current| {
                                 model
@@ -222,22 +219,22 @@ impl ChatComponent {
         let Some(agent) = app.active_agent_mut() else {
             return false;
         };
-        if !agent.has_queued_chat_messages() {
+        if !agent.chat.has_queued_chat_messages() {
             return false;
         }
 
         match key.code {
             KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => {
-                agent.select_previous_queued_chat_message();
+                agent.chat.select_previous_queued_chat_message();
                 true
             }
             KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
-                agent.select_next_queued_chat_message();
+                agent.chat.select_next_queued_chat_message();
                 true
             }
             KeyCode::Backspace | KeyCode::Delete if key.modifiers.contains(KeyModifiers::ALT) => {
-                let _ = agent.cancel_selected_queued_chat_message();
-                let remaining = agent.queued_chat_count();
+                let _ = agent.chat.cancel_selected_queued_chat_message();
+                let remaining = agent.chat.queued_chat_count();
                 agent.status = if remaining == 0 {
                     Some("Queue is empty".to_string())
                 } else {
@@ -246,8 +243,8 @@ impl ChatComponent {
                 true
             }
             KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::ALT) => {
-                let _ = agent.cancel_selected_queued_chat_message();
-                let remaining = agent.queued_chat_count();
+                let _ = agent.chat.cancel_selected_queued_chat_message();
+                let remaining = agent.chat.queued_chat_count();
                 agent.status = if remaining == 0 {
                     Some("Queue is empty".to_string())
                 } else {
@@ -259,150 +256,68 @@ impl ChatComponent {
         }
     }
 
-    pub(in crate::app) fn maybe_dispatch_queued_messages(
-        app: &mut App,
-        codex: CodexAppServer,
-        ui_tx: mpsc::UnboundedSender<UiEvent>,
-    ) {
+    pub(in crate::app) fn maybe_dispatch_queued_messages(app: &mut App) {
         let queued_agents = app
             .agents
             .iter()
             .enumerate()
             .filter_map(|(agent_index, agent)| {
-                (!agent.thinking
-                    && !agent.shell_running
-                    && agent.active_turn_id.is_none()
-                    && agent.has_queued_chat_messages())
+                (!agent.chat.thinking
+                    && !agent.chat.shell_running
+                    && agent.chat.active_turn_id.is_none()
+                    && agent.chat.has_queued_chat_messages())
                 .then_some(agent_index)
             })
             .collect::<Vec<_>>();
 
         for agent_index in queued_agents {
-            let Some(text) = app.agents[agent_index].pop_next_queued_chat_message() else {
+            let Some(text) = app.agents[agent_index].chat.pop_next_queued_chat_message() else {
                 continue;
             };
-            Self::dispatch_message(app, agent_index, text, codex.clone(), ui_tx.clone());
+            Self::dispatch_message(app, agent_index, text);
         }
     }
 
     fn enqueue_message(app: &mut App, agent_index: usize, text: String) {
         let agent = &mut app.agents[agent_index];
-        agent.enqueue_chat_message(text);
-        let queued = agent.queued_chat_count();
+        agent.chat.enqueue_chat_message(text);
+        let queued = agent.chat.queued_chat_count();
         agent.status = Some(format!("{queued} queued message(s)"));
         app.status_message = Some(format!("Queued {queued} message(s)"));
         app.chat_input.clear();
     }
 
-    fn dispatch_message(
-        app: &mut App,
-        agent_index: usize,
-        text: String,
-        codex: CodexAppServer,
-        ui_tx: mpsc::UnboundedSender<UiEvent>,
-    ) {
+    fn dispatch_message(app: &mut App, agent_index: usize, text: String) {
         let agent = &mut app.agents[agent_index];
-        agent.push_message(ChatMessage::new(MessageRole::User, text.clone(), None));
-        agent.thinking = true;
+        agent
+            .chat
+            .push_message(ChatMessage::new(MessageRole::User, text.clone(), None));
+        agent.chat.thinking = true;
         agent.status = None;
-        let existing_thread = agent.thread_id.clone();
-        let thread_loaded = agent.thread_loaded;
-        let selected_model = agent.chat_model.clone();
-        let selected_effort = agent.chat_reasoning_effort.clone();
+        let existing_thread = agent.chat.thread_id.clone();
+        let thread_loaded = agent.chat.thread_loaded;
+        let selected_model = agent.chat.chat_model.clone();
+        let selected_effort = agent.chat.chat_reasoning_effort.clone();
         let workspace = agent.definition.workspace.clone();
 
-        tokio::spawn(async move {
-            let thread_id = match existing_thread {
-                Some(thread_id) => {
-                    if !thread_loaded {
-                        match codex
-                            .resume_thread(&thread_id, selected_model.as_deref())
-                            .await
-                        {
-                            Ok(thread) => {
-                                let id = thread.id.clone();
-                                let _ = ui_tx.send(UiEvent::ThreadReady {
-                                    agent_index,
-                                    thread,
-                                });
-                                id
-                            }
-                            Err(error) => {
-                                let _ = ui_tx.send(UiEvent::SubmissionFailed {
-                                    agent_index,
-                                    message: error.to_string(),
-                                });
-                                return;
-                            }
-                        }
-                    } else {
-                        thread_id
-                    }
-                }
-                None => match codex
-                    .start_thread(&workspace, selected_model.as_deref())
-                    .await
-                {
-                    Ok(thread) => {
-                        let id = thread.id.clone();
-                        let _ = ui_tx.send(UiEvent::ThreadReady {
-                            agent_index,
-                            thread,
-                        });
-                        id
-                    }
-                    Err(error) => {
-                        let _ = ui_tx.send(UiEvent::SubmissionFailed {
-                            agent_index,
-                            message: error.to_string(),
-                        });
-                        return;
-                    }
-                },
-            };
-
-            match codex
-                .start_turn(
-                    &thread_id,
-                    &text,
-                    selected_model.as_deref(),
-                    selected_effort.as_deref(),
-                )
-                .await
-            {
-                Ok(turn_id) => {
-                    let _ = ui_tx.send(UiEvent::TurnStartedLocal {
-                        agent_index,
-                        turn_id,
-                    });
-                }
-                Err(error) => {
-                    let _ = ui_tx.send(UiEvent::SubmissionFailed {
-                        agent_index,
-                        message: error.to_string(),
-                    });
-                }
-            }
+        app.enqueue_effect(AppEffect::StartChatTurn {
+            agent_index,
+            text,
+            existing_thread,
+            thread_loaded,
+            selected_model,
+            selected_effort,
+            workspace,
         });
     }
 
-    pub(in crate::app) fn submit_chat_command(
-        app: &mut App,
-        command: ChatCommand,
-        codex: CodexAppServer,
-        ui_tx: mpsc::UnboundedSender<UiEvent>,
-    ) {
+    pub(in crate::app) fn submit_chat_command(app: &mut App, command: ChatCommand) {
         match command {
-            ChatCommand::Model(command) => Self::submit_model_command(app, command, codex, ui_tx),
+            ChatCommand::Model(command) => Self::submit_model_command(app, command),
         }
     }
 
-    pub(in crate::app) fn submit_model_command(
-        app: &mut App,
-        command: ModelCommand,
-        codex: CodexAppServer,
-        ui_tx: mpsc::UnboundedSender<UiEvent>,
-    ) {
+    pub(in crate::app) fn submit_model_command(app: &mut App, command: ModelCommand) {
         let Some(agent_index) = app.current_agent else {
             app.status_message = Some("Add an agent before changing the model.".to_string());
             return;
@@ -413,33 +328,19 @@ impl ChatComponent {
         match command {
             ModelCommand::List => {
                 app.agents[agent_index].status = Some("Loading available models...".to_string());
-                tokio::spawn(async move {
-                    match codex.list_models().await {
-                        Ok(models) => {
-                            let _ = ui_tx.send(UiEvent::ModelListLoaded {
-                                agent_index,
-                                models,
-                            });
-                        }
-                        Err(error) => {
-                            let message = format!("Unable to load available models.\n\n{error}");
-                            let _ = ui_tx.send(UiEvent::ModelCommandResult {
-                                agent_index,
-                                message,
-                            });
-                        }
-                    }
-                });
+                app.enqueue_effect(AppEffect::ListModels { agent_index });
             }
             ModelCommand::ResetDefault => {
                 let agent = &mut app.agents[agent_index];
-                agent.chat_model = app.default_chat_model.clone();
-                agent.chat_reasoning_effort = app.default_chat_reasoning_effort.clone();
-                agent.chat_model_label = app.chat_model_label.clone();
-                agent.chat_settings_explicit = false;
-                let message = format!("Model set to `{}`.", agent.chat_model_label);
+                agent.chat.chat_model = app.default_chat_model.clone();
+                agent.chat.chat_reasoning_effort = app.default_chat_reasoning_effort.clone();
+                agent.chat.chat_model_label = app.chat_model_label.clone();
+                agent.chat.chat_settings_explicit = false;
+                let message = format!("Model set to `{}`.", agent.chat.chat_model_label);
                 agent.status = Some(message.clone());
-                agent.push_message(ChatMessage::new(MessageRole::System, message, None));
+                agent
+                    .chat
+                    .push_message(ChatMessage::new(MessageRole::System, message, None));
                 app.status_message = Some("Model updated".to_string());
             }
             ModelCommand::Set { model, effort } => {
@@ -447,98 +348,58 @@ impl ChatComponent {
                 let default_label = app.chat_model_label.clone();
                 let agent = &mut app.agents[agent_index];
                 if let Some(model) = model {
-                    agent.chat_model = Some(model);
+                    agent.chat.chat_model = Some(model);
                 }
                 if let Some(effort) = effort {
-                    agent.chat_reasoning_effort = Some(effort);
+                    agent.chat.chat_reasoning_effort = Some(effort);
                 }
-                agent.chat_settings_explicit = true;
-                agent.chat_model_label = ChatSupport::resolve_chat_model_label(
-                    agent.chat_model.as_deref(),
-                    agent.chat_reasoning_effort.as_deref(),
+                agent.chat.chat_settings_explicit = true;
+                agent.chat.chat_model_label = ChatSupport::resolve_chat_model_label(
+                    agent.chat.chat_model.as_deref(),
+                    agent.chat.chat_reasoning_effort.as_deref(),
                     default_model.as_deref(),
                     &default_label,
                 );
-                let message = format!("Model set to `{}`.", agent.chat_model_label);
+                let message = format!("Model set to `{}`.", agent.chat.chat_model_label);
                 agent.status = Some(message.clone());
-                agent.push_message(ChatMessage::new(MessageRole::System, message, None));
+                agent
+                    .chat
+                    .push_message(ChatMessage::new(MessageRole::System, message, None));
                 app.status_message = Some("Model updated".to_string());
             }
         }
     }
 
-    pub(in crate::app) fn submit_shell_command(
-        app: &mut App,
-        command: String,
-        ui_tx: mpsc::UnboundedSender<UiEvent>,
-    ) {
+    pub(in crate::app) fn submit_shell_command(app: &mut App, command: String) {
         let Some(agent_index) = app.current_agent else {
             app.status_message = Some("Add an agent before running shell commands.".to_string());
             return;
         };
 
         let agent = &mut app.agents[agent_index];
-        if agent.thinking || agent.shell_running {
+        if agent.chat.thinking || agent.chat.shell_running {
             app.status_message = Some("Wait for the current response to finish.".to_string());
             return;
         }
 
-        agent.push_message(ChatMessage::new(
+        agent.chat.push_message(ChatMessage::new(
             MessageRole::Shell,
             format!("> {command}"),
             None,
         ));
-        agent.shell_running = true;
+        agent.chat.shell_running = true;
         agent.status = None;
         let workspace = agent.definition.workspace.clone();
         app.chat_input.clear();
 
-        tokio::spawn(async move {
-            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-            let result = Command::new(shell)
-                .arg("-c")
-                .arg(&command)
-                .current_dir(&workspace)
-                .output()
-                .await;
-
-            let (output, success) = match result {
-                Ok(output) => {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    (
-                        ChatSupport::format_shell_output(
-                            &command,
-                            &stdout,
-                            &stderr,
-                            output.status.code(),
-                            output.status.success(),
-                        ),
-                        output.status.success(),
-                    )
-                }
-                Err(error) => (
-                    format!(
-                        "```text\n{}\n```\n\nExit code: unavailable",
-                        ChatSupport::truncate_shell_text(&error.to_string())
-                    ),
-                    false,
-                ),
-            };
-
-            let _ = ui_tx.send(UiEvent::ShellCompleted {
-                agent_index,
-                output,
-                success,
-            });
+        app.enqueue_effect(AppEffect::RunShell {
+            agent_index,
+            command,
+            workspace,
         });
     }
 
-    pub(in crate::app) fn interrupt_active_turn(
-        app: &mut App,
-        codex: CodexAppServer,
-        ui_tx: mpsc::UnboundedSender<UiEvent>,
-    ) {
+    pub(in crate::app) fn interrupt_active_turn(app: &mut App) {
         if app.add_agent_selected() {
             return;
         }
@@ -548,26 +409,24 @@ impl ChatComponent {
         };
         let agent = &mut app.agents[agent_index];
 
-        if !agent.thinking || agent.shell_running {
+        if !agent.chat.thinking || agent.chat.shell_running {
             return;
         }
 
-        let (Some(thread_id), Some(turn_id)) =
-            (agent.thread_id.clone(), agent.active_turn_id.clone())
-        else {
+        let (Some(thread_id), Some(turn_id)) = (
+            agent.chat.thread_id.clone(),
+            agent.chat.active_turn_id.clone(),
+        ) else {
             return;
         };
 
         agent.status = Some("Canceling response...".to_string());
         app.status_message = Some("Canceling response...".to_string());
 
-        tokio::spawn(async move {
-            if let Err(error) = codex.interrupt_turn(&thread_id, &turn_id).await {
-                let _ = ui_tx.send(UiEvent::TurnInterruptFailed {
-                    agent_index,
-                    message: format!("Failed to cancel response: {error}"),
-                });
-            }
+        app.enqueue_effect(AppEffect::InterruptTurn {
+            agent_index,
+            thread_id,
+            turn_id,
         });
     }
 

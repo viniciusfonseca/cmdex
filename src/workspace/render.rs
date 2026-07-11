@@ -1,5 +1,6 @@
 use super::*;
 use crate::{syntax::SyntaxRegistry, theme::ThemeRegistry};
+use syntect::parsing::SyntaxReference;
 
 pub(super) struct WorkspaceRenderer;
 
@@ -16,8 +17,7 @@ impl WorkspaceRenderer {
         let preview =
             String::from_utf8_lossy(&bytes[..bytes.len().min(PREVIEW_LIMIT)]).into_owned();
         let preview = Self::normalize_newlines(&preview);
-        let mut lines =
-            Self::highlighted_preview_lines(&preview, Self::syntax_for_path(path, &preview));
+        let mut lines = SyntaxRegistry::highlight_path(path, &preview);
         if !truncated {
             Self::maybe_trim_trailing_empty_line(&mut lines);
         }
@@ -38,61 +38,18 @@ impl WorkspaceRenderer {
         path: &Path,
         source_lines: &[String],
     ) -> Option<&'static SyntaxReference> {
-        path.extension()
-            .and_then(|extension| extension.to_str())
-            .and_then(|extension| SyntaxRegistry::set().find_syntax_by_extension(extension))
-            .or_else(|| {
-                source_lines
-                    .first()
-                    .and_then(|line| SyntaxRegistry::set().find_syntax_by_first_line(line))
-            })
+        SyntaxRegistry::syntax_for_path(path, &source_lines.join("\n"))
     }
 
     pub(super) fn syntax_for_path(path: &Path, source: &str) -> Option<&'static SyntaxReference> {
-        path.extension()
-            .and_then(|extension| extension.to_str())
-            .and_then(|extension| SyntaxRegistry::set().find_syntax_by_extension(extension))
-            .or_else(|| {
-                source
-                    .lines()
-                    .next()
-                    .and_then(|line| SyntaxRegistry::set().find_syntax_by_first_line(line))
-            })
+        SyntaxRegistry::syntax_for_path(path, source)
     }
 
     pub(super) fn highlighted_preview_lines(
         source: &str,
         syntax: Option<&'static SyntaxReference>,
     ) -> Vec<Line<'static>> {
-        match syntax {
-            Some(syntax) => {
-                let mut highlighter = HighlightLines::new(syntax, ThemeRegistry::syntax());
-                Self::split_preserving_lines(source)
-                    .into_iter()
-                    .map(|line| {
-                        if line.is_empty() {
-                            return Line::default();
-                        }
-
-                        match highlighter.highlight_line(&line, SyntaxRegistry::set()) {
-                            Ok(ranges) => Line::from(
-                                ranges
-                                    .into_iter()
-                                    .map(|(style, text)| {
-                                        Span::styled(
-                                            text.to_string(),
-                                            Self::to_ratatui_style(style),
-                                        )
-                                    })
-                                    .collect::<Vec<_>>(),
-                            ),
-                            Err(_) => Line::from(line),
-                        }
-                    })
-                    .collect()
-            }
-            None => Self::plain_preview_lines(source),
-        }
+        SyntaxRegistry::highlight_source(source, syntax)
     }
 
     pub(super) fn build_editor_render_lines(
@@ -100,39 +57,7 @@ impl WorkspaceRenderer {
         source_lines: &[String],
     ) -> Vec<Line<'static>> {
         let syntax = Self::syntax_for_editor_lines(path, source_lines);
-        let lines = match syntax {
-            Some(syntax) => {
-                let mut highlighter = HighlightLines::new(syntax, ThemeRegistry::syntax());
-                source_lines
-                    .iter()
-                    .map(|line| {
-                        if line.is_empty() {
-                            return Line::default();
-                        }
-
-                        match highlighter.highlight_line(line, SyntaxRegistry::set()) {
-                            Ok(ranges) => Line::from(
-                                ranges
-                                    .into_iter()
-                                    .map(|(style, text)| {
-                                        Span::styled(
-                                            text.to_string(),
-                                            Self::to_ratatui_style(style),
-                                        )
-                                    })
-                                    .collect::<Vec<_>>(),
-                            ),
-                            Err(_) => Line::from(line.clone()),
-                        }
-                    })
-                    .collect::<Vec<_>>()
-            }
-            None => source_lines
-                .iter()
-                .cloned()
-                .map(Line::from)
-                .collect::<Vec<_>>(),
-        };
+        let lines = SyntaxRegistry::highlight_source(&source_lines.join("\n"), syntax);
 
         Self::add_line_numbers(lines)
     }
@@ -234,32 +159,6 @@ impl WorkspaceRenderer {
         {
             lines.pop();
         }
-    }
-
-    fn to_ratatui_style(style: syntect::highlighting::Style) -> Style {
-        let mut modifiers = Modifier::empty();
-        if style.font_style.contains(FontStyle::BOLD) {
-            modifiers |= Modifier::BOLD;
-        }
-        if style.font_style.contains(FontStyle::ITALIC) {
-            modifiers |= Modifier::ITALIC;
-        }
-        if style.font_style.contains(FontStyle::UNDERLINE) {
-            modifiers |= Modifier::UNDERLINED;
-        }
-
-        Style::default()
-            .fg(Color::Rgb(
-                style.foreground.r,
-                style.foreground.g,
-                style.foreground.b,
-            ))
-            .bg(Color::Rgb(
-                style.background.r,
-                style.background.g,
-                style.background.b,
-            ))
-            .add_modifier(modifiers)
     }
 
     fn push_span_slice(

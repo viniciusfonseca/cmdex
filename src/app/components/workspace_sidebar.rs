@@ -1,5 +1,5 @@
 use super::super::*;
-use super::UiSupport;
+use super::{UiSupport, WorkspaceComponent};
 
 pub(in crate::app) struct WorkspaceSidebarComponent;
 
@@ -34,6 +34,11 @@ impl WorkspaceSidebarComponent {
     }
 
     pub(in crate::app) fn handle_click(app: &mut App, column: u16, row: u16, sidebar_list: Rect) {
+        let Some(agent_index) = app.current_agent else {
+            return;
+        };
+        let mut request_open = false;
+        let mut search_position = None;
         if let Some(agent) = app.active_agent_mut() {
             let layout = Self::layout(sidebar_list, agent.workspace.sidebar_tab);
             if let Some(tab) = Self::tab_from_click(layout.tabs, column, row) {
@@ -61,7 +66,7 @@ impl WorkspaceSidebarComponent {
                         inner.height as usize,
                     );
                     let index = (offset + visible_row).min(total.saturating_sub(1));
-                    agent.workspace.select_sidebar_row(index);
+                    request_open = agent.workspace.select_sidebar_row_without_io(index);
                 }
                 WorkspaceSidebarTab::Search => {
                     if layout
@@ -90,11 +95,15 @@ impl WorkspaceSidebarComponent {
                     );
                     let index = (offset + visible_row).min(total.saturating_sub(1));
                     agent.workspace.select_search_row(index);
-                    if let Err(error) = agent.workspace.open_selected_search_result() {
-                        agent.workspace.error = Some(error.to_string());
-                    }
+                    search_position = agent.workspace.open_selected_search_result_without_io();
                 }
             }
+        }
+        if request_open {
+            WorkspaceComponent::request_open_editor(app, agent_index);
+        }
+        if let Some(position) = search_position {
+            WorkspaceComponent::request_open_editor_at(app, agent_index, Some(position));
         }
     }
 
@@ -241,14 +250,12 @@ impl WorkspaceSidebarComponent {
             .highlight_symbol("› ");
         frame.render_stateful_widget(list, layout.content, &mut state);
 
-        if sidebar_focused {
-            if let Some(input_area) = layout.input {
-                let cursor_x = input_area
-                    .x
-                    .saturating_add(1 + agent.workspace.search_query.chars().count() as u16)
-                    .min(input_area.x + input_area.width.saturating_sub(2));
-                frame.set_cursor_position((cursor_x, input_area.y + 1));
-            }
+        if sidebar_focused && let Some(input_area) = layout.input {
+            let cursor_x = input_area
+                .x
+                .saturating_add(1 + agent.workspace.search_query.chars().count() as u16)
+                .min(input_area.x + input_area.width.saturating_sub(2));
+            frame.set_cursor_position((cursor_x, input_area.y + 1));
         }
     }
 }

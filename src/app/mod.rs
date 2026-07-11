@@ -1,11 +1,23 @@
 mod actions;
 mod chat;
 mod components;
+mod effects;
+mod events;
+mod input;
 mod lsp;
+mod lsp_actions;
+mod lsp_framing;
+mod mouse_actions;
+mod navigation_actions;
+mod runtime;
+mod session;
 mod shell;
 #[cfg(test)]
 mod tests;
 mod ui;
+mod workspace_actions;
+
+pub(super) use session::{MessageStore, SessionLoader};
 
 use std::{
     cell::RefCell,
@@ -16,21 +28,16 @@ use std::{
 };
 
 use anyhow::Result;
-use arboard::Clipboard;
 use crossterm::{
-    event::{
-        Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
-        MouseEventKind,
-    },
+    event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind},
     terminal::size as terminal_size,
 };
-use futures_util::StreamExt;
 use pulldown_cmark::{
     CodeBlockKind, Event as MarkdownEvent, HeadingLevel, Options as MarkdownOptions,
     Parser as MarkdownParser, Tag, TagEnd,
 };
 use ratatui::{
-    DefaultTerminal, Frame,
+    Frame,
     layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
     style::{Modifier, Style},
     symbols::border,
@@ -39,6 +46,8 @@ use ratatui::{
 };
 use tokio::{sync::mpsc, time::sleep};
 
+use self::components::ChatComponent;
+use self::input::AppInput;
 use crate::codex::{
     CodexAppServer, HistoryEntryKind, ModelInfo, ModelReasoningEffort, ServerEvent, ThreadInfo,
     ThreadItem, WorkspaceSession,
@@ -47,11 +56,9 @@ use crate::config::{AgentDefinition, CmdexConfig, ConfigStore, LspServerConfig};
 use crate::theme::ThemeRegistry;
 use crate::workspace::{
     DiffBrowserState, DiffSection, EditorCompletionItem, EditorMode, EditorPosition,
-    FileBrowserState, GitRemoteAction, WorkspaceEditorState, WorkspaceSidebarTab,
+    FileBrowserState, GitDiffLoadResult, GitMutation, GitRemoteAction, WorkspaceEditorState,
+    WorkspaceSearchSnapshot, WorkspaceSidebarTab,
 };
-use tokio::process::Command;
-
-use self::components::ChatComponent;
 
 const SIDEBAR_WIDTH: u16 = 45;
 const TAB_LABELS: [(&str, AppTab); 4] = [
@@ -112,6 +119,50 @@ enum UiEvent {
         success: bool,
         message: String,
     },
+    GitDiffMutationCompleted {
+        agent_index: usize,
+        mutation: GitMutation,
+        success: bool,
+        message: String,
+    },
+    GitDiffLoaded {
+        agent_index: usize,
+        generation: u64,
+        result: Option<GitDiffLoadResult>,
+        error: Option<String>,
+    },
+    WorkspaceEntriesLoaded {
+        agent_index: usize,
+        entries: Vec<crate::workspace::FileEntry>,
+        error: Option<String>,
+    },
+    WorkspaceSearchCompleted {
+        agent_index: usize,
+        generation: u64,
+        query: String,
+        snapshot: WorkspaceSearchSnapshot,
+        error: Option<String>,
+    },
+    WorkspaceEditorLoaded {
+        agent_index: usize,
+        path: PathBuf,
+        position: Option<EditorPosition>,
+        source: Option<String>,
+        error: Option<String>,
+    },
+    WorkspacePreviewLoaded {
+        agent_index: usize,
+        path: PathBuf,
+        preview: Vec<Line<'static>>,
+        error: Option<String>,
+    },
+    WorkspaceClipboardCompleted {
+        agent_index: usize,
+        path: PathBuf,
+        operation: ClipboardOperation,
+        text: Option<String>,
+        error: Option<String>,
+    },
     ShellSessionReady {
         agent_index: usize,
         session_id: usize,
@@ -153,6 +204,18 @@ enum UiEvent {
         items: Vec<EditorCompletionItem>,
         error: Option<String>,
     },
+    LspNotification {
+        agent_index: usize,
+        server_name: String,
+        method: String,
+        params: serde_json::Value,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ClipboardOperation {
+    Copy,
+    Paste,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -337,8 +400,8 @@ pub enum AppExit {
 }
 
 #[derive(Debug, Clone)]
-struct AgentState {
-    definition: AgentDefinition,
+struct ChatState {
+    agent_name: String,
     thread_id: Option<String>,
     thread_loaded: bool,
     active_turn_id: Option<String>,
@@ -355,21 +418,27 @@ struct AgentState {
     queued_chat_messages: VecDeque<QueuedChatMessage>,
     queued_chat_selection: usize,
     chat_render_cache: RefCell<ChatRenderCache>,
+}
+
+#[derive(Debug, Clone)]
+struct AgentState {
+    definition: AgentDefinition,
+    chat: ChatState,
     workspace: FileBrowserState,
     shell_tab: shell::ShellTabState,
     git_diff: DiffBrowserState,
     status: Option<String>,
 }
 
-impl AgentState {
+impl ChatState {
     fn new(
-        definition: AgentDefinition,
+        agent_name: String,
         default_chat_model: Option<String>,
         default_chat_reasoning_effort: Option<String>,
         default_chat_model_label: &str,
     ) -> Self {
         Self {
-            definition,
+            agent_name,
             thread_id: None,
             thread_loaded: false,
             active_turn_id: None,
@@ -386,10 +455,6 @@ impl AgentState {
             queued_chat_messages: VecDeque::new(),
             queued_chat_selection: 0,
             chat_render_cache: RefCell::new(ChatRenderCache::default()),
-            workspace: FileBrowserState::default(),
-            shell_tab: shell::ShellTabState::default(),
-            git_diff: DiffBrowserState::default(),
-            status: None,
         }
     }
 
@@ -490,10 +555,9 @@ impl AgentState {
         self.ensure_chat_render_cache();
 
         if let Some((cached_width, content_height)) = self.chat_render_cache.borrow().content_height
+            && cached_width == width
         {
-            if cached_width == width {
-                return content_height;
-            }
+            return content_height;
         }
 
         let content_height = {
@@ -517,6 +581,30 @@ impl AgentState {
     }
 }
 
+impl AgentState {
+    fn new(
+        definition: AgentDefinition,
+        default_chat_model: Option<String>,
+        default_chat_reasoning_effort: Option<String>,
+        default_chat_model_label: &str,
+    ) -> Self {
+        let chat = ChatState::new(
+            definition.name.clone(),
+            default_chat_model,
+            default_chat_reasoning_effort,
+            default_chat_model_label,
+        );
+        Self {
+            definition,
+            chat,
+            workspace: FileBrowserState::default(),
+            shell_tab: shell::ShellTabState::default(),
+            git_diff: DiffBrowserState::default(),
+            status: None,
+        }
+    }
+}
+
 pub struct App {
     config_path: PathBuf,
     config: CmdexConfig,
@@ -533,8 +621,6 @@ pub struct App {
     add_form: AddAgentForm,
     spinner_index: usize,
     status_message: Option<String>,
-    should_quit: bool,
-    should_restart: bool,
     last_mouse_scroll: Option<(ScrollAxis, ScrollDirection, Instant)>,
     active_scrollbar_drag: Option<ScrollbarDragTarget>,
     active_workspace_selection_drag: bool,
@@ -542,7 +628,11 @@ pub struct App {
     shell_runtimes: HashMap<ShellSessionKey, ShellSessionRuntime>,
     lsp_runtimes: HashMap<LspRuntimeKey, LspRuntime>,
     pending_workspace_hover: Option<PendingWorkspaceHover>,
+    workspace_refresh_in_flight: bool,
+    pending_effects: VecDeque<effects::AppEffect>,
 }
+
+pub struct AppRuntime;
 
 #[derive(Debug, Clone)]
 struct ModelPickerState {
@@ -578,6 +668,16 @@ impl App {
                 )
             })
             .collect::<Vec<_>>();
+        let mut agents = agents;
+        for agent in &mut agents {
+            let root = agent.definition.workspace.clone();
+            match FileBrowserState::scan_entries(&root)
+                .and_then(|entries| agent.workspace.apply_scanned_entries(entries).map(|_| ()))
+            {
+                Ok(()) => {}
+                Err(error) => agent.workspace.error = Some(error.to_string()),
+            }
+        }
 
         let current_agent = if agents.is_empty() { None } else { Some(0) };
         let chat_sidebar_index = if agents.is_empty() {
@@ -602,8 +702,6 @@ impl App {
             add_form: AddAgentForm::default(),
             spinner_index: 0,
             status_message: None,
-            should_quit: false,
-            should_restart: false,
             last_mouse_scroll: None,
             active_scrollbar_drag: None,
             active_workspace_selection_drag: false,
@@ -611,6 +709,8 @@ impl App {
             shell_runtimes: HashMap::new(),
             lsp_runtimes: HashMap::new(),
             pending_workspace_hover: None,
+            workspace_refresh_in_flight: false,
+            pending_effects: VecDeque::new(),
         }
     }
 
@@ -620,13 +720,21 @@ impl App {
 
     fn active_chat_model_label(&self) -> &str {
         self.active_agent()
-            .map(|agent| agent.chat_model_label.as_str())
+            .map(|agent| agent.chat.chat_model_label.as_str())
             .unwrap_or(self.chat_model_label.as_str())
     }
 
     fn active_agent_mut(&mut self) -> Option<&mut AgentState> {
         self.current_agent
             .and_then(move |index| self.agents.get_mut(index))
+    }
+
+    fn enqueue_effect(&mut self, effect: effects::AppEffect) {
+        self.pending_effects.push_back(effect);
+    }
+
+    fn take_effects(&mut self) -> Vec<effects::AppEffect> {
+        self.pending_effects.drain(..).collect()
     }
 
     fn add_agent_selected(&self) -> bool {
@@ -667,185 +775,5 @@ impl App {
             agent_index,
             server_index,
         })
-    }
-}
-
-struct MessageStore;
-
-impl MessageStore {
-    fn upsert(agent: &mut AgentState, role: MessageRole, item_id: &str, text: String) {
-        if let Some(message) = agent
-            .messages
-            .iter_mut()
-            .find(|message| message.item_id.as_deref() == Some(item_id))
-        {
-            message.set_text(text);
-        } else {
-            agent
-                .messages
-                .push(ChatMessage::new(role, text, Some(item_id.to_string())));
-        }
-        agent.invalidate_chat_render_cache();
-    }
-}
-
-struct SessionLoader;
-
-impl SessionLoader {
-    fn session_messages(session: WorkspaceSession) -> (String, Vec<ChatMessage>) {
-        let messages = session
-            .entries
-            .into_iter()
-            .map(|entry| {
-                ChatMessage::new(
-                    match entry.kind {
-                        HistoryEntryKind::User => MessageRole::User,
-                        HistoryEntryKind::Assistant => MessageRole::Assistant,
-                        HistoryEntryKind::Event => MessageRole::Event,
-                    },
-                    entry.text,
-                    None,
-                )
-            })
-            .collect::<Vec<_>>();
-
-        (session.thread.id, messages)
-    }
-
-    fn spawn(
-        codex: CodexAppServer,
-        ui_tx: mpsc::UnboundedSender<UiEvent>,
-        agent_index: usize,
-        workspace: PathBuf,
-    ) {
-        tokio::spawn(async move {
-            match codex.load_latest_workspace_session(&workspace).await {
-                Ok(session) => {
-                    let _ = ui_tx.send(UiEvent::SessionLoaded {
-                        agent_index,
-                        session,
-                    });
-                }
-                Err(error) => {
-                    let _ = ui_tx.send(UiEvent::SubmissionFailed {
-                        agent_index,
-                        message: format!("Failed to load the latest workspace session: {error}"),
-                    });
-                }
-            }
-        });
-    }
-
-    async fn hydrate_latest_sessions(app: &mut App, codex: &CodexAppServer) -> Result<()> {
-        for agent in &mut app.agents {
-            if let Some(session) = codex
-                .load_latest_workspace_session(&agent.definition.workspace)
-                .await?
-            {
-                let (thread_id, messages) = Self::session_messages(session);
-                agent.thread_id = Some(thread_id);
-                agent.replace_messages(messages);
-            }
-        }
-
-        Ok(())
-    }
-}
-
-pub struct AppRuntime;
-
-impl AppRuntime {
-    pub async fn run(terminal: &mut DefaultTerminal) -> Result<AppExit> {
-        let config_path = ConfigStore::default_path()?;
-        let config = ConfigStore::load(&config_path)?;
-
-        let (server_tx, mut server_rx) = mpsc::unbounded_channel();
-        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
-        let codex = CodexAppServer::spawn(server_tx).await?;
-        let mut app = App::new(config_path, config);
-        SessionLoader::hydrate_latest_sessions(&mut app, &codex).await?;
-
-        let mut events = EventStream::new();
-        components::TopNavigationComponent::refresh_current_tab(&mut app);
-        let mut needs_redraw = true;
-
-        let exit = loop {
-            if app.should_quit {
-                break if app.should_restart {
-                    AppExit::Restart
-                } else {
-                    AppExit::Quit
-                };
-            }
-
-            if needs_redraw {
-                terminal.draw(|frame| ui::AppUi::draw(frame, &app))?;
-            }
-
-            let tick = sleep(app.tick_interval());
-            tokio::pin!(tick);
-
-            tokio::select! {
-                maybe_event = events.next() => {
-                    match maybe_event {
-                        Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
-                            let (width, height) = terminal_size()?;
-                            app.handle_key(key, &codex, &ui_tx, Rect::new(0, 0, width, height));
-                            ChatComponent::maybe_dispatch_queued_messages(
-                                &mut app,
-                                codex.clone(),
-                                ui_tx.clone(),
-                            );
-                            needs_redraw = true;
-                        }
-                        Some(Ok(Event::Mouse(mouse))) => {
-                            let (width, height) = terminal_size()?;
-                            app.handle_mouse(mouse, Rect::new(0, 0, width, height), &ui_tx);
-                            needs_redraw = true;
-                        }
-                        Some(Ok(Event::Paste(text))) => {
-                            for character in text.chars() {
-                                app.handle_text_input(character);
-                            }
-                            needs_redraw = true;
-                        }
-                        Some(Ok(_)) => {
-                            needs_redraw = true;
-                        }
-                        Some(Err(error)) => {
-                            app.status_message = Some(error.to_string());
-                            needs_redraw = true;
-                        }
-                        None => break AppExit::Quit,
-                    }
-                }
-                Some(server_event) = server_rx.recv() => {
-                    app.handle_server_event(server_event);
-                    ChatComponent::maybe_dispatch_queued_messages(
-                        &mut app,
-                        codex.clone(),
-                        ui_tx.clone(),
-                    );
-                    needs_redraw = true;
-                }
-                Some(ui_event) = ui_rx.recv() => {
-                    app.handle_ui_event(ui_event);
-                    ChatComponent::maybe_dispatch_queued_messages(
-                        &mut app,
-                        codex.clone(),
-                        ui_tx.clone(),
-                    );
-                    needs_redraw = true;
-                }
-                _ = &mut tick => {
-                    needs_redraw = app.on_tick(&ui_tx);
-                }
-            }
-        };
-
-        app.shutdown_lsp_sessions();
-        app.shutdown_shell_sessions();
-
-        Ok(exit)
     }
 }
