@@ -43,10 +43,9 @@ impl TopNavigationComponent {
             AppTab::Workspace => {
                 if let Some(agent_index) = app.current_agent {
                     let root = app.agents[agent_index].definition.workspace.clone();
-                    app.workspace_refresh_in_flight = true;
+                    app.workspace_refresh_in_flight.insert(agent_index);
                     app.enqueue_effect(AppEffect::RefreshWorkspace { agent_index, root });
                 }
-                app.last_workspace_refresh_at = Some(Instant::now());
             }
             AppTab::Shell => {}
             AppTab::GitDiff => {

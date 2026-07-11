@@ -1,12 +1,84 @@
-use super::super::{
-    shell::{self, ShellPresenter},
-    *,
-};
+use super::super::effects::AppEffect;
+use super::super::{shell::ShellPresenter, *};
 use super::{ChatInputComponent, TopNavigationComponent, UiSupport};
 
 pub(in crate::app) struct ShellComponent;
 
 impl ShellComponent {
+    pub(in crate::app) fn move_selection_up(app: &mut App) -> bool {
+        if app.current_tab != AppTab::Shell {
+            return false;
+        }
+        if let Some(agent) = app.active_agent_mut() {
+            agent.shell_tab.move_up();
+        }
+        true
+    }
+
+    pub(in crate::app) fn move_selection_down(app: &mut App) -> bool {
+        if app.current_tab != AppTab::Shell {
+            return false;
+        }
+        if let Some(agent) = app.active_agent_mut() {
+            agent.shell_tab.move_down();
+        }
+        true
+    }
+
+    pub(in crate::app) fn handle_key(
+        app: &mut App,
+        key: KeyEvent,
+        ui_tx: mpsc::UnboundedSender<UiEvent>,
+    ) -> bool {
+        if app.current_tab != AppTab::Shell || key.code != KeyCode::Enter {
+            return false;
+        }
+        Self::submit_command(app, ui_tx);
+        true
+    }
+
+    pub(in crate::app) fn scroll_output(app: &mut App, lines: u16, up: bool) -> bool {
+        if app.current_tab != AppTab::Shell {
+            return false;
+        }
+        if let Some(agent) = app.active_agent_mut()
+            && let Some(session) = agent.shell_tab.selected_session_mut()
+        {
+            if up {
+                session.scroll = session.scroll.saturating_sub(lines);
+            } else {
+                session.scroll = session.scroll.saturating_add(lines);
+            }
+        }
+        true
+    }
+
+    pub(in crate::app) fn handle_text_input(app: &mut App, character: char) -> bool {
+        if app.current_tab != AppTab::Shell {
+            return false;
+        }
+        if let Some(agent) = app.active_agent_mut() {
+            agent.shell_tab.input.push(character);
+            if let Some(session) = agent.shell_tab.selected_session_mut() {
+                session.scroll = u16::MAX;
+            }
+        }
+        true
+    }
+
+    pub(in crate::app) fn handle_backspace(app: &mut App) -> bool {
+        if app.current_tab != AppTab::Shell {
+            return false;
+        }
+        if let Some(agent) = app.active_agent_mut() {
+            agent.shell_tab.input.pop();
+            if let Some(session) = agent.shell_tab.selected_session_mut() {
+                session.scroll = u16::MAX;
+            }
+        }
+        true
+    }
+
     pub(in crate::app) fn draw(frame: &mut Frame, app: &App, area: Rect) {
         let Some(agent) = app.active_agent() else {
             let empty = Paragraph::new("Add an agent from the sidebar to start a shell session.")
@@ -79,7 +151,7 @@ impl ShellComponent {
         frame.set_cursor_position((x, y));
     }
 
-    pub(in crate::app) fn open_tab(app: &mut App, ui_tx: mpsc::UnboundedSender<UiEvent>) {
+    pub(in crate::app) fn open_tab(app: &mut App, _ui_tx: mpsc::UnboundedSender<UiEvent>) {
         let Some(agent_index) = app.current_agent else {
             app.status_message = Some("Add an agent before creating a shell session.".to_string());
             return;
@@ -94,12 +166,12 @@ impl ShellComponent {
         else {
             return;
         };
-        Self::start_session(app, agent_index, session_id, workspace, ui_tx);
+        Self::start_session(app, agent_index, session_id, workspace);
     }
 
     pub(in crate::app) fn open_tab_and_create_session(
         app: &mut App,
-        ui_tx: mpsc::UnboundedSender<UiEvent>,
+        _ui_tx: mpsc::UnboundedSender<UiEvent>,
     ) {
         let Some(agent_index) = app.current_agent else {
             app.status_message = Some("Add an agent before creating a shell session.".to_string());
@@ -110,7 +182,7 @@ impl ShellComponent {
         TopNavigationComponent::refresh_current_tab(app);
         let workspace = app.agents[agent_index].definition.workspace.clone();
         let session_id = app.agents[agent_index].shell_tab.create_session(&workspace);
-        Self::start_session(app, agent_index, session_id, workspace, ui_tx);
+        Self::start_session(app, agent_index, session_id, workspace);
     }
 
     pub(in crate::app) fn submit_command(app: &mut App, _ui_tx: mpsc::UnboundedSender<UiEvent>) {
@@ -145,6 +217,7 @@ impl ShellComponent {
                 .remove_session_by_id(session_id);
             return;
         };
+        let command_tx = runtime.command_tx.clone();
 
         let Some(session) = app.agents[agent_index]
             .shell_tab
@@ -164,57 +237,19 @@ impl ShellComponent {
         session.append_command(&command);
         app.agents[agent_index].shell_tab.input.clear();
 
-        if runtime
-            .command_tx
-            .send(ShellPresenter::command_payload(&command))
-            .is_err()
-        {
-            app.agents[agent_index]
-                .shell_tab
-                .remove_session_by_id(session_id);
-            app.shell_runtimes.remove(&key);
-            app.status_message = Some("Failed to send command to shell.".to_string());
-        }
-    }
-
-    fn start_session(
-        app: &mut App,
-        agent_index: usize,
-        session_id: usize,
-        workspace: PathBuf,
-        ui_tx: mpsc::UnboundedSender<UiEvent>,
-    ) {
-        if let Err(error) = Self::spawn_runtime(app, agent_index, session_id, workspace, ui_tx) {
-            app.agents[agent_index]
-                .shell_tab
-                .remove_session_by_id(session_id);
-            app.status_message = Some(error.to_string());
-        }
-    }
-
-    fn spawn_runtime(
-        app: &mut App,
-        agent_index: usize,
-        session_id: usize,
-        workspace: PathBuf,
-        ui_tx: mpsc::UnboundedSender<UiEvent>,
-    ) -> Result<()> {
-        let shell_path = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        let (command_tx, pid) = shell::ShellRuntimeFactory::spawn(
-            &shell_path,
-            &workspace,
+        app.enqueue_effect(AppEffect::SendShellCommand {
             agent_index,
             session_id,
-            ui_tx,
-        )?;
+            command_tx,
+            payload: ShellPresenter::command_payload(&command),
+        });
+    }
 
-        app.shell_runtimes.insert(
-            ShellSessionKey {
-                agent_index,
-                session_id,
-            },
-            ShellSessionRuntime { command_tx, pid },
-        );
-        Ok(())
+    fn start_session(app: &mut App, agent_index: usize, session_id: usize, workspace: PathBuf) {
+        app.enqueue_effect(AppEffect::StartShellSession {
+            agent_index,
+            session_id,
+            workspace,
+        });
     }
 }

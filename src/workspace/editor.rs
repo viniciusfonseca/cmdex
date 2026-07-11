@@ -40,13 +40,11 @@ impl WorkspaceEditorState {
             vertical_scroll: 0,
             horizontal_scroll: 0,
             mode: EditorMode::Normal,
-            command: String::new(),
             dirty: false,
             status: None,
             hover: None,
             undo_stack: Vec::new(),
             preferred_col: 0,
-            selection_anchor: None,
             hover_request: None,
             overlay: EditorOverlay::None,
             render_cache: EditorRenderCache::default(),
@@ -208,17 +206,16 @@ impl WorkspaceEditorState {
     }
 
     pub fn enter_visual_mode(&mut self) {
-        self.mode = EditorMode::Visual;
-        self.command.clear();
-        if self.selection_anchor.is_none() {
-            self.selection_anchor = Some(self.cursor_position());
-        }
+        let anchor = match &self.mode {
+            EditorMode::Visual { anchor } => *anchor,
+            _ => self.cursor_position(),
+        };
+        self.mode = EditorMode::Visual { anchor };
         self.status = None;
     }
 
     pub fn exit_visual_mode(&mut self) {
         self.mode = EditorMode::Normal;
-        self.clear_selection();
         self.status = None;
     }
 
@@ -265,7 +262,6 @@ impl WorkspaceEditorState {
     pub fn enter_insert_mode(&mut self) {
         self.clear_selection();
         self.mode = EditorMode::Insert;
-        self.command.clear();
         self.status = None;
     }
 
@@ -393,9 +389,7 @@ impl WorkspaceEditorState {
 
     pub fn set_cursor(&mut self, row: usize, col: usize) {
         self.clear_selection();
-        if self.mode == EditorMode::Visual {
-            self.mode = EditorMode::Normal;
-        }
+        self.enter_normal_mode();
         self.cursor_row = row.min(self.lines.len().saturating_sub(1));
         self.cursor_col = col.min(self.line_len(self.cursor_row));
         self.preferred_col = self.cursor_col;
@@ -432,11 +426,8 @@ impl WorkspaceEditorState {
         }
 
         self.push_undo_state();
-        if self.mode == EditorMode::Visual {
-            self.mode = EditorMode::Normal;
-        }
         let _ = self.delete_selection_internal(false);
-        self.clear_selection();
+        self.mode = EditorMode::Normal;
 
         let insert_at = Self::byte_index_for_char(&self.lines[self.cursor_row], self.cursor_col);
         let tail = self.lines[self.cursor_row].split_off(insert_at);
@@ -484,8 +475,6 @@ impl WorkspaceEditorState {
         self.horizontal_scroll = snapshot.horizontal_scroll;
         self.preferred_col = snapshot.preferred_col.min(self.line_len(self.cursor_row));
         self.mode = EditorMode::Normal;
-        self.command.clear();
-        self.clear_selection();
         self.sync_dirty_state();
         self.status = Some("Undid last change".to_string());
         self.rebuild_render_cache();
@@ -502,19 +491,20 @@ impl WorkspaceEditorState {
 
     pub fn start_command(&mut self) {
         self.clear_selection();
-        self.mode = EditorMode::Command;
-        self.command.clear();
+        self.mode = EditorMode::Command {
+            buffer: String::new(),
+        };
     }
 
     pub fn cancel_command(&mut self) {
         self.mode = EditorMode::Normal;
-        self.command.clear();
     }
 
     pub fn execute_command(&mut self) -> Result<EditorCommandResult> {
-        let command = self.command.trim().to_string();
-        self.mode = EditorMode::Normal;
-        self.command.clear();
+        let command = match std::mem::replace(&mut self.mode, EditorMode::Normal) {
+            EditorMode::Command { buffer } => buffer.trim().to_string(),
+            _ => String::new(),
+        };
 
         match command.as_str() {
             "" => Ok(EditorCommandResult {
@@ -565,6 +555,26 @@ impl WorkspaceEditorState {
 
     pub fn has_selection(&self) -> bool {
         self.selection_bounds().is_some()
+    }
+
+    pub fn command_buffer(&self) -> Option<&str> {
+        self.mode.command_buffer()
+    }
+
+    pub fn push_command_char(&mut self, character: char) {
+        if let EditorMode::Command { buffer } = &mut self.mode {
+            buffer.push(character);
+        }
+    }
+
+    pub fn pop_command_char(&mut self) {
+        if let EditorMode::Command { buffer } = &mut self.mode {
+            buffer.pop();
+        }
+    }
+
+    pub fn enter_normal_mode(&mut self) {
+        self.mode = EditorMode::Normal;
     }
 
     pub fn delete_selection(&mut self) -> bool {
@@ -622,20 +632,26 @@ impl WorkspaceEditorState {
     }
 
     pub(super) fn clear_selection(&mut self) {
-        self.selection_anchor = None;
+        if self.mode.is_visual() {
+            self.mode = EditorMode::Visual {
+                anchor: self.cursor_position(),
+            };
+        }
     }
 
     fn selection_bounds(&self) -> Option<(EditorPosition, EditorPosition)> {
-        let anchor = self.selection_anchor?;
+        let EditorMode::Visual { anchor } = &self.mode else {
+            return None;
+        };
         let cursor = self.cursor_position();
-        if anchor == cursor {
+        if *anchor == cursor {
             return None;
         }
 
-        Some(if anchor < cursor {
-            (anchor, cursor)
+        Some(if *anchor < cursor {
+            (*anchor, cursor)
         } else {
-            (cursor, anchor)
+            (cursor, *anchor)
         })
     }
 

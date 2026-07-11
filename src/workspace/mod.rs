@@ -9,6 +9,7 @@ mod render;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use browser::WorkspaceIndex;
 pub(crate) use diff::GitDiffLoadResult;
 pub(crate) use git_repository::GitRepository;
 
@@ -34,7 +35,6 @@ const SEARCH_DEBOUNCE: Duration = Duration::from_millis(80);
 
 #[derive(Debug, Clone, Default)]
 pub struct FileBrowserState {
-    pub entries: Vec<FileEntry>,
     pub tree_rows: Vec<FileTreeRow>,
     pub selected: usize,
     pub tree_cursor: usize,
@@ -46,6 +46,7 @@ pub struct FileBrowserState {
     pub content_scroll: u16,
     pub error: Option<String>,
     pub editor: Option<WorkspaceEditorState>,
+    pub(crate) index: WorkspaceIndex,
     collapsed_dirs: BTreeSet<PathBuf>,
     known_dirs: BTreeSet<PathBuf>,
     search_rows: Vec<WorkspaceSearchRow>,
@@ -160,12 +161,34 @@ pub struct DiffEntry {
     pub status: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditorMode {
     Normal,
-    Visual,
+    Visual { anchor: EditorPosition },
     Insert,
-    Command,
+    Command { buffer: String },
+}
+
+impl EditorMode {
+    pub fn is_visual(&self) -> bool {
+        matches!(self, Self::Visual { .. })
+    }
+
+    pub fn command_buffer(&self) -> Option<&str> {
+        match self {
+            Self::Command { buffer } => Some(buffer),
+            _ => None,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Normal => "NORMAL",
+            Self::Visual { .. } => "VISUAL",
+            Self::Insert => "INSERT",
+            Self::Command { .. } => "COMMAND",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -254,14 +277,12 @@ pub struct WorkspaceEditorState {
     pub vertical_scroll: u16,
     pub horizontal_scroll: u16,
     pub mode: EditorMode,
-    pub command: String,
     pub dirty: bool,
     pub status: Option<String>,
     pub hover: Option<String>,
     saved_lines: Vec<String>,
     undo_stack: Vec<EditorUndoState>,
     preferred_col: usize,
-    selection_anchor: Option<EditorPosition>,
     hover_request: Option<EditorPosition>,
     overlay: EditorOverlay,
     render_cache: EditorRenderCache,

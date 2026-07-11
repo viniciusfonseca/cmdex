@@ -1,9 +1,209 @@
 use super::super::*;
 use super::{UiSupport, WorkspaceEditorComponent};
 
-pub(in crate::app) struct WorkspaceComponent;
+pub(in crate::app) struct WorkspaceScreen;
 
-impl WorkspaceComponent {
+impl WorkspaceScreen {
+    pub(in crate::app) fn handle_key_with_context(
+        app: &mut App,
+        key: KeyEvent,
+        ui_tx: &mpsc::UnboundedSender<UiEvent>,
+        area: Rect,
+    ) -> bool {
+        if app.current_tab != AppTab::Workspace {
+            return false;
+        }
+        app.clear_workspace_hover();
+        if Self::handle_completion_request(app, key, ui_tx) {
+            return true;
+        }
+        Self::handle_key(app, key, area)
+    }
+
+    pub(in crate::app) fn handle_editor_click_with_context(
+        app: &mut App,
+        column: u16,
+        row: u16,
+        modifiers: KeyModifiers,
+        area: Rect,
+        ui_tx: &mpsc::UnboundedSender<UiEvent>,
+    ) -> bool {
+        if app.current_tab != AppTab::Workspace
+            || app
+                .active_agent()
+                .is_none_or(|agent| agent.workspace.editor.is_none())
+        {
+            return false;
+        }
+
+        app.clear_workspace_hover();
+        if Self::handle_shortcuts_popup_click(app, column, row, area) {
+            return true;
+        }
+        if modifiers.contains(KeyModifiers::CONTROL)
+            && Self::handle_editor_definition_click(app, column, row, area, ui_tx)
+        {
+            return true;
+        }
+        app.active_workspace_selection_drag = Self::handle_editor_click(app, column, row, area);
+        true
+    }
+
+    pub(in crate::app) fn handle_editor_scroll(
+        app: &mut App,
+        column: u16,
+        row: u16,
+        area: Rect,
+        footer: Option<Rect>,
+        up: bool,
+        horizontal: bool,
+    ) -> bool {
+        if app.current_tab != AppTab::Workspace {
+            return false;
+        }
+        if Self::shortcuts_popup_open(app)
+            || Self::consume_shortcuts_popup_scroll(app, column, row, area)
+            || (!horizontal && Self::handle_completion_scroll(app, column, row, area, up))
+        {
+            return true;
+        }
+        if !(UiSupport::rect_contains(area, column, row)
+            || footer.is_some_and(|rect| UiSupport::rect_contains(rect, column, row)))
+        {
+            return false;
+        }
+        if !horizontal {
+            return false;
+        }
+
+        let Some(agent) = app.active_agent_mut() else {
+            return false;
+        };
+        let Some(editor) = agent.workspace.editor.as_mut() else {
+            return false;
+        };
+        editor.clear_hover();
+        let viewport = WorkspaceEditorComponent::viewport(area);
+        if up {
+            editor.scroll_left(MOUSE_SCROLL_STEP);
+        } else {
+            editor.scroll_right(MOUSE_SCROLL_STEP, viewport.width);
+        }
+        true
+    }
+
+    pub(in crate::app) fn move_selection_up(app: &mut App) -> bool {
+        Self::move_selection(app, true)
+    }
+
+    pub(in crate::app) fn move_selection_down(app: &mut App) -> bool {
+        Self::move_selection(app, false)
+    }
+
+    pub(in crate::app) fn scroll_content(app: &mut App, area: Rect, lines: u16, up: bool) -> bool {
+        if app.current_tab != AppTab::Workspace {
+            return false;
+        }
+        app.clear_workspace_hover();
+        let Some(agent) = app.active_agent_mut() else {
+            return true;
+        };
+        if let Some(editor) = agent.workspace.editor.as_mut() {
+            let viewport = WorkspaceEditorComponent::viewport(area);
+            if up {
+                editor.scroll_up(lines);
+            } else {
+                editor.scroll_down(lines, viewport.height);
+            }
+        } else if up {
+            agent.workspace.scroll_up(lines);
+        } else {
+            agent.workspace.scroll_down(lines);
+        }
+        true
+    }
+
+    fn move_selection(app: &mut App, up: bool) -> bool {
+        if app.current_tab != AppTab::Workspace {
+            return false;
+        }
+        let Some(agent_index) = app.current_agent else {
+            return true;
+        };
+        let should_open_editor = {
+            let workspace = &mut app.agents[agent_index].workspace;
+            if workspace.editor_focused() {
+                return true;
+            }
+            if workspace.sidebar_tab == WorkspaceSidebarTab::Search {
+                if up {
+                    workspace.search_move_up();
+                } else {
+                    workspace.search_move_down();
+                }
+            } else if up {
+                workspace.move_up_without_io();
+            } else {
+                workspace.move_down_without_io();
+            }
+            true
+        };
+        if should_open_editor {
+            Self::request_open_editor(app, agent_index);
+        }
+        true
+    }
+
+    pub(in crate::app) fn handle_text_input(app: &mut App, character: char) -> bool {
+        if app.current_tab != AppTab::Workspace {
+            return false;
+        }
+        app.clear_workspace_hover();
+        let Some(agent) = app.active_agent_mut() else {
+            return true;
+        };
+        if agent.workspace.sidebar_focused()
+            && agent.workspace.sidebar_tab == WorkspaceSidebarTab::Search
+        {
+            agent.workspace.push_search_char(character);
+            return true;
+        }
+        if let Some(editor) = agent.workspace.editor.as_mut() {
+            editor.clear_completion();
+            match &editor.mode {
+                EditorMode::Insert => editor.insert_char(character),
+                EditorMode::Command { .. } => editor.push_command_char(character),
+                EditorMode::Normal | EditorMode::Visual { .. } => {}
+            }
+        }
+        true
+    }
+
+    pub(in crate::app) fn handle_backspace(app: &mut App) -> bool {
+        if app.current_tab != AppTab::Workspace {
+            return false;
+        }
+        app.clear_workspace_hover();
+        let Some(agent) = app.active_agent_mut() else {
+            return true;
+        };
+        if agent.workspace.sidebar_focused()
+            && agent.workspace.sidebar_tab == WorkspaceSidebarTab::Search
+        {
+            agent.workspace.pop_search_char();
+            return true;
+        }
+        if let Some(editor) = agent.workspace.editor.as_mut() {
+            editor.clear_completion();
+            match &editor.mode {
+                EditorMode::Insert => editor.backspace(),
+                EditorMode::Command { .. } => editor.pop_command_char(),
+                EditorMode::Normal | EditorMode::Visual { .. } => {}
+            }
+        }
+        true
+    }
+
     pub(in crate::app) fn draw(frame: &mut Frame, app: &App, area: Rect) {
         let Some(agent) = app.active_agent() else {
             let empty = Paragraph::new("Select or create an agent in the Chat tab.")
@@ -56,36 +256,14 @@ impl WorkspaceComponent {
         );
     }
 
-    pub(in crate::app) fn maybe_refresh(app: &mut App) -> bool {
-        if app.current_tab != AppTab::Workspace {
-            return false;
-        }
-
-        let now = Instant::now();
-        if app
-            .last_workspace_refresh_at
-            .is_some_and(|last| now.duration_since(last) < WORKSPACE_AUTO_REFRESH_INTERVAL)
-        {
-            return false;
-        }
-
-        if app.workspace_refresh_in_flight {
-            return false;
-        }
-
-        app.last_workspace_refresh_at = Some(now);
-        let Some(agent_index) = app.current_agent else {
-            return false;
-        };
-        Self::request_refresh_for_agent(app, agent_index)
-    }
-
     pub(in crate::app) fn request_refresh_for_agent(app: &mut App, agent_index: usize) -> bool {
         let Some(agent) = app.agents.get(agent_index) else {
             return false;
         };
         let root = agent.definition.workspace.clone();
-        app.workspace_refresh_in_flight = true;
+        if !app.workspace_refresh_in_flight.insert(agent_index) {
+            return false;
+        }
         app.enqueue_effect(super::super::effects::AppEffect::RefreshWorkspace {
             agent_index,
             root,
@@ -105,7 +283,7 @@ impl WorkspaceComponent {
             return false;
         };
 
-        let entries = app.agents[agent_index].workspace.entries.clone();
+        let entries = app.agents[agent_index].workspace.entries().to_vec();
         app.enqueue_effect(super::super::effects::AppEffect::SearchWorkspace {
             agent_index,
             entries,
@@ -129,7 +307,7 @@ impl WorkspaceComponent {
         };
         let Some(path) = agent
             .workspace
-            .entries
+            .entries()
             .get(agent.workspace.selected)
             .map(|entry| entry.path.clone())
         else {
@@ -152,7 +330,7 @@ impl WorkspaceComponent {
         };
         let Some(path) = agent
             .workspace
-            .entries
+            .entries()
             .get(agent.workspace.selected)
             .map(|entry| entry.path.clone())
         else {
@@ -191,7 +369,10 @@ impl WorkspaceComponent {
                 return false;
             };
             if editor.shortcuts_help_open()
-                || matches!(editor.mode, EditorMode::Command | EditorMode::Visual)
+                || matches!(
+                    editor.mode,
+                    EditorMode::Command { .. } | EditorMode::Visual { .. }
+                )
             {
                 return false;
             }
@@ -279,7 +460,7 @@ impl WorkspaceComponent {
         };
         editor.clear_hover();
         editor.clear_completion();
-        editor.mode = EditorMode::Normal;
+        editor.enter_normal_mode();
         editor.set_cursor(target.row, target.col);
         let viewport = WorkspaceEditorComponent::viewport(area);
         editor.ensure_visible(viewport.width, viewport.height);

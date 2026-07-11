@@ -1,7 +1,7 @@
 use super::super::*;
-use super::{WorkspaceComponent, WorkspaceEditorComponent};
+use super::{WorkspaceEditorComponent, WorkspaceScreen};
 
-impl WorkspaceComponent {
+impl WorkspaceScreen {
     pub(in crate::app) fn handle_key(app: &mut App, key: KeyEvent, area: Rect) -> bool {
         if app.current_tab != AppTab::Workspace {
             return false;
@@ -35,7 +35,7 @@ impl WorkspaceComponent {
         let mut sidebar_result = None;
         {
             let workspace = &mut app.agents[agent_index].workspace;
-            let editor_mode = workspace.editor.as_ref().map(|editor| editor.mode);
+            let editor_mode = workspace.editor.as_ref().map(|editor| editor.mode.clone());
             let completion_visible = workspace
                 .editor
                 .as_ref()
@@ -44,7 +44,10 @@ impl WorkspaceComponent {
             if workspace.editor.is_some()
                 && key.code == KeyCode::Tab
                 && !completion_visible
-                && matches!(editor_mode, Some(EditorMode::Normal | EditorMode::Visual))
+                && matches!(
+                    editor_mode,
+                    Some(EditorMode::Normal | EditorMode::Visual { .. })
+                )
             {
                 workspace.toggle_focus();
                 return true;

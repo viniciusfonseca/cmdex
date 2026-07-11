@@ -1,9 +1,49 @@
-use super::{UiEvent, chat::ChatSupport, *};
+use super::{
+    ChatEvent, GitEvent, LspEvent, ShellEvent, UiEvent, WorkspaceEvent, chat::ChatSupport,
+    event_types, *,
+};
 use crate::workspace::GitRepository;
 use arboard::Clipboard;
 use tokio::process::Command;
 
 pub(super) enum AppEffect {
+    StopWorkspaceWatcher {
+        stop_tx: std::sync::mpsc::Sender<()>,
+    },
+    StartWorkspaceWatcher {
+        agent_index: usize,
+        root: PathBuf,
+    },
+    StopShellSession {
+        pid: u32,
+    },
+    StopLspSession {
+        command_tx: std::sync::mpsc::Sender<lsp::LspCommand>,
+    },
+    StartShellSession {
+        agent_index: usize,
+        session_id: usize,
+        workspace: PathBuf,
+    },
+    SendShellCommand {
+        agent_index: usize,
+        session_id: usize,
+        command_tx: std::sync::mpsc::Sender<String>,
+        payload: String,
+    },
+    StartLspSession {
+        agent_index: usize,
+        server_index: usize,
+        workspace: PathBuf,
+        server: LspServerConfig,
+        command: lsp::LspCommand,
+    },
+    SendLspCommand {
+        agent_index: usize,
+        server_index: usize,
+        command_tx: std::sync::mpsc::Sender<lsp::LspCommand>,
+        command: lsp::LspCommand,
+    },
     RunShell {
         agent_index: usize,
         command: String,
@@ -79,6 +119,188 @@ pub(super) fn spawn(
     ui_tx: mpsc::UnboundedSender<UiEvent>,
 ) {
     match effect {
+        AppEffect::StopWorkspaceWatcher { stop_tx } => {
+            let _ = stop_tx.send(());
+        }
+        AppEffect::StartWorkspaceWatcher { agent_index, root } => {
+            if let Err(error) =
+                super::workspace_watcher::WorkspaceWatcher::spawn(agent_index, root, ui_tx.clone())
+            {
+                event_types::send(
+                    &ui_tx,
+                    WorkspaceEvent::WatcherFailed {
+                        agent_index,
+                        message: error.to_string(),
+                    },
+                );
+            }
+        }
+        AppEffect::StopShellSession { pid } => {
+            tokio::spawn(async move {
+                let _ = tokio::task::spawn_blocking(move || {
+                    std::process::Command::new("kill")
+                        .args(["-TERM", &pid.to_string()])
+                        .status()
+                })
+                .await;
+            });
+        }
+        AppEffect::StopLspSession { command_tx } => {
+            tokio::spawn(async move {
+                let _ = command_tx.send(lsp::LspCommand::Shutdown);
+            });
+        }
+        AppEffect::StartShellSession {
+            agent_index,
+            session_id,
+            workspace,
+        } => {
+            tokio::spawn(async move {
+                let shell_path = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+                let worker_tx = ui_tx.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    super::shell::ShellRuntimeFactory::spawn(
+                        &shell_path,
+                        &workspace,
+                        agent_index,
+                        session_id,
+                        worker_tx,
+                    )
+                })
+                .await;
+                match result {
+                    Ok(Ok((command_tx, pid))) => {
+                        event_types::send(
+                            &ui_tx,
+                            ShellEvent::RuntimeReady {
+                                agent_index,
+                                session_id,
+                                command_tx,
+                                pid,
+                            },
+                        );
+                    }
+                    Ok(Err(error)) => {
+                        event_types::send(
+                            &ui_tx,
+                            ShellEvent::SessionExited {
+                                agent_index,
+                                session_id,
+                                message: error.to_string(),
+                            },
+                        );
+                    }
+                    Err(error) => {
+                        event_types::send(
+                            &ui_tx,
+                            ShellEvent::SessionExited {
+                                agent_index,
+                                session_id,
+                                message: format!("shell startup task failed: {error}"),
+                            },
+                        );
+                    }
+                }
+            });
+        }
+        AppEffect::SendShellCommand {
+            agent_index,
+            session_id,
+            command_tx,
+            payload,
+        } => {
+            tokio::spawn(async move {
+                if let Err(error) = command_tx.send(payload) {
+                    event_types::send(
+                        &ui_tx,
+                        ShellEvent::SessionExited {
+                            agent_index,
+                            session_id,
+                            message: format!("Failed to send command to shell: {error}"),
+                        },
+                    );
+                }
+            });
+        }
+        AppEffect::StartLspSession {
+            agent_index,
+            server_index,
+            workspace,
+            server,
+            command,
+        } => {
+            tokio::spawn(async move {
+                let worker_tx = ui_tx.clone();
+                let server_name = server.name.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    lsp::LspRuntimeFactory::spawn(&workspace, server, agent_index, worker_tx)
+                })
+                .await;
+                match result {
+                    Ok(Ok(command_tx)) => {
+                        if let Err(error) = command_tx.send(command) {
+                            event_types::send(
+                                &ui_tx,
+                                LspEvent::RuntimeFailed {
+                                    agent_index,
+                                    server_index,
+                                    message: format!("Failed to send LSP request: {error:?}"),
+                                },
+                            );
+                        } else {
+                            event_types::send(
+                                &ui_tx,
+                                LspEvent::RuntimeReady {
+                                    agent_index,
+                                    server_index,
+                                    server_name,
+                                    command_tx,
+                                },
+                            );
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        event_types::send(
+                            &ui_tx,
+                            LspEvent::RuntimeFailed {
+                                agent_index,
+                                server_index,
+                                message: error.to_string(),
+                            },
+                        );
+                    }
+                    Err(error) => {
+                        event_types::send(
+                            &ui_tx,
+                            LspEvent::RuntimeFailed {
+                                agent_index,
+                                server_index,
+                                message: format!("LSP startup task failed: {error}"),
+                            },
+                        );
+                    }
+                }
+            });
+        }
+        AppEffect::SendLspCommand {
+            agent_index,
+            server_index,
+            command_tx,
+            command,
+        } => {
+            tokio::spawn(async move {
+                if let Err(error) = command_tx.send(command) {
+                    event_types::send(
+                        &ui_tx,
+                        LspEvent::RuntimeFailed {
+                            agent_index,
+                            server_index,
+                            message: format!("Failed to send LSP request: {error:?}"),
+                        },
+                    );
+                }
+            });
+        }
         AppEffect::RunShell {
             agent_index,
             command,
@@ -117,11 +339,14 @@ pub(super) fn spawn(
                     ),
                 };
 
-                let _ = ui_tx.send(UiEvent::ShellCompleted {
-                    agent_index,
-                    output,
-                    success,
-                });
+                event_types::send(
+                    &ui_tx,
+                    ShellEvent::CommandCompleted {
+                        agent_index,
+                        output,
+                        success,
+                    },
+                );
             });
         }
         AppEffect::RunGitRemote {
@@ -140,12 +365,15 @@ pub(super) fn spawn(
                     Err(error) => (false, format!("git remote task failed: {error}")),
                 };
 
-                let _ = ui_tx.send(UiEvent::GitDiffRemoteCompleted {
-                    agent_index,
-                    action,
-                    success,
-                    message,
-                });
+                event_types::send(
+                    &ui_tx,
+                    GitEvent::RemoteCompleted {
+                        agent_index,
+                        action,
+                        success,
+                        message,
+                    },
+                );
             });
         }
         AppEffect::RunGitMutation {
@@ -164,12 +392,15 @@ pub(super) fn spawn(
                     Ok(Err(error)) => (false, error.to_string()),
                     Err(error) => (false, format!("git mutation task failed: {error}")),
                 };
-                let _ = ui_tx.send(UiEvent::GitDiffMutationCompleted {
-                    agent_index,
-                    mutation: operation,
-                    success,
-                    message,
-                });
+                event_types::send(
+                    &ui_tx,
+                    GitEvent::MutationCompleted {
+                        agent_index,
+                        mutation: operation,
+                        success,
+                        message,
+                    },
+                );
             });
         }
         AppEffect::RefreshGitDiff {
@@ -190,12 +421,15 @@ pub(super) fn spawn(
                     Ok(Err(error)) => (None, Some(error.to_string())),
                     Err(error) => (None, Some(format!("git refresh task failed: {error}"))),
                 };
-                let _ = ui_tx.send(UiEvent::GitDiffLoaded {
-                    agent_index,
-                    generation,
-                    result,
-                    error,
-                });
+                event_types::send(
+                    &ui_tx,
+                    GitEvent::Loaded {
+                        agent_index,
+                        generation,
+                        result,
+                        error,
+                    },
+                );
             });
         }
         AppEffect::RefreshWorkspace { agent_index, root } => {
@@ -208,11 +442,14 @@ pub(super) fn spawn(
                     Ok(Err(error)) => (Vec::new(), Some(error.to_string())),
                     Err(error) => (Vec::new(), Some(format!("workspace scan failed: {error}"))),
                 };
-                let _ = ui_tx.send(UiEvent::WorkspaceEntriesLoaded {
-                    agent_index,
-                    entries,
-                    error,
-                });
+                event_types::send(
+                    &ui_tx,
+                    WorkspaceEvent::EntriesLoaded {
+                        agent_index,
+                        entries,
+                        error,
+                    },
+                );
             });
         }
         AppEffect::SearchWorkspace {
@@ -235,13 +472,16 @@ pub(super) fn spawn(
                         Some(format!("workspace search failed: {error}")),
                     ),
                 };
-                let _ = ui_tx.send(UiEvent::WorkspaceSearchCompleted {
-                    agent_index,
-                    generation,
-                    query,
-                    snapshot,
-                    error,
-                });
+                event_types::send(
+                    &ui_tx,
+                    WorkspaceEvent::SearchCompleted {
+                        agent_index,
+                        generation,
+                        query,
+                        snapshot,
+                        error,
+                    },
+                );
             });
         }
         AppEffect::OpenWorkspaceEditor {
@@ -260,13 +500,16 @@ pub(super) fn spawn(
                     Ok(Err(error)) => (None, Some(error.to_string())),
                     Err(error) => (None, Some(format!("editor load failed: {error}"))),
                 };
-                let _ = ui_tx.send(UiEvent::WorkspaceEditorLoaded {
-                    agent_index,
-                    path,
-                    position,
-                    source,
-                    error,
-                });
+                event_types::send(
+                    &ui_tx,
+                    WorkspaceEvent::EditorLoaded {
+                        agent_index,
+                        path,
+                        position,
+                        source,
+                        error,
+                    },
+                );
             });
         }
         AppEffect::LoadWorkspacePreview { agent_index, path } => {
@@ -281,12 +524,15 @@ pub(super) fn spawn(
                     Ok(Err(error)) => (Vec::new(), Some(error.to_string())),
                     Err(error) => (Vec::new(), Some(format!("preview load failed: {error}"))),
                 };
-                let _ = ui_tx.send(UiEvent::WorkspacePreviewLoaded {
-                    agent_index,
-                    path,
-                    preview,
-                    error,
-                });
+                event_types::send(
+                    &ui_tx,
+                    WorkspaceEvent::PreviewLoaded {
+                        agent_index,
+                        path,
+                        preview,
+                        error,
+                    },
+                );
             });
         }
         AppEffect::CopyToClipboard {
@@ -304,13 +550,16 @@ pub(super) fn spawn(
                     Ok(Err(error)) => Some(format!("Copy failed: {error}")),
                     Err(error) => Some(format!("clipboard task failed: {error}")),
                 };
-                let _ = ui_tx.send(UiEvent::WorkspaceClipboardCompleted {
-                    agent_index,
-                    path,
-                    operation: ClipboardOperation::Copy,
-                    text: None,
-                    error,
-                });
+                event_types::send(
+                    &ui_tx,
+                    WorkspaceEvent::ClipboardCompleted {
+                        agent_index,
+                        path,
+                        operation: ClipboardOperation::Copy,
+                        text: None,
+                        error,
+                    },
+                );
             });
         }
         AppEffect::PasteFromClipboard { agent_index, path } => {
@@ -325,13 +574,16 @@ pub(super) fn spawn(
                     Ok(Err(error)) => (None, Some(format!("Paste failed: {error}"))),
                     Err(error) => (None, Some(format!("clipboard task failed: {error}"))),
                 };
-                let _ = ui_tx.send(UiEvent::WorkspaceClipboardCompleted {
-                    agent_index,
-                    path,
-                    operation: ClipboardOperation::Paste,
-                    text,
-                    error,
-                });
+                event_types::send(
+                    &ui_tx,
+                    WorkspaceEvent::ClipboardCompleted {
+                        agent_index,
+                        path,
+                        operation: ClipboardOperation::Paste,
+                        text,
+                        error,
+                    },
+                );
             });
         }
         AppEffect::StartChatTurn {
@@ -353,17 +605,23 @@ pub(super) fn spawn(
                             {
                                 Ok(thread) => {
                                     let id = thread.id.clone();
-                                    let _ = ui_tx.send(UiEvent::ThreadReady {
-                                        agent_index,
-                                        thread,
-                                    });
+                                    event_types::send(
+                                        &ui_tx,
+                                        ChatEvent::ThreadReady {
+                                            agent_index,
+                                            thread,
+                                        },
+                                    );
                                     id
                                 }
                                 Err(error) => {
-                                    let _ = ui_tx.send(UiEvent::SubmissionFailed {
-                                        agent_index,
-                                        message: error.to_string(),
-                                    });
+                                    event_types::send(
+                                        &ui_tx,
+                                        ChatEvent::SubmissionFailed {
+                                            agent_index,
+                                            message: error.to_string(),
+                                        },
+                                    );
                                     return;
                                 }
                             }
@@ -377,17 +635,23 @@ pub(super) fn spawn(
                     {
                         Ok(thread) => {
                             let id = thread.id.clone();
-                            let _ = ui_tx.send(UiEvent::ThreadReady {
-                                agent_index,
-                                thread,
-                            });
+                            event_types::send(
+                                &ui_tx,
+                                ChatEvent::ThreadReady {
+                                    agent_index,
+                                    thread,
+                                },
+                            );
                             id
                         }
                         Err(error) => {
-                            let _ = ui_tx.send(UiEvent::SubmissionFailed {
-                                agent_index,
-                                message: error.to_string(),
-                            });
+                            event_types::send(
+                                &ui_tx,
+                                ChatEvent::SubmissionFailed {
+                                    agent_index,
+                                    message: error.to_string(),
+                                },
+                            );
                             return;
                         }
                     },
@@ -403,16 +667,22 @@ pub(super) fn spawn(
                     .await
                 {
                     Ok(turn_id) => {
-                        let _ = ui_tx.send(UiEvent::TurnStartedLocal {
-                            agent_index,
-                            turn_id,
-                        });
+                        event_types::send(
+                            &ui_tx,
+                            ChatEvent::TurnStartedLocal {
+                                agent_index,
+                                turn_id,
+                            },
+                        );
                     }
                     Err(error) => {
-                        let _ = ui_tx.send(UiEvent::SubmissionFailed {
-                            agent_index,
-                            message: error.to_string(),
-                        });
+                        event_types::send(
+                            &ui_tx,
+                            ChatEvent::SubmissionFailed {
+                                agent_index,
+                                message: error.to_string(),
+                            },
+                        );
                     }
                 }
             });
@@ -421,16 +691,22 @@ pub(super) fn spawn(
             tokio::spawn(async move {
                 match codex.list_models().await {
                     Ok(models) => {
-                        let _ = ui_tx.send(UiEvent::ModelListLoaded {
-                            agent_index,
-                            models,
-                        });
+                        event_types::send(
+                            &ui_tx,
+                            ChatEvent::ModelListLoaded {
+                                agent_index,
+                                models,
+                            },
+                        );
                     }
                     Err(error) => {
-                        let _ = ui_tx.send(UiEvent::ModelCommandResult {
-                            agent_index,
-                            message: format!("Unable to load available models.\n\n{error}"),
-                        });
+                        event_types::send(
+                            &ui_tx,
+                            ChatEvent::ModelCommandResult {
+                                agent_index,
+                                message: format!("Unable to load available models.\n\n{error}"),
+                            },
+                        );
                     }
                 }
             });
@@ -442,10 +718,13 @@ pub(super) fn spawn(
         } => {
             tokio::spawn(async move {
                 if let Err(error) = codex.interrupt_turn(&thread_id, &turn_id).await {
-                    let _ = ui_tx.send(UiEvent::TurnInterruptFailed {
-                        agent_index,
-                        message: format!("Failed to cancel response: {error}"),
-                    });
+                    event_types::send(
+                        &ui_tx,
+                        ChatEvent::TurnInterruptFailed {
+                            agent_index,
+                            message: format!("Failed to cancel response: {error}"),
+                        },
+                    );
                 }
             });
         }

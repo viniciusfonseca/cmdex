@@ -2,10 +2,17 @@ mod actions;
 mod chat;
 mod components;
 mod effects;
+mod event_types;
 mod events;
+mod events_chat;
+mod events_git;
+mod events_lsp;
+mod events_shell;
+mod events_workspace;
 mod input;
 mod lsp;
 mod lsp_actions;
+mod lsp_document;
 mod lsp_framing;
 mod mouse_actions;
 mod navigation_actions;
@@ -13,15 +20,23 @@ mod runtime;
 mod session;
 mod shell;
 #[cfg(test)]
+mod test_support;
+#[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_chat;
+#[cfg(test)]
+mod tests_lsp;
 mod ui;
 mod workspace_actions;
+mod workspace_watcher;
 
 pub(super) use session::{MessageStore, SessionLoader};
 
+use std::ops::{Deref, DerefMut};
 use std::{
     cell::RefCell,
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     env, fs,
     path::PathBuf,
     time::{Duration, Instant},
@@ -47,17 +62,20 @@ use ratatui::{
 use tokio::{sync::mpsc, time::sleep};
 
 use self::components::ChatComponent;
+use self::event_types::{
+    ChatEvent, ClipboardOperation, GitEvent, LspEvent, ShellEvent, UiEvent, WorkspaceEvent,
+};
 use self::input::AppInput;
 use crate::codex::{
-    CodexAppServer, HistoryEntryKind, ModelInfo, ModelReasoningEffort, ServerEvent, ThreadInfo,
-    ThreadItem, WorkspaceSession,
+    CodexAppServer, HistoryEntryKind, ModelInfo, ModelReasoningEffort, ServerEvent, ThreadItem,
+    WorkspaceSession,
 };
 use crate::config::{AgentDefinition, CmdexConfig, ConfigStore, LspServerConfig};
 use crate::theme::ThemeRegistry;
 use crate::workspace::{
     DiffBrowserState, DiffSection, EditorCompletionItem, EditorMode, EditorPosition,
-    FileBrowserState, GitDiffLoadResult, GitMutation, GitRemoteAction, WorkspaceEditorState,
-    WorkspaceSearchSnapshot, WorkspaceSidebarTab,
+    FileBrowserState, GitMutation, GitRemoteAction, WorkspaceEditorState, WorkspaceSearchSnapshot,
+    WorkspaceSidebarTab,
 };
 
 const SIDEBAR_WIDTH: u16 = 45;
@@ -72,151 +90,10 @@ const CONTENT_SCROLL_STEP: u16 = 4;
 const MOUSE_SCROLL_STEP: u16 = 4;
 const MOUSE_SCROLL_DEBOUNCE: Duration = Duration::from_millis(20);
 const HOVER_POPOVER_DELAY: Duration = Duration::from_millis(200);
-const WORKSPACE_AUTO_REFRESH_INTERVAL: Duration = Duration::from_millis(750);
 const FAST_TICK_INTERVAL: Duration = Duration::from_millis(80);
 const WORKSPACE_TICK_INTERVAL: Duration = Duration::from_millis(250);
 const IDLE_TICK_INTERVAL: Duration = Duration::from_millis(1000);
 const SHELL_OUTPUT_LIMIT: usize = 64_000;
-
-#[derive(Debug, Clone)]
-enum UiEvent {
-    ThreadReady {
-        agent_index: usize,
-        thread: ThreadInfo,
-    },
-    ModelCommandResult {
-        agent_index: usize,
-        message: String,
-    },
-    ModelListLoaded {
-        agent_index: usize,
-        models: Vec<ModelInfo>,
-    },
-    SessionLoaded {
-        agent_index: usize,
-        session: Option<WorkspaceSession>,
-    },
-    SubmissionFailed {
-        agent_index: usize,
-        message: String,
-    },
-    TurnStartedLocal {
-        agent_index: usize,
-        turn_id: String,
-    },
-    ShellCompleted {
-        agent_index: usize,
-        output: String,
-        success: bool,
-    },
-    TurnInterruptFailed {
-        agent_index: usize,
-        message: String,
-    },
-    GitDiffRemoteCompleted {
-        agent_index: usize,
-        action: GitRemoteAction,
-        success: bool,
-        message: String,
-    },
-    GitDiffMutationCompleted {
-        agent_index: usize,
-        mutation: GitMutation,
-        success: bool,
-        message: String,
-    },
-    GitDiffLoaded {
-        agent_index: usize,
-        generation: u64,
-        result: Option<GitDiffLoadResult>,
-        error: Option<String>,
-    },
-    WorkspaceEntriesLoaded {
-        agent_index: usize,
-        entries: Vec<crate::workspace::FileEntry>,
-        error: Option<String>,
-    },
-    WorkspaceSearchCompleted {
-        agent_index: usize,
-        generation: u64,
-        query: String,
-        snapshot: WorkspaceSearchSnapshot,
-        error: Option<String>,
-    },
-    WorkspaceEditorLoaded {
-        agent_index: usize,
-        path: PathBuf,
-        position: Option<EditorPosition>,
-        source: Option<String>,
-        error: Option<String>,
-    },
-    WorkspacePreviewLoaded {
-        agent_index: usize,
-        path: PathBuf,
-        preview: Vec<Line<'static>>,
-        error: Option<String>,
-    },
-    WorkspaceClipboardCompleted {
-        agent_index: usize,
-        path: PathBuf,
-        operation: ClipboardOperation,
-        text: Option<String>,
-        error: Option<String>,
-    },
-    ShellSessionReady {
-        agent_index: usize,
-        session_id: usize,
-    },
-    ShellSessionOutput {
-        agent_index: usize,
-        session_id: usize,
-        line: String,
-        stderr: bool,
-    },
-    ShellSessionCommandFinished {
-        agent_index: usize,
-        session_id: usize,
-        exit_code: i32,
-    },
-    ShellSessionExited {
-        agent_index: usize,
-        session_id: usize,
-        message: String,
-    },
-    LspHoverResult {
-        agent_index: usize,
-        path: PathBuf,
-        position: EditorPosition,
-        contents: Option<String>,
-        error: Option<String>,
-    },
-    LspDefinitionResult {
-        agent_index: usize,
-        source_path: PathBuf,
-        _source_position: EditorPosition,
-        target: Option<lsp::DefinitionTarget>,
-        error: Option<String>,
-    },
-    LspCompletionResult {
-        agent_index: usize,
-        path: PathBuf,
-        position: EditorPosition,
-        items: Vec<EditorCompletionItem>,
-        error: Option<String>,
-    },
-    LspNotification {
-        agent_index: usize,
-        server_name: String,
-        method: String,
-        params: serde_json::Value,
-    },
-}
-
-#[derive(Debug, Clone, Copy)]
-enum ClipboardOperation {
-    Copy,
-    Paste,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AppTab {
@@ -310,6 +187,14 @@ struct AddAgentForm {
     workspace: String,
     active_field: AddAgentField,
     error: Option<String>,
+}
+
+pub struct AppShell {
+    current_tab: AppTab,
+    current_agent: Option<usize>,
+    chat_sidebar_index: usize,
+    model_picker: Option<ModelPickerState>,
+    add_form: AddAgentForm,
 }
 
 impl Default for AddAgentForm {
@@ -606,6 +491,7 @@ impl AgentState {
 }
 
 pub struct App {
+    shell: AppShell,
     config_path: PathBuf,
     config: CmdexConfig,
     lsp_servers: Vec<LspServerConfig>,
@@ -613,23 +499,34 @@ pub struct App {
     default_chat_model: Option<String>,
     default_chat_reasoning_effort: Option<String>,
     chat_model_label: String,
-    current_tab: AppTab,
-    current_agent: Option<usize>,
-    chat_sidebar_index: usize,
     chat_input: String,
-    model_picker: Option<ModelPickerState>,
-    add_form: AddAgentForm,
     spinner_index: usize,
     status_message: Option<String>,
     last_mouse_scroll: Option<(ScrollAxis, ScrollDirection, Instant)>,
     active_scrollbar_drag: Option<ScrollbarDragTarget>,
     active_workspace_selection_drag: bool,
-    last_workspace_refresh_at: Option<Instant>,
     shell_runtimes: HashMap<ShellSessionKey, ShellSessionRuntime>,
     lsp_runtimes: HashMap<LspRuntimeKey, LspRuntime>,
+    lsp_starting: HashSet<LspRuntimeKey>,
+    pending_lsp_commands: HashMap<LspRuntimeKey, Vec<lsp::LspCommand>>,
     pending_workspace_hover: Option<PendingWorkspaceHover>,
-    workspace_refresh_in_flight: bool,
+    workspace_refresh_in_flight: HashSet<usize>,
+    workspace_watchers: HashMap<usize, std::sync::mpsc::Sender<()>>,
     pending_effects: VecDeque<effects::AppEffect>,
+}
+
+impl Deref for App {
+    type Target = AppShell;
+
+    fn deref(&self) -> &Self::Target {
+        &self.shell
+    }
+}
+
+impl DerefMut for App {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.shell
+    }
 }
 
 pub struct AppRuntime;
@@ -668,17 +565,6 @@ impl App {
                 )
             })
             .collect::<Vec<_>>();
-        let mut agents = agents;
-        for agent in &mut agents {
-            let root = agent.definition.workspace.clone();
-            match FileBrowserState::scan_entries(&root)
-                .and_then(|entries| agent.workspace.apply_scanned_entries(entries).map(|_| ()))
-            {
-                Ok(()) => {}
-                Err(error) => agent.workspace.error = Some(error.to_string()),
-            }
-        }
-
         let current_agent = if agents.is_empty() { None } else { Some(0) };
         let chat_sidebar_index = if agents.is_empty() {
             0
@@ -686,7 +572,14 @@ impl App {
             current_agent.map(|index| index + 1).unwrap_or(0)
         };
 
-        Self {
+        let app = Self {
+            shell: AppShell {
+                current_tab: AppTab::Chat,
+                current_agent,
+                chat_sidebar_index,
+                model_picker: None,
+                add_form: AddAgentForm::default(),
+            },
             config_path,
             config,
             lsp_servers,
@@ -694,23 +587,45 @@ impl App {
             default_chat_model,
             default_chat_reasoning_effort,
             chat_model_label: default_chat_model_label,
-            current_tab: AppTab::Chat,
-            current_agent,
-            chat_sidebar_index,
             chat_input: String::new(),
-            model_picker: None,
-            add_form: AddAgentForm::default(),
             spinner_index: 0,
             status_message: None,
             last_mouse_scroll: None,
             active_scrollbar_drag: None,
             active_workspace_selection_drag: false,
-            last_workspace_refresh_at: None,
             shell_runtimes: HashMap::new(),
             lsp_runtimes: HashMap::new(),
+            lsp_starting: HashSet::new(),
+            pending_lsp_commands: HashMap::new(),
             pending_workspace_hover: None,
-            workspace_refresh_in_flight: false,
+            workspace_refresh_in_flight: HashSet::new(),
+            workspace_watchers: HashMap::new(),
             pending_effects: VecDeque::new(),
+        };
+
+        #[cfg(test)]
+        let app = {
+            let mut app = app;
+            app.hydrate_workspace_snapshots_for_tests();
+            app
+        };
+
+        app
+    }
+
+    #[cfg(test)]
+    fn hydrate_workspace_snapshots_for_tests(&mut self) {
+        for agent in &mut self.agents {
+            let root = agent.definition.workspace.clone();
+            match FileBrowserState::scan_entries(&root).and_then(|entries| {
+                agent
+                    .workspace
+                    .apply_scanned_entries_without_io(entries)
+                    .map(|_| ())
+            }) {
+                Ok(()) => {}
+                Err(error) => agent.workspace.error = Some(error.to_string()),
+            }
         }
     }
 

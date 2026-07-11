@@ -1,9 +1,114 @@
 use anyhow::{Context, Result, anyhow};
+use serde::Deserialize;
 use serde_json::Value;
 use std::{fs, path::PathBuf};
 use url::Url;
 
 use super::{DefinitionTarget, EditorCompletionItem, EditorPosition};
+
+#[derive(Debug, Deserialize)]
+struct HoverResponseDto {
+    contents: Option<HoverContentsDto>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum HoverContentsDto {
+    Text(String),
+    Marked(MarkedStringDto),
+    Many(Vec<HoverContentsDto>),
+}
+
+#[derive(Debug, Deserialize)]
+struct MarkedStringDto {
+    #[serde(default)]
+    language: Option<String>,
+    value: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum CompletionResponseDto {
+    Items(Vec<CompletionItemDto>),
+    List(CompletionListDto),
+}
+
+#[derive(Debug, Deserialize)]
+struct CompletionListDto {
+    #[serde(default)]
+    items: Vec<CompletionItemDto>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompletionItemDto {
+    label: String,
+    #[serde(default)]
+    detail: Option<String>,
+    #[serde(default)]
+    preselect: bool,
+    #[serde(rename = "insertTextFormat", default)]
+    insert_text_format: Option<u64>,
+    #[serde(rename = "insertText", default)]
+    insert_text: Option<String>,
+    #[serde(rename = "textEdit", default)]
+    text_edit: Option<CompletionTextEditDto>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum CompletionTextEditDto {
+    Range {
+        range: LspRangeDto,
+        #[serde(rename = "newText")]
+        new_text: String,
+    },
+    InsertReplace {
+        insert: LspRangeDto,
+        replace: LspRangeDto,
+        #[serde(rename = "newText")]
+        new_text: String,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+struct LspRangeDto {
+    start: LspPositionDto,
+    end: LspPositionDto,
+}
+
+#[derive(Debug, Deserialize)]
+struct LspPositionDto {
+    line: usize,
+    character: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum DefinitionResponseDto {
+    One(DefinitionTargetDto),
+    Many(Vec<DefinitionTargetDto>),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum DefinitionTargetDto {
+    Location(DefinitionLocationDto),
+    Link(DefinitionLinkDto),
+}
+
+#[derive(Debug, Deserialize)]
+struct DefinitionLocationDto {
+    uri: String,
+    range: LspRangeDto,
+}
+
+#[derive(Debug, Deserialize)]
+struct DefinitionLinkDto {
+    #[serde(rename = "targetUri")]
+    target_uri: String,
+    #[serde(rename = "targetSelectionRange", alias = "targetRange")]
+    target_selection_range: LspRangeDto,
+}
 
 pub fn summarize_hover_text(text: &str) -> Option<String> {
     let mut lines = Vec::new();
@@ -71,7 +176,31 @@ pub fn summarize_hover_text(text: &str) -> Option<String> {
 }
 
 pub fn parse_hover_response(value: &Value) -> Option<String> {
-    hover_value_to_text(value.get("contents")?)
+    let response: HoverResponseDto = serde_json::from_value(value.clone()).ok()?;
+    hover_dto_to_text(response.contents?)
+}
+
+fn hover_dto_to_text(value: HoverContentsDto) -> Option<String> {
+    match value {
+        HoverContentsDto::Text(text) => Some(text),
+        HoverContentsDto::Marked(marked) => {
+            let language = marked.language.as_deref().unwrap_or_default().trim();
+            if language.is_empty() {
+                Some(marked.value)
+            } else {
+                Some(format!("```{language}\n{}\n```", marked.value))
+            }
+        }
+        HoverContentsDto::Many(items) => {
+            let joined = items
+                .into_iter()
+                .filter_map(hover_dto_to_text)
+                .filter(|text| !text.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            (!joined.is_empty()).then_some(joined)
+        }
+    }
 }
 
 pub fn parse_completion_response(
@@ -79,93 +208,50 @@ pub fn parse_completion_response(
     source: &str,
     position: EditorPosition,
 ) -> Vec<EditorCompletionItem> {
-    match value {
-        Value::Array(items) => items
-            .iter()
-            .filter_map(|item| parse_completion_item(item, source, position))
-            .collect(),
-        Value::Object(map) => map
-            .get("items")
-            .and_then(Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|item| parse_completion_item(item, source, position))
-                    .collect()
-            })
-            .unwrap_or_default(),
-        _ => Vec::new(),
-    }
-}
-
-fn hover_value_to_text(value: &Value) -> Option<String> {
-    match value {
-        Value::Null => None,
-        Value::String(text) => Some(text.clone()),
-        Value::Array(items) => {
-            let joined = items
-                .iter()
-                .filter_map(hover_value_to_text)
-                .filter(|text| !text.trim().is_empty())
-                .collect::<Vec<_>>()
-                .join("\n\n");
-            (!joined.is_empty()).then_some(joined)
-        }
-        Value::Object(map) => map
-            .get("language")
-            .and_then(Value::as_str)
-            .zip(map.get("value").and_then(Value::as_str))
-            .map(|(language, value)| {
-                let language = language.trim();
-                if language.is_empty() {
-                    format!("```\n{value}\n```")
-                } else {
-                    format!("```{language}\n{value}\n```")
-                }
-            })
-            .or_else(|| map.get("value").and_then(Value::as_str).map(str::to_string)),
-        _ => None,
-    }
+    let response: CompletionResponseDto = match serde_json::from_value(value.clone()) {
+        Ok(response) => response,
+        Err(_) => return Vec::new(),
+    };
+    let items = match response {
+        CompletionResponseDto::Items(items) => items,
+        CompletionResponseDto::List(list) => list.items,
+    };
+    items
+        .into_iter()
+        .filter_map(|item| parse_completion_item(item, source, position))
+        .collect()
 }
 
 fn parse_completion_item(
-    value: &Value,
+    item: CompletionItemDto,
     source: &str,
     position: EditorPosition,
 ) -> Option<EditorCompletionItem> {
-    let map = value.as_object()?;
-    let label = map.get("label")?.as_str()?.trim().to_string();
+    let CompletionItemDto {
+        label: raw_label,
+        detail: raw_detail,
+        preselect,
+        insert_text_format,
+        insert_text,
+        text_edit,
+    } = item;
+    let label = raw_label.trim().to_string();
     if label.is_empty() {
         return None;
     }
 
-    let detail = map
-        .get("detail")
-        .and_then(Value::as_str)
+    let detail = raw_detail
+        .as_deref()
         .map(str::trim)
         .filter(|detail| !detail.is_empty())
         .map(ToString::to_string);
-    let preselected = map
-        .get("preselect")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let insert_text_format = map
-        .get("insertTextFormat")
-        .and_then(Value::as_u64)
-        .unwrap_or(1);
-
-    let text_edit = map.get("textEdit");
     let (replace_start, replace_end, edit_text) = parse_completion_text_edit(text_edit, source)
         .unwrap_or_else(|| {
             let default_range = default_completion_range(source, position);
-            let text = map
-                .get("insertText")
-                .and_then(Value::as_str)
-                .unwrap_or(label.as_str())
-                .to_string();
+            let text = insert_text.unwrap_or_else(|| label.clone());
             (default_range.0, default_range.1, text)
         });
-    let insert_text = if insert_text_format == 2 {
+    let insert_text = if insert_text_format == Some(2) {
         normalize_completion_snippet(&edit_text)
     } else {
         edit_text
@@ -177,44 +263,40 @@ fn parse_completion_item(
         insert_text,
         replace_start,
         replace_end,
-        preselected,
+        preselected: preselect,
     })
 }
 
 fn parse_completion_text_edit(
-    value: Option<&Value>,
+    value: Option<CompletionTextEditDto>,
     source: &str,
 ) -> Option<(EditorPosition, EditorPosition, String)> {
-    let map = value?.as_object()?;
-    let new_text = map.get("newText")?.as_str()?.to_string();
-    let range = map
-        .get("range")
-        .or_else(|| map.get("replace"))
-        .or_else(|| map.get("insert"))?;
-    let (start, end) = parse_lsp_range(source, range)?;
-    Some((start, end, new_text))
+    match value? {
+        CompletionTextEditDto::Range { range, new_text } => {
+            let (start, end) = parse_lsp_range(source, &range)?;
+            Some((start, end, new_text))
+        }
+        CompletionTextEditDto::InsertReplace {
+            insert,
+            replace,
+            new_text,
+        } => {
+            let (start, end) =
+                parse_lsp_range(source, &replace).or_else(|| parse_lsp_range(source, &insert))?;
+            Some((start, end, new_text))
+        }
+    }
 }
 
-fn parse_lsp_range(source: &str, range: &Value) -> Option<(EditorPosition, EditorPosition)> {
-    let start = range.get("start")?;
-    let end = range.get("end")?;
-
+fn parse_lsp_range(source: &str, range: &LspRangeDto) -> Option<(EditorPosition, EditorPosition)> {
     Some((
         EditorPosition {
-            row: start.get("line")?.as_u64()? as usize,
-            col: char_column_from_utf16(
-                source,
-                start.get("line")?.as_u64()? as usize,
-                start.get("character")?.as_u64()? as usize,
-            ),
+            row: range.start.line,
+            col: char_column_from_utf16(source, range.start.line, range.start.character),
         },
         EditorPosition {
-            row: end.get("line")?.as_u64()? as usize,
-            col: char_column_from_utf16(
-                source,
-                end.get("line")?.as_u64()? as usize,
-                end.get("character")?.as_u64()? as usize,
-            ),
+            row: range.end.line,
+            col: char_column_from_utf16(source, range.end.line, range.end.character),
         },
     ))
 }
@@ -306,7 +388,7 @@ fn snippet_placeholder_text(source: &str) -> String {
 }
 
 pub fn parse_definition_response(value: &Value) -> Result<Option<DefinitionTarget>> {
-    let Some(location) = first_definition_location(value) else {
+    let Some(location) = parse_definition_location(value)? else {
         return Ok(None);
     };
 
@@ -324,46 +406,34 @@ pub fn parse_definition_response(value: &Value) -> Result<Option<DefinitionTarge
 }
 
 #[derive(Debug, Clone)]
-struct RawDefinitionLocation {
-    uri: String,
-    line: usize,
-    character: usize,
+pub(super) struct RawDefinitionLocation {
+    pub(super) uri: String,
+    pub(super) line: usize,
+    pub(super) character: usize,
 }
 
-fn first_definition_location(value: &Value) -> Option<RawDefinitionLocation> {
-    match value {
-        Value::Null => None,
-        Value::Array(items) => items.iter().find_map(first_definition_location),
-        Value::Object(map) => {
-            if let Some(uri) = map.get("uri").and_then(Value::as_str) {
-                let range = map.get("range")?;
-                return extract_definition_location(uri, range);
-            }
-
-            let uri = map.get("targetUri").and_then(Value::as_str)?;
-            let range = map
-                .get("targetSelectionRange")
-                .or_else(|| map.get("targetRange"))?;
-            extract_definition_location(uri, range)
-        }
-        _ => None,
-    }
+pub(super) fn parse_definition_location(value: &Value) -> Result<Option<RawDefinitionLocation>> {
+    let response: DefinitionResponseDto = serde_json::from_value(value.clone())?;
+    let target = match response {
+        DefinitionResponseDto::One(target) => Some(target),
+        DefinitionResponseDto::Many(targets) => targets.into_iter().next(),
+    };
+    Ok(target.map(|target| match target {
+        DefinitionTargetDto::Location(location) => RawDefinitionLocation {
+            uri: location.uri,
+            line: location.range.start.line,
+            character: location.range.start.character,
+        },
+        DefinitionTargetDto::Link(link) => RawDefinitionLocation {
+            uri: link.target_uri,
+            line: link.target_selection_range.start.line,
+            character: link.target_selection_range.start.character,
+        },
+    }))
 }
 
-fn extract_definition_location(uri: &str, range: &Value) -> Option<RawDefinitionLocation> {
-    let start = range.get("start")?;
-    Some(RawDefinitionLocation {
-        uri: uri.to_string(),
-        line: start.get("line")?.as_u64()? as usize,
-        character: start.get("character")?.as_u64()? as usize,
-    })
-}
-
-fn file_path_from_uri(uri: String) -> Result<PathBuf> {
-    Url::parse(&uri)
-        .context("invalid LSP file URI")?
-        .to_file_path()
-        .map_err(|_| anyhow!("definition target is not a local file"))
+fn normalize_newlines(source: &str) -> String {
+    source.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 pub fn utf16_column(source: &str, position: EditorPosition) -> usize {
@@ -393,6 +463,9 @@ pub fn char_column_from_utf16(source: &str, row: usize, utf16_col: usize) -> usi
     chars
 }
 
-fn normalize_newlines(source: &str) -> String {
-    source.replace("\r\n", "\n").replace('\r', "\n")
+fn file_path_from_uri(uri: String) -> Result<PathBuf> {
+    Url::parse(&uri)
+        .context("invalid LSP file URI")?
+        .to_file_path()
+        .map_err(|_| anyhow!("definition target is not a local file"))
 }

@@ -1,8 +1,8 @@
 use super::super::*;
-use super::{GitDiffComponent, WorkspaceComponent};
+use super::{GitDiffComponent, WorkspaceScreen};
 use crate::workspace::editor_keymap::{self, EditorKeyAction};
 
-impl WorkspaceComponent {
+impl WorkspaceScreen {
     pub(super) fn handle_completion_key(
         workspace: &mut FileBrowserState,
         key: KeyEvent,
@@ -43,7 +43,7 @@ impl WorkspaceComponent {
             .workspace
             .editor
             .as_ref()
-            .and_then(|editor| editor_keymap::map_key(editor.mode, key, page_step));
+            .and_then(|editor| editor_keymap::map_key(&editor.mode, key, page_step));
         let Some(action) = action else {
             return false;
         };
@@ -62,14 +62,12 @@ impl WorkspaceComponent {
                 EditorKeyAction::Copy => request_copy = true,
                 EditorKeyAction::Paste => request_paste = true,
                 EditorKeyAction::CommandCancel => editor.cancel_command(),
-                EditorKeyAction::CommandBackspace => {
-                    editor.command.pop();
-                }
+                EditorKeyAction::CommandBackspace => editor.pop_command_char(),
                 EditorKeyAction::CommandSubmit => match editor.execute_command() {
                     Ok(result) => command_result = Some(result),
                     Err(error) => editor.status = Some(error.to_string()),
                 },
-                EditorKeyAction::CommandInsert(character) => editor.command.push(character),
+                EditorKeyAction::CommandInsert(character) => editor.push_command_char(character),
                 EditorKeyAction::Consume => {}
             }
             editor.clear_hover();

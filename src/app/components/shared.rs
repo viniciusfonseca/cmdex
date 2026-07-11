@@ -387,3 +387,83 @@ impl UiSupport {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::*;
+    use crate::app::ScrollbarMetrics;
+    use ratatui::{
+        layout::Rect,
+        text::{Line, Text},
+    };
+
+    #[test]
+    fn wrapped_text_height_matches_paragraph_word_wrapping() {
+        let text = Text::from(vec![Line::from("abc def ghi")]);
+        assert_eq!(UiSupport::wrapped_text_height(&text, 6), 3);
+    }
+
+    #[test]
+    fn list_offset_keeps_long_lists_selection_visible() {
+        assert_eq!(UiSupport::list_offset(0, 10, 4), 0);
+        assert_eq!(UiSupport::list_offset(3, 10, 4), 0);
+        assert_eq!(UiSupport::list_offset(4, 10, 4), 1);
+        assert_eq!(UiSupport::list_offset(9, 10, 4), 6);
+    }
+
+    #[test]
+    fn vertical_scrollbar_track_stays_inside_container_border() {
+        let metrics = UiSupport::vertical_scrollbar_metrics(Rect::new(10, 5, 20, 8), 32)
+            .expect("scrollbar metrics");
+        assert_eq!(metrics.track, Rect::new(28, 6, 1, 6));
+    }
+
+    #[test]
+    fn scrollbar_drag_maps_mouse_row_to_scroll_position() {
+        let metrics = ScrollbarMetrics {
+            track: Rect::new(0, 10, 1, 6),
+            content_length: 30,
+            viewport_length: 6,
+        };
+        assert_eq!(UiSupport::scroll_position_from_row(metrics, 10), 0);
+        assert_eq!(UiSupport::scroll_position_from_row(metrics, 13), 14);
+        assert_eq!(UiSupport::scroll_position_from_row(metrics, 15), 24);
+    }
+
+    #[test]
+    fn scrollbar_drag_keeps_cursor_at_thumb_center() {
+        let metrics = ScrollbarMetrics {
+            track: Rect::new(0, 10, 1, 6),
+            content_length: 8,
+            viewport_length: 4,
+        };
+        let (thumb_top, thumb_height) =
+            UiSupport::scrollbar_thumb_bounds(metrics, 3).expect("thumb bounds");
+        let cursor_row = metrics.track.y + thumb_top + thumb_height / 2;
+        assert_eq!(UiSupport::scroll_position_from_row(metrics, cursor_row), 3);
+    }
+
+    #[test]
+    fn scrollbar_thumb_reaches_bottom_at_max_scroll() {
+        let metrics = ScrollbarMetrics {
+            track: Rect::new(0, 10, 1, 6),
+            content_length: 8,
+            viewport_length: 4,
+        };
+        let (thumb_top, thumb_height) =
+            UiSupport::scrollbar_thumb_bounds(metrics, 4).expect("thumb bounds");
+        assert_eq!(thumb_top + thumb_height, metrics.track.height);
+    }
+
+    #[test]
+    fn scrollable_content_height_accounts_for_scrollbar_width() {
+        let area = Rect::new(0, 0, 6, 3);
+        let lines = vec![Line::from("1234567")];
+        let text = Text::from(lines.clone());
+        assert_eq!(
+            UiSupport::scrollable_preview_content_height(&lines, area),
+            3
+        );
+        assert_eq!(UiSupport::scrollable_text_height(&text, area), 3);
+    }
+}

@@ -1,5 +1,5 @@
 use super::super::*;
-use super::{UiSupport, WorkspaceComponent};
+use super::{UiSupport, WorkspaceScreen};
 
 pub(in crate::app) struct WorkspaceSidebarComponent;
 
@@ -100,10 +100,10 @@ impl WorkspaceSidebarComponent {
             }
         }
         if request_open {
-            WorkspaceComponent::request_open_editor(app, agent_index);
+            WorkspaceScreen::request_open_editor(app, agent_index);
         }
         if let Some(position) = search_position {
-            WorkspaceComponent::request_open_editor_at(app, agent_index, Some(position));
+            WorkspaceScreen::request_open_editor_at(app, agent_index, Some(position));
         }
     }
 

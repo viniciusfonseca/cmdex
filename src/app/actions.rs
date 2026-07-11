@@ -1,8 +1,7 @@
 use super::{
-    chat::ModelCommand,
     components::*,
     input::{AppInput, AppOutcome},
-    lsp, *,
+    *,
 };
 
 impl App {
@@ -49,8 +48,8 @@ impl App {
             needs_redraw = true;
         }
 
-        let search_requested = WorkspaceComponent::maybe_search(self);
-        WorkspaceComponent::maybe_refresh(self) || search_requested || needs_redraw
+        let search_requested = WorkspaceScreen::maybe_search(self);
+        search_requested || needs_redraw
     }
 
     pub(super) fn tick_interval(&self) -> Duration {
@@ -82,25 +81,31 @@ impl App {
         }
     }
 
-    pub(super) fn shutdown_shell_sessions(&mut self) {
-        let pids = self
-            .shell_runtimes
+    pub(super) fn shutdown_shell_sessions(&mut self) -> Vec<effects::AppEffect> {
+        self.shell_runtimes
             .drain()
             .map(|(_, runtime)| runtime.pid)
             .filter(|pid| *pid != 0)
-            .collect::<Vec<_>>();
-
-        for pid in pids {
-            let _ = std::process::Command::new("kill")
-                .args(["-TERM", &pid.to_string()])
-                .status();
-        }
+            .map(|pid| effects::AppEffect::StopShellSession { pid })
+            .collect()
     }
 
-    pub(super) fn shutdown_lsp_sessions(&mut self) {
-        for (_, runtime) in self.lsp_runtimes.drain() {
-            let _ = runtime.command_tx.send(lsp::LspCommand::Shutdown);
-        }
+    pub(super) fn shutdown_lsp_sessions(&mut self) -> Vec<effects::AppEffect> {
+        self.lsp_starting.clear();
+        self.pending_lsp_commands.clear();
+        self.lsp_runtimes
+            .drain()
+            .map(|(_, runtime)| effects::AppEffect::StopLspSession {
+                command_tx: runtime.command_tx,
+            })
+            .collect()
+    }
+
+    pub(super) fn shutdown_workspace_watchers(&mut self) -> Vec<effects::AppEffect> {
+        self.workspace_watchers
+            .drain()
+            .map(|(_, stop_tx)| effects::AppEffect::StopWorkspaceWatcher { stop_tx })
+            .collect()
     }
 
     pub(super) fn handle_key(
@@ -110,42 +115,21 @@ impl App {
         ui_tx: &mpsc::UnboundedSender<UiEvent>,
         area: Rect,
     ) -> Option<AppExit> {
-        match ChatComponent::handle_model_picker_key(self, key) {
-            ModelPickerAction::NotOpen => {}
-            ModelPickerAction::Handled => return None,
-            ModelPickerAction::Apply {
-                agent_index,
-                model,
-                effort,
-            } => {
-                if self.current_agent == Some(agent_index) {
-                    ChatComponent::submit_model_command(
-                        self,
-                        ModelCommand::Set {
-                            model: Some(model),
-                            effort,
-                        },
-                    );
-                }
-                return None;
-            }
+        if ChatComponent::handle_key(self, key) {
+            return None;
         }
-        if self.current_tab == AppTab::Workspace {
-            self.clear_workspace_hover();
-            if WorkspaceComponent::handle_completion_request(self, key, ui_tx) {
-                return None;
-            }
+        if AddAgentDialogComponent::handle_key(self, key, codex, ui_tx.clone()) {
+            return None;
         }
-        if WorkspaceComponent::handle_key(self, key, area) {
+        if WorkspaceScreen::handle_key_with_context(self, key, ui_tx, area) {
             return None;
         }
         if GitDiffComponent::handle_key(self, key) {
             return None;
         }
-        if self.current_tab == AppTab::Chat && ChatComponent::handle_queue_key(self, key) {
+        if ShellComponent::handle_key(self, key, ui_tx.clone()) {
             return None;
         }
-
         match key.code {
             KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 Some(AppExit::Quit)
@@ -180,14 +164,6 @@ impl App {
                 TopNavigationComponent::activate_tab(self, tab, ui_tx.clone());
                 None
             }
-            KeyCode::Enter
-                if self.current_tab == AppTab::Chat
-                    && !self.add_agent_selected()
-                    && key.modifiers.contains(KeyModifiers::SHIFT) =>
-            {
-                self.chat_input.push('\n');
-                None
-            }
             KeyCode::Up => {
                 self.move_selection_up();
                 None
@@ -198,7 +174,11 @@ impl App {
             }
             KeyCode::PageUp => {
                 if self.current_tab == AppTab::Chat && !self.add_agent_selected() {
-                    self.scroll_chat_up(self.compute_layout(area).body, CONTENT_SCROLL_STEP);
+                    ChatComponent::scroll_up(
+                        self,
+                        self.compute_layout(area).body,
+                        CONTENT_SCROLL_STEP,
+                    );
                 } else {
                     self.scroll_content_up(self.compute_layout(area).body);
                 }
@@ -206,7 +186,11 @@ impl App {
             }
             KeyCode::PageDown => {
                 if self.current_tab == AppTab::Chat && !self.add_agent_selected() {
-                    self.scroll_chat_down(self.compute_layout(area).body, CONTENT_SCROLL_STEP);
+                    ChatComponent::scroll_down(
+                        self,
+                        self.compute_layout(area).body,
+                        CONTENT_SCROLL_STEP,
+                    );
                 } else {
                     self.scroll_content_down(self.compute_layout(area).body);
                 }
@@ -214,37 +198,6 @@ impl App {
             }
             KeyCode::F(5) => {
                 TopNavigationComponent::refresh_current_tab(self);
-                None
-            }
-            KeyCode::Esc if self.add_agent_selected() => {
-                self.add_form = AddAgentForm::default();
-                if !self.agents.is_empty() {
-                    self.chat_sidebar_index =
-                        self.current_agent.map(|index| index + 1).unwrap_or(0);
-                }
-                None
-            }
-            KeyCode::Esc if self.current_tab == AppTab::Chat => {
-                ChatComponent::interrupt_active_turn(self);
-                None
-            }
-            KeyCode::Tab if self.add_agent_selected() => {
-                self.add_form.active_field = match self.add_form.active_field {
-                    AddAgentField::Name => AddAgentField::Workspace,
-                    AddAgentField::Workspace => AddAgentField::Name,
-                };
-                None
-            }
-            KeyCode::Enter if self.add_agent_selected() => {
-                AddAgentDialogComponent::submit(self, codex.clone(), ui_tx.clone());
-                None
-            }
-            KeyCode::Enter if self.current_tab == AppTab::Chat => {
-                ChatComponent::submit_message(self);
-                None
-            }
-            KeyCode::Enter if self.current_tab == AppTab::Shell => {
-                ShellComponent::submit_command(self, ui_tx.clone());
                 None
             }
             KeyCode::Backspace => {
@@ -260,91 +213,22 @@ impl App {
     }
 
     pub(super) fn handle_text_input(&mut self, character: char) {
-        if self.add_agent_selected() {
-            self.add_form.error = None;
-            match self.add_form.active_field {
-                AddAgentField::Name => self.add_form.name.push(character),
-                AddAgentField::Workspace => self.add_form.workspace.push(character),
-            }
-        } else if self.current_tab == AppTab::Workspace {
-            self.clear_workspace_hover();
-            if let Some(agent) = self.active_agent_mut() {
-                if agent.workspace.sidebar_focused()
-                    && agent.workspace.sidebar_tab == WorkspaceSidebarTab::Search
-                {
-                    agent.workspace.push_search_char(character);
-                    return;
-                }
-                if let Some(editor) = agent.workspace.editor.as_mut() {
-                    editor.clear_completion();
-                    match editor.mode {
-                        EditorMode::Insert => editor.insert_char(character),
-                        EditorMode::Command => editor.command.push(character),
-                        EditorMode::Normal | EditorMode::Visual => {}
-                    }
-                }
-            }
-        } else if self.current_tab == AppTab::Shell {
-            if let Some(agent) = self.active_agent_mut() {
-                agent.shell_tab.input.push(character);
-                if let Some(session) = agent.shell_tab.selected_session_mut() {
-                    session.scroll = u16::MAX;
-                }
-            }
-        } else if self.current_tab == AppTab::GitDiff {
-            if let Some(agent) = self.active_agent_mut() {
-                agent.git_diff.commit_message.push(character);
-                agent.git_diff.error = None;
-            }
-        } else if self.current_tab == AppTab::Chat {
-            self.chat_input.push(character);
+        if AddAgentDialogComponent::handle_text_input(self, character) {
+            return;
         }
+        let _ = WorkspaceScreen::handle_text_input(self, character)
+            || ShellComponent::handle_text_input(self, character)
+            || GitDiffComponent::handle_text_input(self, character)
+            || ChatComponent::handle_text_input(self, character);
     }
 
     fn handle_backspace(&mut self) {
-        if self.add_agent_selected() {
-            match self.add_form.active_field {
-                AddAgentField::Name => {
-                    self.add_form.name.pop();
-                }
-                AddAgentField::Workspace => {
-                    self.add_form.workspace.pop();
-                }
-            }
-        } else if self.current_tab == AppTab::Workspace {
-            self.clear_workspace_hover();
-            if let Some(agent) = self.active_agent_mut() {
-                if agent.workspace.sidebar_focused()
-                    && agent.workspace.sidebar_tab == WorkspaceSidebarTab::Search
-                {
-                    agent.workspace.pop_search_char();
-                    return;
-                }
-                if let Some(editor) = agent.workspace.editor.as_mut() {
-                    editor.clear_completion();
-                    match editor.mode {
-                        EditorMode::Insert => editor.backspace(),
-                        EditorMode::Command => {
-                            editor.command.pop();
-                        }
-                        EditorMode::Normal | EditorMode::Visual => {}
-                    }
-                }
-            }
-        } else if self.current_tab == AppTab::Shell {
-            if let Some(agent) = self.active_agent_mut() {
-                agent.shell_tab.input.pop();
-                if let Some(session) = agent.shell_tab.selected_session_mut() {
-                    session.scroll = u16::MAX;
-                }
-            }
-        } else if self.current_tab == AppTab::GitDiff {
-            if let Some(agent) = self.active_agent_mut() {
-                agent.git_diff.commit_message.pop();
-                agent.git_diff.error = None;
-            }
-        } else if self.current_tab == AppTab::Chat {
-            self.chat_input.pop();
+        if AddAgentDialogComponent::handle_backspace(self) {
+            return;
         }
+        let _ = WorkspaceScreen::handle_backspace(self)
+            || ShellComponent::handle_backspace(self)
+            || GitDiffComponent::handle_backspace(self)
+            || ChatComponent::handle_backspace(self);
     }
 }

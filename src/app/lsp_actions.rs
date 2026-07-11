@@ -1,33 +1,44 @@
-use super::{lsp, *};
+use super::{effects::AppEffect, lsp, *};
 
 impl App {
-    fn lsp_command_tx(
+    fn enqueue_lsp_command(
         &mut self,
         agent_index: usize,
         server_index: usize,
-        ui_tx: &mpsc::UnboundedSender<UiEvent>,
-    ) -> anyhow::Result<std::sync::mpsc::Sender<lsp::LspCommand>> {
+        command: lsp::LspCommand,
+    ) {
         let key = LspRuntimeKey {
             agent_index,
             server_index,
         };
+
         if let Some(runtime) = self.lsp_runtimes.get(&key) {
-            return Ok(runtime.command_tx.clone());
+            self.enqueue_effect(AppEffect::SendLspCommand {
+                agent_index,
+                server_index,
+                command_tx: runtime.command_tx.clone(),
+                command,
+            });
+            return;
         }
 
-        let workspace_root = self.agents[agent_index].definition.workspace.clone();
+        if !self.lsp_starting.insert(key) {
+            self.pending_lsp_commands
+                .entry(key)
+                .or_default()
+                .push(command);
+            return;
+        }
+
+        let workspace = self.agents[agent_index].definition.workspace.clone();
         let server = self.lsp_servers[server_index].clone();
-        let command_tx =
-            lsp::LspRuntimeFactory::spawn(&workspace_root, server, agent_index, ui_tx.clone())?;
-        self.lsp_runtimes.insert(
-            key,
-            LspRuntime {
-                command_tx: command_tx.clone(),
-                server_name: self.lsp_servers[server_index].name.clone(),
-                starting: true,
-            },
-        );
-        Ok(command_tx)
+        self.enqueue_effect(AppEffect::StartLspSession {
+            agent_index,
+            server_index,
+            workspace,
+            server,
+            command,
+        });
     }
 
     fn lsp_server_index_for_path(&self, path: &std::path::Path) -> Option<usize> {
@@ -65,44 +76,21 @@ impl App {
         path: PathBuf,
         source: String,
         position: EditorPosition,
-        ui_tx: &mpsc::UnboundedSender<UiEvent>,
+        _ui_tx: &mpsc::UnboundedSender<UiEvent>,
     ) {
         let Some(server_index) = self.lsp_server_index_for_path(&path) else {
             return;
         };
-        let server_name = self.lsp_servers[server_index].name.clone();
-
-        let command_tx = match self.lsp_command_tx(agent_index, server_index, ui_tx) {
-            Ok(command_tx) => command_tx,
-            Err(error) => {
-                if let Some(agent) = self.agents.get_mut(agent_index)
-                    && let Some(editor) = agent.workspace.editor.as_mut()
-                {
-                    editor.status = Some(error.to_string());
-                }
-                return;
-            }
-        };
-
-        if command_tx
-            .send(lsp::LspCommand::Hover {
+        self.enqueue_lsp_command(
+            agent_index,
+            server_index,
+            lsp::LspCommand::Hover {
                 agent_index,
                 path,
                 source,
                 position,
-            })
-            .is_err()
-        {
-            self.lsp_runtimes.remove(&LspRuntimeKey {
-                agent_index,
-                server_index,
-            });
-            if let Some(agent) = self.agents.get_mut(agent_index)
-                && let Some(editor) = agent.workspace.editor.as_mut()
-            {
-                editor.status = Some(format!("Failed to send hover request to {}", server_name));
-            }
-        }
+            },
+        );
     }
 
     pub(super) fn request_lsp_definition(
@@ -111,53 +99,22 @@ impl App {
         path: PathBuf,
         source: String,
         position: EditorPosition,
-        ui_tx: &mpsc::UnboundedSender<UiEvent>,
+        _ui_tx: &mpsc::UnboundedSender<UiEvent>,
     ) {
         let Some(server_index) = self.lsp_server_index_for_path(&path) else {
-            let error_message = self.lsp_server_error_for_path(&path);
-            if let Some(agent) = self.agents.get_mut(agent_index)
-                && let Some(editor) = agent.workspace.editor.as_mut()
-            {
-                editor.status = Some(error_message);
-            }
+            self.set_lsp_editor_status(agent_index, self.lsp_server_error_for_path(&path));
             return;
         };
-        let server_name = self.lsp_servers[server_index].name.clone();
-
-        let command_tx = match self.lsp_command_tx(agent_index, server_index, ui_tx) {
-            Ok(command_tx) => command_tx,
-            Err(error) => {
-                if let Some(agent) = self.agents.get_mut(agent_index)
-                    && let Some(editor) = agent.workspace.editor.as_mut()
-                {
-                    editor.status = Some(error.to_string());
-                }
-                return;
-            }
-        };
-
-        if command_tx
-            .send(lsp::LspCommand::Definition {
+        self.enqueue_lsp_command(
+            agent_index,
+            server_index,
+            lsp::LspCommand::Definition {
                 agent_index,
                 path,
                 source,
                 position,
-            })
-            .is_err()
-        {
-            self.lsp_runtimes.remove(&LspRuntimeKey {
-                agent_index,
-                server_index,
-            });
-            if let Some(agent) = self.agents.get_mut(agent_index)
-                && let Some(editor) = agent.workspace.editor.as_mut()
-            {
-                editor.status = Some(format!(
-                    "Failed to send definition request to {}",
-                    server_name
-                ));
-            }
-        }
+            },
+        );
     }
 
     pub(super) fn request_lsp_completion(
@@ -166,55 +123,34 @@ impl App {
         path: PathBuf,
         source: String,
         position: EditorPosition,
-        ui_tx: &mpsc::UnboundedSender<UiEvent>,
+        _ui_tx: &mpsc::UnboundedSender<UiEvent>,
     ) {
         let Some(server_index) = self.lsp_server_index_for_path(&path) else {
-            let error_message = self.lsp_server_error_for_path(&path);
+            self.set_lsp_editor_status(agent_index, self.lsp_server_error_for_path(&path));
             if let Some(agent) = self.agents.get_mut(agent_index)
                 && let Some(editor) = agent.workspace.editor.as_mut()
             {
-                editor.status = Some(error_message);
                 editor.clear_completion();
             }
             return;
         };
-        let server_name = self.lsp_servers[server_index].name.clone();
-
-        let command_tx = match self.lsp_command_tx(agent_index, server_index, ui_tx) {
-            Ok(command_tx) => command_tx,
-            Err(error) => {
-                if let Some(agent) = self.agents.get_mut(agent_index)
-                    && let Some(editor) = agent.workspace.editor.as_mut()
-                {
-                    editor.status = Some(error.to_string());
-                    editor.clear_completion();
-                }
-                return;
-            }
-        };
-
-        if command_tx
-            .send(lsp::LspCommand::Completion {
+        self.enqueue_lsp_command(
+            agent_index,
+            server_index,
+            lsp::LspCommand::Completion {
                 agent_index,
                 path,
                 source,
                 position,
-            })
-            .is_err()
+            },
+        );
+    }
+
+    pub(super) fn set_lsp_editor_status(&mut self, agent_index: usize, message: String) {
+        if let Some(agent) = self.agents.get_mut(agent_index)
+            && let Some(editor) = agent.workspace.editor.as_mut()
         {
-            self.lsp_runtimes.remove(&LspRuntimeKey {
-                agent_index,
-                server_index,
-            });
-            if let Some(agent) = self.agents.get_mut(agent_index)
-                && let Some(editor) = agent.workspace.editor.as_mut()
-            {
-                editor.status = Some(format!(
-                    "Failed to send completion request to {}",
-                    server_name
-                ));
-                editor.clear_completion();
-            }
+            editor.status = Some(message);
         }
     }
 }

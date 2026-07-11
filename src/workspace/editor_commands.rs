@@ -38,14 +38,14 @@ impl WorkspaceEditorState {
             EditorCommand::EnterVisual => self.enter_visual_mode(),
             EditorCommand::ExitVisual => self.exit_visual_mode(),
             EditorCommand::ExitInsert => {
-                self.mode = EditorMode::Normal;
                 self.clear_selection();
+                self.enter_normal_mode();
             }
             EditorCommand::StartCommand => self.start_command(),
             EditorCommand::DeleteChar => self.delete_char(),
             EditorCommand::DeleteSelection => {
                 self.delete_selection();
-                self.mode = EditorMode::Normal;
+                self.enter_normal_mode();
             }
             EditorCommand::Backspace => self.backspace(),
             EditorCommand::InsertNewline => self.insert_newline(),

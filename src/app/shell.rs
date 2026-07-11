@@ -5,6 +5,7 @@ use std::{
     thread,
 };
 
+use super::event_types::{self, ShellEvent};
 use super::*;
 use anyhow::{Context, Result};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
@@ -281,19 +282,25 @@ impl ShellRuntimeFactory {
             .spawn(move || {
                 for command in command_rx {
                     if let Err(error) = writer.write_all(command.as_bytes()) {
-                        let _ = ui_tx.send(UiEvent::ShellSessionExited {
-                            agent_index,
-                            session_id,
-                            message: format!("Shell PTY write failed: {error}"),
-                        });
+                        event_types::send(
+                            &ui_tx,
+                            ShellEvent::SessionExited {
+                                agent_index,
+                                session_id,
+                                message: format!("Shell PTY write failed: {error}"),
+                            },
+                        );
                         break;
                     }
                     if let Err(error) = writer.flush() {
-                        let _ = ui_tx.send(UiEvent::ShellSessionExited {
-                            agent_index,
-                            session_id,
-                            message: format!("Shell PTY flush failed: {error}"),
-                        });
+                        event_types::send(
+                            &ui_tx,
+                            ShellEvent::SessionExited {
+                                agent_index,
+                                session_id,
+                                message: format!("Shell PTY flush failed: {error}"),
+                            },
+                        );
                         break;
                     }
                 }
@@ -331,11 +338,14 @@ impl ShellRuntimeFactory {
                             }
                         }
                         Err(error) => {
-                            let _ = ui_tx.send(UiEvent::ShellSessionExited {
-                                agent_index,
-                                session_id,
-                                message: format!("Shell PTY read failed: {error}"),
-                            });
+                            event_types::send(
+                                &ui_tx,
+                                ShellEvent::SessionExited {
+                                    agent_index,
+                                    session_id,
+                                    message: format!("Shell PTY read failed: {error}"),
+                                },
+                            );
                             break;
                         }
                     }
@@ -358,11 +368,14 @@ impl ShellRuntimeFactory {
                     Ok(status) => format!("Shell exited with status {}", status),
                     Err(error) => format!("Shell wait failed: {error}"),
                 };
-                let _ = ui_tx.send(UiEvent::ShellSessionExited {
-                    agent_index,
-                    session_id,
-                    message,
-                });
+                event_types::send(
+                    &ui_tx,
+                    ShellEvent::SessionExited {
+                        agent_index,
+                        session_id,
+                        message,
+                    },
+                );
             })
             .context("failed to spawn PTY shell wait thread")?;
         Ok(())
@@ -376,25 +389,34 @@ impl ShellRuntimeFactory {
     ) {
         match record {
             ShellOutputRecord::Ready => {
-                let _ = ui_tx.send(UiEvent::ShellSessionReady {
-                    agent_index,
-                    session_id,
-                });
+                event_types::send(
+                    ui_tx,
+                    ShellEvent::SessionReady {
+                        agent_index,
+                        session_id,
+                    },
+                );
             }
             ShellOutputRecord::Line(line) => {
-                let _ = ui_tx.send(UiEvent::ShellSessionOutput {
-                    agent_index,
-                    session_id,
-                    line,
-                    stderr: false,
-                });
+                event_types::send(
+                    ui_tx,
+                    ShellEvent::SessionOutput {
+                        agent_index,
+                        session_id,
+                        line,
+                        stderr: false,
+                    },
+                );
             }
             ShellOutputRecord::CommandFinished(exit_code) => {
-                let _ = ui_tx.send(UiEvent::ShellSessionCommandFinished {
-                    agent_index,
-                    session_id,
-                    exit_code,
-                });
+                event_types::send(
+                    ui_tx,
+                    ShellEvent::SessionCommandFinished {
+                        agent_index,
+                        session_id,
+                        exit_code,
+                    },
+                );
             }
         }
     }
@@ -500,5 +522,139 @@ impl ShellOutputParser {
                 };
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn display_lines_hides_prompt_while_session_is_running() {
+        let mut shell_tab = ShellTabState::default();
+        let workspace = PathBuf::from("/tmp/project");
+        shell_tab.create_session(&workspace);
+        let session = shell_tab.selected_session_mut().expect("session");
+        session.mark_ready();
+
+        let idle_lines = ShellPresenter::display_lines(session, "ls");
+        assert_eq!(line_text(idle_lines.last().expect("idle prompt")), "$ ls");
+
+        session.append_command("ls");
+        let running_lines = ShellPresenter::display_lines(session, "");
+        assert_eq!(
+            line_text(running_lines.last().expect("running line")),
+            "$ ls"
+        );
+    }
+
+    #[test]
+    fn session_creation_selects_new_session() {
+        let mut shell_tab = ShellTabState::default();
+        let workspace = PathBuf::from("/tmp/project");
+
+        let first = shell_tab.create_session(&workspace);
+        let second = shell_tab.create_session(&workspace);
+
+        assert_eq!(first, 1);
+        assert_eq!(second, 2);
+        assert_eq!(shell_tab.selected_index(), 1);
+        assert_eq!(
+            shell_tab
+                .selected_session()
+                .map(|session| session.title.as_str()),
+            Some("Session 2")
+        );
+    }
+
+    #[test]
+    fn initial_session_is_created_only_once() {
+        let mut shell_tab = ShellTabState::default();
+        let workspace = PathBuf::from("/tmp/project");
+
+        assert_eq!(shell_tab.create_session_if_empty(&workspace), Some(1));
+        assert_eq!(shell_tab.create_session_if_empty(&workspace), None);
+        assert_eq!(shell_tab.sessions.len(), 1);
+        assert_eq!(shell_tab.selected_index(), 0);
+    }
+
+    #[test]
+    fn removing_session_clamps_selection() {
+        let mut shell_tab = ShellTabState::default();
+        let workspace = PathBuf::from("/tmp/project");
+        let first = shell_tab.create_session(&workspace);
+        let second = shell_tab.create_session(&workspace);
+
+        assert_eq!(
+            shell_tab
+                .remove_session_by_id(second)
+                .map(|session| session.id),
+            Some(second)
+        );
+        assert_eq!(shell_tab.sessions.len(), 1);
+        assert_eq!(shell_tab.selected_index(), 0);
+        assert_eq!(
+            shell_tab.selected_session().map(|session| session.id),
+            Some(first)
+        );
+    }
+
+    #[test]
+    fn command_payload_ends_with_newline() {
+        assert_eq!(ShellPresenter::command_payload("pwd"), "pwd\n");
+    }
+
+    #[test]
+    fn output_parser_splits_sentinel_from_same_terminal_line() {
+        let mut parser = ShellOutputParser::new();
+        let records = parser.push("value__CMDEX_DONE__:7\n");
+
+        assert_eq!(records.len(), 2);
+        assert!(matches!(&records[0], ShellOutputRecord::Line(line) if line == "value"));
+        assert!(matches!(records[1], ShellOutputRecord::CommandFinished(7)));
+    }
+
+    #[test]
+    fn output_parser_normalizes_carriage_returns() {
+        let mut parser = ShellOutputParser::new();
+        let records = parser.push("first\rsecond\r__CMDEX_DONE__:0\n");
+
+        assert_eq!(records.len(), 3);
+        assert!(matches!(&records[0], ShellOutputRecord::Line(line) if line == "first"));
+        assert!(matches!(&records[1], ShellOutputRecord::Line(line) if line == "second"));
+        assert!(matches!(records[2], ShellOutputRecord::CommandFinished(0)));
+    }
+
+    #[test]
+    fn output_parser_strips_ansi_sequences_before_rendering() {
+        let mut parser = ShellOutputParser::new();
+        let records = parser.push("\u{1b}[31mred\u{1b}[0m\r\n");
+
+        assert!(matches!(records.as_slice(), [ShellOutputRecord::Line(line)] if line == "red"));
+    }
+
+    #[test]
+    fn output_parser_treats_crlf_as_single_line_break() {
+        let mut parser = ShellOutputParser::new();
+        let records = parser.push("first\r\nsecond\r\n");
+
+        assert_eq!(records.len(), 2);
+        assert!(matches!(&records[0], ShellOutputRecord::Line(line) if line == "first"));
+        assert!(matches!(&records[1], ShellOutputRecord::Line(line) if line == "second"));
+    }
+
+    #[test]
+    fn output_parser_recognizes_ready_sentinel() {
+        let mut parser = ShellOutputParser::new();
+        let records = parser.push("__CMDEX_READY__\r\n");
+
+        assert!(matches!(records.as_slice(), [ShellOutputRecord::Ready]));
     }
 }

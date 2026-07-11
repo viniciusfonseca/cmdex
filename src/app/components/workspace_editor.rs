@@ -34,12 +34,7 @@ impl WorkspaceEditorComponent {
         focused: bool,
         lsp_loading: Option<&str>,
     ) {
-        let mode = match editor.mode {
-            EditorMode::Normal => "NORMAL",
-            EditorMode::Visual => "VISUAL",
-            EditorMode::Insert => "INSERT",
-            EditorMode::Command => "COMMAND",
-        };
+        let mode = editor.mode.label();
         let dirty = if editor.dirty { " [+]" } else { "" };
         let block = UiSupport::focus_block(
             UiSupport::editor_block().title(format!(
@@ -101,17 +96,22 @@ impl WorkspaceEditorComponent {
             return;
         }
 
-        match editor.mode {
-            EditorMode::Command => {
+        match &editor.mode {
+            EditorMode::Command { .. } => {
                 if let Some(status_area) = status_area {
+                    let command_len = editor
+                        .command_buffer()
+                        .map(str::chars)
+                        .map(Iterator::count)
+                        .unwrap_or(0);
                     let x = status_area
                         .x
-                        .saturating_add(1 + editor.command.chars().count() as u16)
+                        .saturating_add(1 + command_len as u16)
                         .min(status_area.x + status_area.width.saturating_sub(1));
                     frame.set_cursor_position((x, status_area.y));
                 }
             }
-            EditorMode::Normal | EditorMode::Visual | EditorMode::Insert => {
+            EditorMode::Normal | EditorMode::Visual { .. } | EditorMode::Insert => {
                 if code_area.width == 0 || code_area.height == 0 {
                     return;
                 }
@@ -191,8 +191,8 @@ impl WorkspaceEditorComponent {
     }
 
     fn status(editor: &WorkspaceEditorState, focused: bool) -> String {
-        if editor.mode == EditorMode::Command {
-            return format!(":{}", editor.command);
+        if let Some(command) = editor.command_buffer() {
+            return format!(":{command}");
         }
 
         if let Some(status) = editor.status.as_deref() {
@@ -207,11 +207,11 @@ impl WorkspaceEditorComponent {
             return "COMPLETION".to_string();
         }
 
-        match editor.mode {
-            EditorMode::Visual => "VISUAL".to_string(),
+        match &editor.mode {
+            EditorMode::Visual { .. } => "VISUAL".to_string(),
             EditorMode::Insert => "INSERT".to_string(),
             EditorMode::Normal => "NORMAL".to_string(),
-            EditorMode::Command => unreachable!("command mode handled above"),
+            EditorMode::Command { .. } => unreachable!("command mode handled above"),
         }
     }
 

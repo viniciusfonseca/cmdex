@@ -13,48 +13,23 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use url::Url;
 
+use super::event_types::{self, LspEvent};
 use super::{EditorCompletionItem, EditorPosition, UiEvent};
 use crate::config::LspServerConfig;
 
 #[path = "lsp_protocol.rs"]
 mod lsp_protocol;
+#[path = "lsp_requests.rs"]
+mod lsp_requests;
+#[path = "lsp_runtime.rs"]
+mod lsp_runtime;
 #[cfg(test)]
 pub(super) use lsp_protocol::char_column_from_utf16;
 pub(super) use lsp_protocol::{
     parse_completion_response, parse_definition_response, parse_hover_response,
     summarize_hover_text, utf16_column,
 };
-
-pub(super) struct LspRuntimeFactory;
-
-#[derive(Debug)]
-pub(super) enum LspCommand {
-    Hover {
-        agent_index: usize,
-        path: PathBuf,
-        source: String,
-        position: EditorPosition,
-    },
-    Definition {
-        agent_index: usize,
-        path: PathBuf,
-        source: String,
-        position: EditorPosition,
-    },
-    Completion {
-        agent_index: usize,
-        path: PathBuf,
-        source: String,
-        position: EditorPosition,
-    },
-    Shutdown,
-}
-
-#[derive(Debug, Clone)]
-struct TrackedDocument {
-    version: i32,
-    source: String,
-}
+pub(super) use lsp_runtime::{LspCommand, LspRuntimeFactory};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct DefinitionTarget {
@@ -70,7 +45,7 @@ struct LspSession {
     incoming: Option<std_mpsc::Receiver<LspIncoming>>,
     reader: Option<thread::JoinHandle<()>>,
     next_request_id: u64,
-    documents: HashMap<PathBuf, TrackedDocument>,
+    document_sync: super::lsp_document::DocumentSync,
     pending_responses: HashMap<u64, Value>,
     pending_notifications: VecDeque<Value>,
     agent_index: usize,
@@ -80,118 +55,6 @@ struct LspSession {
 enum LspIncoming {
     Message(Value),
     Error(String),
-}
-
-impl LspRuntimeFactory {
-    pub(super) fn spawn(
-        workspace_root: &Path,
-        server: LspServerConfig,
-        agent_index: usize,
-        ui_tx: mpsc::UnboundedSender<UiEvent>,
-    ) -> Result<std_mpsc::Sender<LspCommand>> {
-        let workspace_root = workspace_root.to_path_buf();
-        let (command_tx, command_rx) = std_mpsc::channel::<LspCommand>();
-
-        thread::Builder::new()
-            .name(format!(
-                "cmdex-lsp-{}-{}",
-                server.name.clone(),
-                workspace_root
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("workspace")
-            ))
-            .spawn(move || {
-                let mut session =
-                    LspSession::new(workspace_root, server, agent_index, ui_tx.clone());
-
-                while let Ok(command) = command_rx.recv() {
-                    match command {
-                        LspCommand::Hover {
-                            agent_index,
-                            path,
-                            source,
-                            position,
-                        } => match session.hover(&path, &source, position) {
-                            Ok(contents) => {
-                                let _ = ui_tx.send(UiEvent::LspHoverResult {
-                                    agent_index,
-                                    path,
-                                    position,
-                                    contents,
-                                    error: None,
-                                });
-                            }
-                            Err(error) => {
-                                let _ = ui_tx.send(UiEvent::LspHoverResult {
-                                    agent_index,
-                                    path,
-                                    position,
-                                    contents: None,
-                                    error: Some(error.to_string()),
-                                });
-                            }
-                        },
-                        LspCommand::Definition {
-                            agent_index,
-                            path,
-                            source,
-                            position,
-                        } => match session.definition(&path, &source, position) {
-                            Ok(target) => {
-                                let _ = ui_tx.send(UiEvent::LspDefinitionResult {
-                                    agent_index,
-                                    source_path: path,
-                                    _source_position: position,
-                                    target,
-                                    error: None,
-                                });
-                            }
-                            Err(error) => {
-                                let _ = ui_tx.send(UiEvent::LspDefinitionResult {
-                                    agent_index,
-                                    source_path: path,
-                                    _source_position: position,
-                                    target: None,
-                                    error: Some(error.to_string()),
-                                });
-                            }
-                        },
-                        LspCommand::Completion {
-                            agent_index,
-                            path,
-                            source,
-                            position,
-                        } => match session.completion(&path, &source, position) {
-                            Ok(items) => {
-                                let _ = ui_tx.send(UiEvent::LspCompletionResult {
-                                    agent_index,
-                                    path,
-                                    position,
-                                    items,
-                                    error: None,
-                                });
-                            }
-                            Err(error) => {
-                                let _ = ui_tx.send(UiEvent::LspCompletionResult {
-                                    agent_index,
-                                    path,
-                                    position,
-                                    items: Vec::new(),
-                                    error: Some(error.to_string()),
-                                });
-                            }
-                        },
-                        LspCommand::Shutdown => break,
-                    }
-                }
-
-                session.shutdown();
-            })
-            .context("failed to spawn LSP worker thread")?;
-
-        Ok(command_tx)
-    }
 }
 
 impl LspSession {
@@ -209,7 +72,7 @@ impl LspSession {
             incoming: None,
             reader: None,
             next_request_id: 1,
-            documents: HashMap::new(),
+            document_sync: super::lsp_document::DocumentSync::default(),
             pending_responses: HashMap::new(),
             pending_notifications: VecDeque::new(),
             agent_index,
@@ -223,19 +86,7 @@ impl LspSession {
         source: &str,
         position: EditorPosition,
     ) -> Result<Option<String>> {
-        self.ensure_document_synced(path, source)?;
-        let uri = file_uri(path)?;
-        let result = self.request_value(
-            "textDocument/hover",
-            json!({
-                "textDocument": { "uri": uri },
-                "position": {
-                    "line": position.row,
-                    "character": utf16_column(source, position),
-                }
-            }),
-        )?;
-        Ok(parse_hover_response(&result).and_then(|text| summarize_hover_text(&text)))
+        lsp_requests::hover(self, path, source, position)
     }
 
     fn definition(
@@ -244,19 +95,7 @@ impl LspSession {
         source: &str,
         position: EditorPosition,
     ) -> Result<Option<DefinitionTarget>> {
-        self.ensure_document_synced(path, source)?;
-        let uri = file_uri(path)?;
-        let result = self.request_value(
-            "textDocument/definition",
-            json!({
-                "textDocument": { "uri": uri },
-                "position": {
-                    "line": position.row,
-                    "character": utf16_column(source, position),
-                }
-            }),
-        )?;
-        parse_definition_response(&result)
+        lsp_requests::definition(self, path, source, position)
     }
 
     fn completion(
@@ -265,69 +104,17 @@ impl LspSession {
         source: &str,
         position: EditorPosition,
     ) -> Result<Vec<EditorCompletionItem>> {
-        self.ensure_document_synced(path, source)?;
-        let uri = file_uri(path)?;
-        let result = self.request_value(
-            "textDocument/completion",
-            json!({
-                "textDocument": { "uri": uri },
-                "position": {
-                    "line": position.row,
-                    "character": utf16_column(source, position),
-                }
-            }),
-        )?;
-        Ok(parse_completion_response(&result, source, position))
+        lsp_requests::completion(self, path, source, position)
     }
 
     fn ensure_document_synced(&mut self, path: &Path, source: &str) -> Result<()> {
         self.ensure_started()?;
-        let uri = file_uri(path)?;
-
-        if let Some((version, changed)) = self
-            .documents
-            .get(path)
-            .map(|document| (document.version + 1, document.source.as_str() != source))
+        if let Some((method, params)) =
+            self.document_sync
+                .notification_for(&self.server, path, source)?
         {
-            if changed {
-                self.notify(
-                    "textDocument/didChange",
-                    json!({
-                        "textDocument": {
-                            "uri": uri,
-                            "version": version,
-                        },
-                        "contentChanges": [{
-                            "text": source,
-                        }]
-                    }),
-                )?;
-                if let Some(document) = self.documents.get_mut(path) {
-                    document.version = version;
-                    document.source = source.to_string();
-                }
-            }
-            return Ok(());
+            self.notify(method, params)?;
         }
-
-        self.notify(
-            "textDocument/didOpen",
-            json!({
-                "textDocument": {
-                    "uri": uri,
-                    "languageId": self.server.language_id.clone(),
-                    "version": 1,
-                    "text": source,
-                }
-            }),
-        )?;
-        self.documents.insert(
-            path.to_path_buf(),
-            TrackedDocument {
-                version: 1,
-                source: source.to_string(),
-            },
-        );
         Ok(())
     }
 
@@ -477,12 +264,15 @@ impl LspSession {
             } else {
                 let params = message.get("params").cloned().unwrap_or(Value::Null);
                 self.pending_notifications.push_back(message);
-                let _ = self.ui_tx.send(UiEvent::LspNotification {
-                    agent_index: self.agent_index,
-                    server_name: self.server.name.clone(),
-                    method,
-                    params,
-                });
+                event_types::send(
+                    &self.ui_tx,
+                    LspEvent::Notification {
+                        agent_index: self.agent_index,
+                        server_name: self.server.name.clone(),
+                        method,
+                        params,
+                    },
+                );
             }
             return Ok(());
         }
@@ -536,7 +326,7 @@ impl LspSession {
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
         }
-        self.documents.clear();
+        self.document_sync.clear();
         self.pending_responses.clear();
         self.pending_notifications.clear();
     }

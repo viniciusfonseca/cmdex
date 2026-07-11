@@ -22,30 +22,16 @@ impl App {
                 if self.handle_scrollbar_drag(mouse.row, layout) {
                     return;
                 }
-                if self.active_workspace_selection_drag
-                    && self.current_tab == AppTab::Workspace
-                    && self
-                        .active_agent()
-                        .is_some_and(|agent| agent.workspace.editor.is_some())
-                {
-                    WorkspaceComponent::handle_editor_drag(
-                        self,
-                        mouse.column,
-                        mouse.row,
-                        layout.body,
-                    );
-                }
+                WorkspaceScreen::handle_editor_drag_if_active(
+                    self,
+                    mouse.column,
+                    mouse.row,
+                    layout.body,
+                );
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 self.active_scrollbar_drag = None;
-                if self.active_workspace_selection_drag
-                    && let Some(agent) = self.active_agent_mut()
-                    && let Some(editor) = agent.workspace.editor.as_mut()
-                    && editor.mode == EditorMode::Visual
-                    && !editor.has_selection()
-                {
-                    editor.exit_visual_mode();
-                }
+                WorkspaceScreen::finish_editor_drag(self);
                 self.active_workspace_selection_drag = false;
             }
             MouseEventKind::Moved if !self.active_workspace_selection_drag => {
@@ -68,14 +54,7 @@ impl App {
     }
 
     fn handle_mouse_move(&mut self, column: u16, row: u16, layout: UiLayout) {
-        if self.current_tab == AppTab::Workspace && WorkspaceComponent::shortcuts_popup_open(self) {
-            self.clear_workspace_hover();
-            return;
-        }
-
-        if self.current_tab == AppTab::Workspace
-            && WorkspaceComponent::handle_editor_hover(self, column, row, layout.body)
-        {
+        if WorkspaceScreen::handle_mouse_move(self, column, row, layout.body) {
             return;
         }
 
@@ -112,32 +91,15 @@ impl App {
         row: u16,
         layout: UiLayout,
     ) -> Option<ScrollbarDragTarget> {
-        if self.current_tab == AppTab::Workspace
-            && self
-                .active_agent()
-                .is_some_and(|agent| agent.workspace.editor.is_some())
-            && self
-                .scrollbar_metrics(ScrollbarDragTarget::WorkspaceCompletionPopover, layout)
-                .is_some_and(|metrics| UiSupport::rect_contains(metrics.track, column, row))
-        {
-            return Some(ScrollbarDragTarget::WorkspaceCompletionPopover);
+        if let Some(target) = WorkspaceScreen::scrollbar_drag_target_at(self, column, row, layout) {
+            return Some(target);
         }
 
         let target = match self.current_tab {
             AppTab::Chat if !self.add_agent_selected() => ScrollbarDragTarget::Chat,
-            AppTab::Workspace => {
-                if self
-                    .active_agent()
-                    .is_some_and(|agent| agent.workspace.editor.is_some())
-                {
-                    ScrollbarDragTarget::WorkspaceEditor
-                } else {
-                    ScrollbarDragTarget::WorkspacePreview
-                }
-            }
             AppTab::Shell => ScrollbarDragTarget::ShellOutput,
             AppTab::GitDiff => ScrollbarDragTarget::GitDiffPreview,
-            AppTab::Chat => return None,
+            AppTab::Chat | AppTab::Workspace => return None,
         };
 
         let metrics = self.scrollbar_metrics(target, layout)?;
@@ -155,6 +117,10 @@ impl App {
         };
         let scroll = UiSupport::scroll_position_from_row(metrics, row);
 
+        if WorkspaceScreen::update_scrollbar_drag(self, target, scroll, metrics) {
+            return true;
+        }
+
         match target {
             ScrollbarDragTarget::Chat => {
                 let Some(agent) = self.active_agent_mut() else {
@@ -162,30 +128,6 @@ impl App {
                 };
                 agent.chat.chat_follow_output = false;
                 agent.chat.chat_scroll = scroll;
-            }
-            ScrollbarDragTarget::WorkspacePreview => {
-                let Some(agent) = self.active_agent_mut() else {
-                    return false;
-                };
-                agent.workspace.content_scroll = scroll;
-            }
-            ScrollbarDragTarget::WorkspaceEditor => {
-                let Some(agent) = self.active_agent_mut() else {
-                    return false;
-                };
-                let Some(editor) = agent.workspace.editor.as_mut() else {
-                    return false;
-                };
-                editor.set_vertical_scroll(scroll, metrics.viewport_length as u16);
-            }
-            ScrollbarDragTarget::WorkspaceCompletionPopover => {
-                let Some(agent) = self.active_agent_mut() else {
-                    return false;
-                };
-                let Some(editor) = agent.workspace.editor.as_mut() else {
-                    return false;
-                };
-                editor.set_completion_window_start(scroll as usize, metrics.viewport_length);
             }
             ScrollbarDragTarget::ShellOutput => {
                 let Some(agent) = self.active_agent_mut() else {
@@ -202,6 +144,9 @@ impl App {
                 };
                 agent.git_diff.content_scroll = scroll;
             }
+            ScrollbarDragTarget::WorkspacePreview
+            | ScrollbarDragTarget::WorkspaceEditor
+            | ScrollbarDragTarget::WorkspaceCompletionPopover => return false,
         }
 
         true
@@ -212,31 +157,15 @@ impl App {
         target: ScrollbarDragTarget,
         layout: UiLayout,
     ) -> Option<ScrollbarMetrics> {
+        if let Some(metrics) = WorkspaceScreen::scrollbar_metrics(self, target, layout) {
+            return Some(metrics);
+        }
         let agent = self.active_agent()?;
 
         match target {
             ScrollbarDragTarget::Chat => {
                 let content_length = ChatSupport::content_height(&agent.chat, layout.body);
                 UiSupport::vertical_scrollbar_metrics(layout.body, content_length)
-            }
-            ScrollbarDragTarget::WorkspacePreview => {
-                let content_length = UiSupport::scrollable_preview_content_height(
-                    &agent.workspace.preview,
-                    layout.body,
-                );
-                UiSupport::vertical_scrollbar_metrics(layout.body, content_length)
-            }
-            ScrollbarDragTarget::WorkspaceEditor => {
-                let editor = agent.workspace.editor.as_ref()?;
-                let viewport = WorkspaceEditorComponent::viewport(layout.body);
-                UiSupport::vertical_scrollbar_metrics_for_viewport(
-                    viewport,
-                    editor.content_height(),
-                )
-            }
-            ScrollbarDragTarget::WorkspaceCompletionPopover => {
-                let editor = agent.workspace.editor.as_ref()?;
-                WorkspaceEditorComponent::completion_popover_scrollbar_metrics(editor, layout.body)
             }
             ScrollbarDragTarget::ShellOutput => {
                 let session = agent.shell_tab.selected_session()?;
@@ -253,6 +182,9 @@ impl App {
                 );
                 UiSupport::vertical_scrollbar_metrics(diff_layout.preview, content_length)
             }
+            ScrollbarDragTarget::WorkspacePreview
+            | ScrollbarDragTarget::WorkspaceEditor
+            | ScrollbarDragTarget::WorkspaceCompletionPopover => None,
         }
     }
 
@@ -264,15 +196,7 @@ impl App {
         layout: UiLayout,
         ui_tx: &mpsc::UnboundedSender<UiEvent>,
     ) {
-        if self.current_tab == AppTab::Workspace && WorkspaceComponent::shortcuts_popup_open(self) {
-            self.clear_workspace_hover();
-            if UiSupport::rect_contains(layout.body, column, row) {
-                WorkspaceComponent::handle_shortcuts_popup_click(self, column, row, layout.body);
-            } else if let Some(agent) = self.active_agent_mut()
-                && let Some(editor) = agent.workspace.editor.as_mut()
-            {
-                editor.close_shortcuts_help();
-            }
+        if WorkspaceScreen::handle_popup_click_or_close(self, column, row, layout.body) {
             return;
         }
 
@@ -294,46 +218,24 @@ impl App {
             return;
         }
 
-        if self.current_tab == AppTab::Workspace
-            && self
-                .active_agent()
-                .is_some_and(|agent| agent.workspace.editor.is_some())
-        {
-            self.clear_workspace_hover();
-            if WorkspaceComponent::handle_shortcuts_popup_click(self, column, row, layout.body) {
-                return;
-            }
-            if modifiers.contains(KeyModifiers::CONTROL)
-                && WorkspaceComponent::handle_editor_definition_click(
-                    self,
-                    column,
-                    row,
-                    layout.body,
-                    ui_tx,
-                )
-            {
-                return;
-            }
-            self.active_workspace_selection_drag =
-                WorkspaceComponent::handle_editor_click(self, column, row, layout.body);
+        if WorkspaceScreen::handle_editor_click_with_context(
+            self,
+            column,
+            row,
+            modifiers,
+            layout.body,
+            ui_tx,
+        ) {
             return;
         }
 
-        if self.add_agent_selected() {
-            if layout
-                .add_name
-                .is_some_and(|rect| UiSupport::rect_contains(rect, column, row))
-            {
-                self.add_form.active_field = AddAgentField::Name;
-                return;
-            }
-            if layout
-                .add_workspace
-                .is_some_and(|rect| UiSupport::rect_contains(rect, column, row))
-            {
-                self.add_form.active_field = AddAgentField::Workspace;
-            }
-        }
+        AddAgentDialogComponent::handle_click(
+            self,
+            column,
+            row,
+            layout.add_name,
+            layout.add_workspace,
+        );
     }
 
     fn handle_scroll(
@@ -344,10 +246,6 @@ impl App {
         up: bool,
         horizontal: bool,
     ) {
-        if self.current_tab == AppTab::Workspace && WorkspaceComponent::shortcuts_popup_open(self) {
-            return;
-        }
-
         if UiSupport::rect_contains(layout.sidebar_list, column, row) {
             if up {
                 self.move_selection_up();
@@ -357,16 +255,15 @@ impl App {
             return;
         }
 
-        if self.current_tab == AppTab::Workspace
-            && WorkspaceComponent::consume_shortcuts_popup_scroll(self, column, row, layout.body)
-        {
-            return;
-        }
-
-        if !horizontal
-            && self.current_tab == AppTab::Workspace
-            && WorkspaceComponent::handle_completion_scroll(self, column, row, layout.body, up)
-        {
+        if WorkspaceScreen::handle_editor_scroll(
+            self,
+            column,
+            row,
+            layout.body,
+            layout.footer,
+            up,
+            horizontal,
+        ) {
             return;
         }
 
@@ -375,33 +272,10 @@ impl App {
                 .footer
                 .is_some_and(|rect| UiSupport::rect_contains(rect, column, row))
         {
-            if horizontal
-                && self.current_tab == AppTab::Workspace
-                && self
-                    .active_agent()
-                    .is_some_and(|agent| agent.workspace.editor.is_some())
-            {
-                self.clear_workspace_hover();
-                if let Some(agent) = self.active_agent_mut()
-                    && let Some(editor) = agent.workspace.editor.as_mut()
-                {
-                    let viewport = WorkspaceEditorComponent::viewport(layout.body);
-                    if up {
-                        editor.scroll_left(MOUSE_SCROLL_STEP);
-                    } else {
-                        editor.scroll_right(MOUSE_SCROLL_STEP, viewport.width);
-                    }
-                    return;
-                }
+            if ChatComponent::handle_scroll(self, layout.body, up) {
+                return;
             }
-
-            if self.current_tab == AppTab::Chat && !self.add_agent_selected() {
-                if up {
-                    self.scroll_chat_up(layout.body, MOUSE_SCROLL_STEP);
-                } else {
-                    self.scroll_chat_down(layout.body, MOUSE_SCROLL_STEP);
-                }
-            } else if up {
+            if up {
                 self.scroll_content_up_by(layout.body, MOUSE_SCROLL_STEP);
             } else {
                 self.scroll_content_down_by(layout.body, MOUSE_SCROLL_STEP);

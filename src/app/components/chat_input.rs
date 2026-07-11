@@ -259,3 +259,34 @@ impl ChatInputComponent {
         wrapped
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::layout::Rect;
+
+    #[test]
+    fn wraps_input_into_multiple_lines() {
+        assert_eq!(
+            ChatInputComponent::wrapped_lines("abcdef", 4),
+            vec!["abcd".to_string(), "ef".to_string()]
+        );
+        assert_eq!(
+            ChatInputComponent::wrapped_lines("ab\ncd", 4),
+            vec!["ab".to_string(), "cd".to_string()]
+        );
+    }
+
+    #[test]
+    fn input_height_grows_with_wrapped_content() {
+        let main_area = Rect::new(0, 0, 10, 20);
+        assert_eq!(
+            ChatInputComponent::height_for_main_area("short", main_area),
+            3
+        );
+        assert_eq!(
+            ChatInputComponent::height_for_main_area("abcdefghijk", main_area),
+            4
+        );
+    }
+}

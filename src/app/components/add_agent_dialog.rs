@@ -4,6 +4,89 @@ use super::UiSupport;
 pub(in crate::app) struct AddAgentDialogComponent;
 
 impl AddAgentDialogComponent {
+    pub(in crate::app) fn handle_click(
+        app: &mut App,
+        column: u16,
+        row: u16,
+        name_area: Option<Rect>,
+        workspace_area: Option<Rect>,
+    ) -> bool {
+        if !app.add_agent_selected() {
+            return false;
+        }
+        if name_area.is_some_and(|area| UiSupport::rect_contains(area, column, row)) {
+            app.add_form.active_field = AddAgentField::Name;
+            return true;
+        }
+        if workspace_area.is_some_and(|area| UiSupport::rect_contains(area, column, row)) {
+            app.add_form.active_field = AddAgentField::Workspace;
+            return true;
+        }
+        false
+    }
+
+    pub(in crate::app) fn handle_key(
+        app: &mut App,
+        key: KeyEvent,
+        codex: &CodexAppServer,
+        ui_tx: mpsc::UnboundedSender<UiEvent>,
+    ) -> bool {
+        if !app.add_agent_selected() {
+            return false;
+        }
+
+        match key.code {
+            KeyCode::Esc => Self::cancel(app),
+            KeyCode::Tab => Self::toggle_field(app),
+            KeyCode::Enter => Self::submit(app, codex.clone(), ui_tx),
+            _ => return false,
+        }
+        true
+    }
+
+    pub(in crate::app) fn handle_text_input(app: &mut App, character: char) -> bool {
+        if !app.add_agent_selected() {
+            return false;
+        }
+
+        app.add_form.error = None;
+        match app.add_form.active_field {
+            AddAgentField::Name => app.add_form.name.push(character),
+            AddAgentField::Workspace => app.add_form.workspace.push(character),
+        }
+        true
+    }
+
+    pub(in crate::app) fn handle_backspace(app: &mut App) -> bool {
+        if !app.add_agent_selected() {
+            return false;
+        }
+
+        match app.add_form.active_field {
+            AddAgentField::Name => {
+                app.add_form.name.pop();
+            }
+            AddAgentField::Workspace => {
+                app.add_form.workspace.pop();
+            }
+        }
+        true
+    }
+
+    fn cancel(app: &mut App) {
+        app.add_form = AddAgentForm::default();
+        if !app.agents.is_empty() {
+            app.chat_sidebar_index = app.current_agent.map(|index| index + 1).unwrap_or(0);
+        }
+    }
+
+    fn toggle_field(app: &mut App) {
+        app.add_form.active_field = match app.add_form.active_field {
+            AddAgentField::Name => AddAgentField::Workspace,
+            AddAgentField::Workspace => AddAgentField::Name,
+        };
+    }
+
     pub(in crate::app) fn draw(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_widget(Clear, area);
         let outer = UiSupport::panel_block().title("New Agent");
@@ -97,6 +180,10 @@ impl AddAgentDialogComponent {
                 let new_index = app.agents.len().saturating_sub(1);
                 app.current_agent = Some(new_index);
                 app.chat_sidebar_index = new_index + 1;
+                app.enqueue_effect(super::super::effects::AppEffect::StartWorkspaceWatcher {
+                    agent_index: new_index,
+                    root: app.agents[new_index].definition.workspace.clone(),
+                });
                 app.add_form = AddAgentForm::default();
                 app.status_message = Some("Agent saved to ~/.cmdex.yml".to_string());
                 SessionLoader::spawn(

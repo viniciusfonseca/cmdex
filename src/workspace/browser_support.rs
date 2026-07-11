@@ -1,10 +1,23 @@
 use super::*;
 
-pub(crate) struct WorkspaceIndex;
+#[derive(Debug, Clone, Default)]
+pub(crate) struct WorkspaceIndex {
+    entries: Vec<FileEntry>,
+}
 
 impl WorkspaceIndex {
     pub(crate) fn scan(root: &Path) -> Result<Vec<FileEntry>> {
         WorkspaceBrowserSupport::build_file_entries(root)
+    }
+
+    pub(crate) fn entries(&self) -> &[FileEntry] {
+        &self.entries
+    }
+
+    pub(crate) fn replace(&mut self, entries: Vec<FileEntry>) {
+        if self.entries != entries {
+            self.entries = entries;
+        }
     }
 }
 impl FileTreeRow {

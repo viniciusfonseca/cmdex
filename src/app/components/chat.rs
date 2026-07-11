@@ -3,7 +3,7 @@ use super::super::{
     effects::AppEffect,
     *,
 };
-use super::UiSupport;
+use super::{AgentsSidebarComponent, UiSupport};
 
 pub(in crate::app) struct ChatComponent;
 
@@ -19,6 +19,125 @@ pub(in crate::app) enum ModelPickerAction {
 }
 
 impl ChatComponent {
+    pub(in crate::app) fn move_selection_up(app: &mut App) -> bool {
+        if app.current_tab != AppTab::Chat {
+            return false;
+        }
+        let index = app.chat_sidebar_index.saturating_sub(1);
+        AgentsSidebarComponent::select_index(app, index);
+        true
+    }
+
+    pub(in crate::app) fn move_selection_down(app: &mut App) -> bool {
+        if app.current_tab != AppTab::Chat {
+            return false;
+        }
+        let index = (app.chat_sidebar_index + 1).min(app.agents.len());
+        AgentsSidebarComponent::select_index(app, index);
+        true
+    }
+
+    pub(in crate::app) fn scroll_up(app: &mut App, area: Rect, lines: u16) -> bool {
+        Self::scroll(app, area, lines, true)
+    }
+
+    pub(in crate::app) fn scroll_down(app: &mut App, area: Rect, lines: u16) -> bool {
+        Self::scroll(app, area, lines, false)
+    }
+
+    pub(in crate::app) fn handle_scroll(app: &mut App, area: Rect, up: bool) -> bool {
+        if up {
+            Self::scroll_up(app, area, MOUSE_SCROLL_STEP)
+        } else {
+            Self::scroll_down(app, area, MOUSE_SCROLL_STEP)
+        }
+    }
+
+    fn scroll(app: &mut App, area: Rect, lines: u16, up: bool) -> bool {
+        if app.current_tab != AppTab::Chat || app.add_agent_selected() {
+            return false;
+        }
+        let Some(agent) = app.active_agent_mut() else {
+            return true;
+        };
+        let max_scroll = ChatSupport::max_scroll(&agent.chat, area);
+        let current = if agent.chat.chat_follow_output {
+            max_scroll
+        } else {
+            agent.chat.chat_scroll.min(max_scroll)
+        };
+        let next = if up {
+            current.saturating_sub(lines)
+        } else {
+            current.saturating_add(lines).min(max_scroll)
+        };
+        agent.chat.chat_scroll = next;
+        agent.chat.chat_follow_output = next >= max_scroll;
+        true
+    }
+
+    pub(in crate::app) fn handle_key(app: &mut App, key: KeyEvent) -> bool {
+        match Self::handle_model_picker_key(app, key) {
+            ModelPickerAction::NotOpen => {}
+            ModelPickerAction::Handled => return true,
+            ModelPickerAction::Apply {
+                agent_index,
+                model,
+                effort,
+            } => {
+                if app.current_agent == Some(agent_index) {
+                    Self::submit_model_command(
+                        app,
+                        ModelCommand::Set {
+                            model: Some(model),
+                            effort,
+                        },
+                    );
+                }
+                return true;
+            }
+        }
+
+        if app.current_tab != AppTab::Chat || app.add_agent_selected() {
+            return false;
+        }
+        if Self::handle_queue_key(app, key) {
+            return true;
+        }
+
+        match key.code {
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                app.chat_input.push('\n');
+                true
+            }
+            KeyCode::Enter => {
+                Self::submit_message(app);
+                true
+            }
+            KeyCode::Esc => {
+                Self::interrupt_active_turn(app);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub(in crate::app) fn handle_text_input(app: &mut App, character: char) -> bool {
+        if app.current_tab != AppTab::Chat {
+            return false;
+        }
+        app.chat_input.push(character);
+        true
+    }
+
+    pub(in crate::app) fn handle_backspace(app: &mut App) -> bool {
+        if app.current_tab != AppTab::Chat {
+            return false;
+        }
+        app.chat_input.pop();
+        true
+    }
+
     pub(in crate::app) fn draw(frame: &mut Frame, app: &App, area: Rect) {
         let Some(agent) = app.active_agent() else {
             let empty = Paragraph::new("Add an agent from the sidebar to start chatting.")

@@ -14,13 +14,14 @@ pub(super) mod workspace_editor;
 pub(super) mod workspace_editor_input;
 pub(super) mod workspace_editor_shortcuts;
 pub(super) mod workspace_keys;
+pub(super) mod workspace_mouse;
 pub(super) mod workspace_sidebar;
 pub(super) mod workspace_sidebar_input;
 
 pub(super) use self::{
     add_agent_dialog::AddAgentDialogComponent,
     agents_sidebar::AgentsSidebarComponent,
-    chat::{ChatComponent, ModelPickerAction},
+    chat::ChatComponent,
     chat_input::ChatInputComponent,
     git_diff::GitDiffComponent,
     git_diff_sidebar::GitDiffSidebarComponent,
@@ -29,7 +30,10 @@ pub(super) use self::{
     shared::{SelectableListPopover, UiSupport},
     shell::ShellComponent,
     shell_sidebar::ShellSidebarComponent,
-    workspace::WorkspaceComponent,
+    workspace::WorkspaceScreen,
     workspace_editor::WorkspaceEditorComponent,
     workspace_sidebar::WorkspaceSidebarComponent,
 };
+
+#[cfg(test)]
+pub(in crate::app) use chat::ModelPickerAction;

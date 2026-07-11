@@ -15,13 +15,13 @@ pub(crate) enum EditorKeyAction {
 }
 
 pub(crate) fn map_key(
-    mode: EditorMode,
+    mode: &EditorMode,
     key: KeyEvent,
     page_step: usize,
 ) -> Option<EditorKeyAction> {
     match mode {
-        EditorMode::Command => map_command_key(key),
-        EditorMode::Visual => map_visual_key(key, page_step),
+        EditorMode::Command { .. } => map_command_key(key),
+        EditorMode::Visual { .. } => map_visual_key(key, page_step),
         EditorMode::Insert => map_insert_key(key, page_step),
         EditorMode::Normal => map_normal_key(key, page_step),
     }
@@ -163,12 +163,12 @@ mod tests {
     #[test]
     fn arrows_and_vim_keys_share_movement_commands() {
         let arrow = map_key(
-            EditorMode::Normal,
+            &EditorMode::Normal,
             KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
             4,
         );
         let vim = map_key(
-            EditorMode::Normal,
+            &EditorMode::Normal,
             KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE),
             4,
         );
@@ -180,7 +180,7 @@ mod tests {
     fn shift_page_movement_extends_selection() {
         assert_eq!(
             map_key(
-                EditorMode::Normal,
+                &EditorMode::Normal,
                 KeyEvent::new(KeyCode::PageDown, KeyModifiers::SHIFT),
                 4,
             ),

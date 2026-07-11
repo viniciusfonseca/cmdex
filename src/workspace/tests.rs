@@ -89,8 +89,8 @@ fn editor_refuses_quit_when_dirty_without_bang() {
     let mut editor = WorkspaceEditorState::open(&path).unwrap();
     editor.enter_insert_mode();
     editor.insert_char('!');
-    editor.mode = EditorMode::Command;
-    editor.command = "q".to_string();
+    editor.start_command();
+    editor.push_command_char('q');
 
     let result = editor.execute_command().unwrap();
 
@@ -147,7 +147,7 @@ fn editor_delete_selection_removes_selected_range_across_lines() {
     assert_eq!(editor.lines, vec!["alta".to_string(), "gamma".to_string()]);
     assert_eq!(editor.cursor_row, 0);
     assert_eq!(editor.cursor_col, 2);
-    assert_eq!(editor.mode, EditorMode::Visual);
+    assert!(matches!(editor.mode, EditorMode::Visual { .. }));
 
     let _ = fs::remove_file(path);
 }
@@ -204,7 +204,7 @@ fn editor_paste_text_inserts_multiline_content() {
     );
     assert_eq!(editor.cursor_row, 1);
     assert_eq!(editor.cursor_col, 1);
-    assert_eq!(editor.mode, EditorMode::Normal);
+    assert!(matches!(editor.mode, EditorMode::Normal));
 
     let _ = fs::remove_file(path);
 }
@@ -228,7 +228,7 @@ fn editor_paste_text_replaces_selection_and_exits_visual_mode() {
     assert_eq!(editor.lines, vec!["habco".to_string()]);
     assert_eq!(editor.cursor_row, 0);
     assert_eq!(editor.cursor_col, 4);
-    assert_eq!(editor.mode, EditorMode::Normal);
+    assert!(matches!(editor.mode, EditorMode::Normal));
     assert!(!editor.has_selection());
 
     let _ = fs::remove_file(path);
@@ -269,7 +269,7 @@ fn editor_completion_applies_selected_item_over_replace_range() {
     );
     assert_eq!(editor.cursor_row, 0);
     assert_eq!(editor.cursor_col, 11);
-    assert_eq!(editor.mode, EditorMode::Insert);
+    assert!(matches!(editor.mode, EditorMode::Insert));
     assert!(editor.completion_popover().is_none());
 
     let _ = fs::remove_file(path);
@@ -331,7 +331,7 @@ fn editor_undo_reverts_latest_change_and_restores_clean_state() {
     assert_eq!(editor.lines, vec!["hello".to_string()]);
     assert_eq!(editor.cursor_row, 0);
     assert_eq!(editor.cursor_col, 0);
-    assert_eq!(editor.mode, EditorMode::Normal);
+    assert!(matches!(editor.mode, EditorMode::Normal));
     assert!(!editor.dirty);
 
     let _ = fs::remove_file(path);
@@ -354,7 +354,7 @@ fn editor_undo_reverts_multiline_paste() {
     assert_eq!(editor.lines, vec!["alpha".to_string(), "omega".to_string()]);
     assert_eq!(editor.cursor_row, 0);
     assert_eq!(editor.cursor_col, 2);
-    assert_eq!(editor.mode, EditorMode::Normal);
+    assert!(matches!(editor.mode, EditorMode::Normal));
 
     let _ = fs::remove_file(path);
 }
@@ -381,19 +381,16 @@ fn selecting_a_file_auto_opens_editor_in_normal_mode() {
         std::env::temp_dir().join(format!("cmdex-editor-auto-open-{}.txt", std::process::id()));
     fs::write(&path, "hello").unwrap();
 
-    let mut browser = FileBrowserState {
-        entries: vec![FileEntry {
-            path: path.clone(),
-            relative_path: PathBuf::from("hello.txt"),
-        }],
-        ..Default::default()
-    };
+    let mut browser = FileBrowserState::with_entries(vec![FileEntry {
+        path: path.clone(),
+        relative_path: PathBuf::from("hello.txt"),
+    }]);
 
     browser.select(0);
 
     let editor = browser.editor.as_ref().expect("editor");
     assert_eq!(editor.path, path);
-    assert_eq!(editor.mode, EditorMode::Normal);
+    assert!(matches!(editor.mode, EditorMode::Normal));
 
     let _ = fs::remove_file(path);
 }
@@ -406,19 +403,16 @@ fn dirty_editor_blocks_switching_selected_file() {
     fs::write(&first, "first").unwrap();
     fs::write(&second, "second").unwrap();
 
-    let mut browser = FileBrowserState {
-        entries: vec![
-            FileEntry {
-                path: first.clone(),
-                relative_path: PathBuf::from("first.txt"),
-            },
-            FileEntry {
-                path: second.clone(),
-                relative_path: PathBuf::from("second.txt"),
-            },
-        ],
-        ..Default::default()
-    };
+    let mut browser = FileBrowserState::with_entries(vec![
+        FileEntry {
+            path: first.clone(),
+            relative_path: PathBuf::from("first.txt"),
+        },
+        FileEntry {
+            path: second.clone(),
+            relative_path: PathBuf::from("second.txt"),
+        },
+    ]);
 
     browser.select(0);
     browser.editor.as_mut().unwrap().insert_char('!');
@@ -516,7 +510,7 @@ fn workspace_tree_starts_collapsed_by_default() {
 
     let mut browser = FileBrowserState::default();
     browser
-        .apply_scanned_entries(FileBrowserState::scan_entries(&root).unwrap())
+        .apply_scanned_entries_without_io(FileBrowserState::scan_entries(&root).unwrap())
         .unwrap();
 
     assert_eq!(
@@ -548,17 +542,17 @@ fn applying_scanned_entries_preserves_selected_file_and_updates_tree_rows() {
 
     let mut browser = FileBrowserState::default();
     browser
-        .apply_scanned_entries(FileBrowserState::scan_entries(&root).unwrap())
+        .apply_scanned_entries_without_io(FileBrowserState::scan_entries(&root).unwrap())
         .unwrap();
 
-    assert_eq!(browser.entries[browser.selected].path, selected);
+    assert_eq!(browser.entries()[browser.selected].path, selected);
 
     fs::write(&added, "a").unwrap();
     browser
-        .apply_scanned_entries(FileBrowserState::scan_entries(&root).unwrap())
+        .apply_scanned_entries_without_io(FileBrowserState::scan_entries(&root).unwrap())
         .unwrap();
 
-    assert_eq!(browser.entries[browser.selected].path, selected);
+    assert_eq!(browser.entries()[browser.selected].path, selected);
     assert!(
         browser
             .tree_rows
@@ -569,7 +563,7 @@ fn applying_scanned_entries_preserves_selected_file_and_updates_tree_rows() {
 
     fs::remove_file(&added).unwrap();
     browser
-        .apply_scanned_entries(FileBrowserState::scan_entries(&root).unwrap())
+        .apply_scanned_entries_without_io(FileBrowserState::scan_entries(&root).unwrap())
         .unwrap();
 
     assert!(
@@ -598,23 +592,20 @@ fn stale_workspace_search_results_do_not_replace_newer_query() {
     let path = root.join("source.txt");
     fs::write(&path, "alpha\nbeta\n").unwrap();
 
-    let mut browser = FileBrowserState {
-        entries: vec![FileEntry {
-            path: path.clone(),
-            relative_path: PathBuf::from("source.txt"),
-        }],
-        ..Default::default()
-    };
+    let mut browser = FileBrowserState::with_entries(vec![FileEntry {
+        path: path.clone(),
+        relative_path: PathBuf::from("source.txt"),
+    }]);
     browser.push_search_char('a');
     let first_generation = browser.search_generation();
     browser.push_search_char('b');
     let second_generation = browser.search_generation();
 
-    let first = FileBrowserState::search_entries(&browser.entries, "a").unwrap();
+    let first = FileBrowserState::search_entries(browser.entries(), "a").unwrap();
     assert!(!browser.apply_search_snapshot(first_generation, "a", first));
     assert_eq!(browser.search_total_rows(), 0);
 
-    let second = FileBrowserState::search_entries(&browser.entries, "ab").unwrap();
+    let second = FileBrowserState::search_entries(browser.entries(), "ab").unwrap();
     assert!(browser.apply_search_snapshot(second_generation, "ab", second));
     assert_eq!(browser.search_match_count(), 0);
 

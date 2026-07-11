@@ -13,7 +13,7 @@ impl FileBrowserState {
     ) -> Result<bool> {
         self.finish_editor_load(path);
         let selected_path = self
-            .entries
+            .entries()
             .get(self.selected)
             .map(|entry| entry.path.as_path());
         if selected_path != Some(path) || self.editor.as_ref().is_some_and(|editor| editor.dirty) {
@@ -56,7 +56,7 @@ impl FileBrowserState {
         self.focus_sidebar();
         self.content_scroll = 0;
         self.preview_title = self
-            .entries
+            .entries()
             .get(self.selected)
             .map(|entry| entry.path.display().to_string())
             .unwrap_or_else(|| "Workspace".to_string());
@@ -71,7 +71,7 @@ impl FileBrowserState {
     ) -> bool {
         if self.editor.is_some()
             || self
-                .entries
+                .entries()
                 .get(self.selected)
                 .is_none_or(|entry| entry.path != path)
         {

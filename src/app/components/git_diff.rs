@@ -17,6 +17,66 @@ pub(in crate::app) struct GitDiffLayout {
 }
 
 impl GitDiffComponent {
+    pub(in crate::app) fn move_selection_up(app: &mut App) -> bool {
+        if app.current_tab != AppTab::GitDiff {
+            return false;
+        }
+        if let Some(agent) = app.active_agent_mut() {
+            let root = agent.definition.workspace.clone();
+            agent.git_diff.move_up(&root);
+        }
+        Self::request_refresh(app);
+        true
+    }
+
+    pub(in crate::app) fn move_selection_down(app: &mut App) -> bool {
+        if app.current_tab != AppTab::GitDiff {
+            return false;
+        }
+        if let Some(agent) = app.active_agent_mut() {
+            let root = agent.definition.workspace.clone();
+            agent.git_diff.move_down(&root);
+        }
+        Self::request_refresh(app);
+        true
+    }
+
+    pub(in crate::app) fn scroll_preview(app: &mut App, lines: u16, up: bool) -> bool {
+        if app.current_tab != AppTab::GitDiff {
+            return false;
+        }
+        if let Some(agent) = app.active_agent_mut() {
+            if up {
+                agent.git_diff.scroll_up(lines);
+            } else {
+                agent.git_diff.scroll_down(lines);
+            }
+        }
+        true
+    }
+
+    pub(in crate::app) fn handle_text_input(app: &mut App, character: char) -> bool {
+        if app.current_tab != AppTab::GitDiff {
+            return false;
+        }
+        if let Some(agent) = app.active_agent_mut() {
+            agent.git_diff.commit_message.push(character);
+            agent.git_diff.error = None;
+        }
+        true
+    }
+
+    pub(in crate::app) fn handle_backspace(app: &mut App) -> bool {
+        if app.current_tab != AppTab::GitDiff {
+            return false;
+        }
+        if let Some(agent) = app.active_agent_mut() {
+            agent.git_diff.commit_message.pop();
+            agent.git_diff.error = None;
+        }
+        true
+    }
+
     pub(in crate::app) fn request_refresh(app: &mut App) -> bool {
         let Some(agent_index) = app.current_agent else {
             return false;
@@ -562,5 +622,54 @@ impl GitDiffComponent {
                 .iter()
                 .collect()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{
+        style::{Color, Style},
+        text::Line,
+    };
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn remote_button_label_shows_spinner_only_for_active_action() {
+        assert_eq!(
+            GitDiffComponent::remote_button_label(
+                "Push",
+                Some(GitRemoteAction::Push),
+                GitRemoteAction::Push,
+                2,
+            ),
+            format!("{} Push", SPINNER[2])
+        );
+        assert_eq!(
+            GitDiffComponent::remote_button_label(
+                "Pull",
+                Some(GitRemoteAction::Push),
+                GitRemoteAction::Pull,
+                2,
+            ),
+            "Pull"
+        );
+    }
+
+    #[test]
+    fn preview_padding_fills_changed_rows_to_viewport_width() {
+        let changed = Line::from("abc").style(Style::default().bg(Color::Red));
+        let context = Line::from("xy");
+        let padded = GitDiffComponent::pad_preview_lines(&[changed, context], 5);
+
+        assert_eq!(line_text(&padded[0]), "abc  ");
+        assert_eq!(padded[0].width(), 5);
+        assert_eq!(padded[1].width(), 2);
     }
 }

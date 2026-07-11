@@ -15,10 +15,23 @@ impl AppRuntime {
         let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
         let codex = CodexAppServer::spawn(server_tx).await?;
         let mut app = App::new(config_path, config);
+        let workspace_roots = app
+            .agents
+            .iter()
+            .enumerate()
+            .map(|(agent_index, agent)| (agent_index, agent.definition.workspace.clone()))
+            .collect::<Vec<_>>();
+        for (agent_index, root) in workspace_roots {
+            app.enqueue_effect(effects::AppEffect::StartWorkspaceWatcher { agent_index, root });
+            let root = app.agents[agent_index].definition.workspace.clone();
+            app.workspace_refresh_in_flight.insert(agent_index);
+            app.enqueue_effect(effects::AppEffect::RefreshWorkspace { agent_index, root });
+        }
         super::SessionLoader::hydrate_latest_sessions(&mut app, &codex).await?;
 
         let mut events = EventStream::new();
         super::components::TopNavigationComponent::refresh_current_tab(&mut app);
+        Self::spawn_pending_effects(&mut app, &codex, &ui_tx);
         let mut needs_redraw = true;
 
         let exit = loop {
@@ -79,8 +92,14 @@ impl AppRuntime {
             }
         };
 
-        app.shutdown_lsp_sessions();
-        app.shutdown_shell_sessions();
+        for effect in app
+            .shutdown_lsp_sessions()
+            .into_iter()
+            .chain(app.shutdown_shell_sessions())
+            .chain(app.shutdown_workspace_watchers())
+        {
+            effects::spawn(effect, codex.clone(), ui_tx.clone());
+        }
 
         Ok(exit)
     }
@@ -90,7 +109,7 @@ impl AppRuntime {
         codex: &CodexAppServer,
         ui_tx: &mpsc::UnboundedSender<UiEvent>,
     ) {
-        super::components::WorkspaceComponent::maybe_search(app);
+        super::components::WorkspaceScreen::maybe_search(app);
         for effect in app.take_effects() {
             effects::spawn(effect, codex.clone(), ui_tx.clone());
         }

@@ -1,7 +1,7 @@
 use super::super::*;
-use super::WorkspaceComponent;
+use super::WorkspaceScreen;
 
-impl WorkspaceComponent {
+impl WorkspaceScreen {
     pub(super) fn handle_search_key(
         workspace: &mut FileBrowserState,
         key: KeyEvent,

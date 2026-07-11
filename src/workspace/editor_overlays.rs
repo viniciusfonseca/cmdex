@@ -178,15 +178,19 @@ impl WorkspaceEditorState {
             (end, start)
         };
 
+        let keep_insert_mode = matches!(self.mode, EditorMode::Insert);
         self.clear_selection();
         self.cursor_row = start.row;
         self.cursor_col = start.col;
-        self.selection_anchor = Some(start);
+        self.mode = EditorMode::Visual { anchor: start };
         self.cursor_row = end.row;
         self.cursor_col = end.col;
         self.preferred_col = self.cursor_col;
 
         let applied = self.paste_text(&item.insert_text);
+        if keep_insert_mode {
+            self.mode = EditorMode::Insert;
+        }
         self.clear_completion();
         applied
     }

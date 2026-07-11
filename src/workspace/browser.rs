@@ -5,33 +5,38 @@ mod browser_loading;
 #[path = "browser_support.rs"]
 mod browser_support;
 
+pub(crate) use browser_support::WorkspaceIndex;
 pub(super) struct WorkspaceBrowserSupport;
 
 impl FileBrowserState {
-    pub(crate) fn scan_entries(root: &Path) -> Result<Vec<FileEntry>> {
-        browser_support::WorkspaceIndex::scan(root)
+    pub(crate) fn entries(&self) -> &[FileEntry] {
+        self.index.entries()
     }
 
-    pub(crate) fn apply_scanned_entries(&mut self, entries: Vec<FileEntry>) -> Result<bool> {
-        if entries == self.entries {
-            return Ok(false);
-        }
-        self.apply_entries(entries)?;
-        Ok(true)
+    #[cfg(test)]
+    pub(crate) fn with_entries(entries: Vec<FileEntry>) -> Self {
+        let mut browser = Self::default();
+        browser.index.replace(entries);
+        browser.rebuild_tree_rows();
+        browser
+    }
+
+    pub(crate) fn scan_entries(root: &Path) -> Result<Vec<FileEntry>> {
+        browser_support::WorkspaceIndex::scan(root)
     }
 
     pub(crate) fn apply_scanned_entries_without_io(
         &mut self,
         entries: Vec<FileEntry>,
     ) -> Result<bool> {
-        if entries == self.entries {
+        if entries == self.entries() {
             return Ok(false);
         }
 
         let keep_dirty_editor = self.reconcile_entries(entries);
         if !keep_dirty_editor
             && self.editor.as_ref().is_some_and(|editor| {
-                self.entries
+                self.entries()
                     .get(self.selected)
                     .is_none_or(|entry| editor.path != entry.path)
             })
@@ -40,7 +45,7 @@ impl FileBrowserState {
             self.focus_sidebar();
         }
         self.preview_title = self
-            .entries
+            .entries()
             .get(self.selected)
             .map(|entry| entry.path.display().to_string())
             .unwrap_or_else(|| "Workspace".to_string());
@@ -84,18 +89,18 @@ impl FileBrowserState {
     }
 
     pub(crate) fn select_without_io(&mut self, index: usize) -> bool {
-        if self.entries.is_empty() {
+        if self.entries().is_empty() {
             return false;
         }
-        self.select_index_without_io(index.min(self.entries.len().saturating_sub(1)))
+        self.select_index_without_io(index.min(self.entries().len().saturating_sub(1)))
     }
 
     #[allow(dead_code)]
     pub fn select(&mut self, index: usize) {
-        if self.entries.is_empty() {
+        if self.entries().is_empty() {
             return;
         }
-        let _ = self.select_index(index.min(self.entries.len().saturating_sub(1)), true);
+        let _ = self.select_index(index.min(self.entries().len().saturating_sub(1)), true);
     }
 
     pub fn scroll_up(&mut self, lines: u16) {
@@ -108,12 +113,12 @@ impl FileBrowserState {
 
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn open_editor(&mut self) -> Result<()> {
-        if self.entries.is_empty() {
+        if self.entries().is_empty() {
             return Ok(());
         }
 
         self.editor = Some(WorkspaceEditorState::open(
-            &self.entries[self.selected].path,
+            &self.entries()[self.selected].path,
         )?);
         self.focus_editor();
         self.error = None;
@@ -310,7 +315,7 @@ impl FileBrowserState {
 
     #[allow(dead_code)]
     pub fn open_path_at_position(&mut self, path: &Path, row: usize, col: usize) -> Result<bool> {
-        let Some(file_index) = self.entries.iter().position(|entry| entry.path == path) else {
+        let Some(file_index) = self.entries().iter().position(|entry| entry.path == path) else {
             return Ok(false);
         };
 
@@ -330,7 +335,7 @@ impl FileBrowserState {
     }
 
     pub(crate) fn open_path_at_position_without_io(&mut self, path: &Path) -> Option<PathBuf> {
-        let file_index = self.entries.iter().position(|entry| entry.path == path)?;
+        let file_index = self.entries().iter().position(|entry| entry.path == path)?;
         self.select_index_without_io(file_index)
             .then(|| path.to_path_buf())
     }
@@ -393,10 +398,10 @@ impl FileBrowserState {
     }
 
     fn select_index_without_io(&mut self, index: usize) -> bool {
-        let index = index.min(self.entries.len().saturating_sub(1));
+        let index = index.min(self.entries().len().saturating_sub(1));
         if index != self.selected && self.editor.as_ref().is_some_and(|editor| editor.dirty) {
             if let Some(editor) = self.editor.as_mut() {
-                editor.mode = EditorMode::Normal;
+                editor.enter_normal_mode();
                 editor.status =
                     Some("Unsaved changes. Use :w, :q or :q! before switching files.".to_string());
             }
@@ -409,7 +414,7 @@ impl FileBrowserState {
         if let Some(row) = self.row_for_file(index) {
             self.tree_cursor = row;
         }
-        let selected_path = self.entries.get(self.selected).map(|entry| &entry.path);
+        let selected_path = self.entries().get(self.selected).map(|entry| &entry.path);
         if self
             .editor
             .as_ref()
@@ -421,19 +426,10 @@ impl FileBrowserState {
         true
     }
 
-    fn apply_entries(&mut self, entries: Vec<FileEntry>) -> Result<()> {
-        let keep_dirty_editor = self.reconcile_entries(entries);
-        self.update_preview()?;
-        if !keep_dirty_editor {
-            self.sync_editor_to_selection(true)?;
-        }
-        Ok(())
-    }
-
     fn reconcile_entries(&mut self, entries: Vec<FileEntry>) -> bool {
         let previous_selected = self.selected;
         let previous_selected_path = self
-            .entries
+            .entries()
             .get(self.selected)
             .map(|entry| entry.path.clone());
         let previous_editor_path = self.editor.as_ref().map(|editor| editor.path.clone());
@@ -447,7 +443,7 @@ impl FileBrowserState {
             editor.dirty && !entries.iter().any(|entry| entry.path == editor.path)
         });
 
-        self.entries = entries;
+        self.index.replace(entries);
         self.selected = self.resolve_selected_index(
             previous_editor_path
                 .as_ref()
@@ -464,7 +460,7 @@ impl FileBrowserState {
         }
         self.request_search();
         self.content_scroll = if previous_selected_path.as_ref().is_some_and(|path| {
-            self.entries
+            self.entries()
                 .get(self.selected)
                 .is_some_and(|entry| &entry.path == path)
         }) {
@@ -481,13 +477,13 @@ impl FileBrowserState {
         selected_path: Option<&PathBuf>,
         fallback_index: usize,
     ) -> usize {
-        if self.entries.is_empty() {
+        if self.entries().is_empty() {
             return 0;
         }
 
         selected_path
-            .and_then(|path| self.entries.iter().position(|entry| entry.path == *path))
-            .unwrap_or_else(|| fallback_index.min(self.entries.len().saturating_sub(1)))
+            .and_then(|path| self.entries().iter().position(|entry| entry.path == *path))
+            .unwrap_or_else(|| fallback_index.min(self.entries().len().saturating_sub(1)))
     }
 
     #[allow(dead_code)]
@@ -563,7 +559,7 @@ impl FileBrowserState {
 
     fn rebuild_tree_rows(&mut self) {
         let (tree_rows, tree_file_rows) =
-            WorkspaceBrowserSupport::build_file_tree_rows(&self.entries, &self.collapsed_dirs);
+            WorkspaceBrowserSupport::build_file_tree_rows(self.entries(), &self.collapsed_dirs);
         self.tree_rows = tree_rows;
 
         if let Some(row) = tree_file_rows
@@ -577,7 +573,7 @@ impl FileBrowserState {
     }
 
     fn sync_collapsed_dirs(&mut self) {
-        let directory_paths = WorkspaceBrowserSupport::collect_directory_paths(&self.entries);
+        let directory_paths = WorkspaceBrowserSupport::collect_directory_paths(self.entries());
 
         if self.known_dirs.is_empty() {
             self.collapsed_dirs = directory_paths.clone();
@@ -615,7 +611,7 @@ impl FileBrowserState {
     }
 
     fn visible_ancestor_row(&self, file_index: usize) -> Option<usize> {
-        let relative = self.entries.get(file_index)?.relative_path.as_path();
+        let relative = self.entries().get(file_index)?.relative_path.as_path();
         let mut ancestor = relative.parent();
 
         while let Some(path) = ancestor {
@@ -675,13 +671,13 @@ impl FileBrowserState {
     }
 
     fn sync_editor_to_selection(&mut self, auto_open: bool) -> Result<()> {
-        if self.entries.is_empty() {
+        if self.entries().is_empty() {
             self.editor = None;
             self.focus_sidebar();
             return Ok(());
         }
 
-        let entry = &self.entries[self.selected];
+        let entry = &self.entries()[self.selected];
         if self
             .editor
             .as_ref()
@@ -707,16 +703,16 @@ impl FileBrowserState {
     }
 
     fn update_preview(&mut self) -> Result<()> {
-        if self.entries.is_empty() {
+        if self.entries().is_empty() {
             self.preview_title = "Workspace".to_string();
             self.preview =
                 WorkspaceRenderer::plain_preview_lines("No files found for this workspace.");
             return Ok(());
         }
 
-        let entry = &self.entries[self.selected];
-        self.preview_title = entry.path.display().to_string();
-        self.preview = WorkspaceRenderer::read_text_preview(&entry.path)?;
+        let path = self.entries()[self.selected].path.clone();
+        self.preview_title = path.display().to_string();
+        self.preview = WorkspaceRenderer::read_text_preview(&path)?;
         Ok(())
     }
 }

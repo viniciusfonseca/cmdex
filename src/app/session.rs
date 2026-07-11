@@ -1,3 +1,4 @@
+use super::event_types::{self, ChatEvent};
 use super::*;
 
 pub struct MessageStore;
@@ -53,16 +54,24 @@ impl SessionLoader {
         tokio::spawn(async move {
             match codex.load_latest_workspace_session(&workspace).await {
                 Ok(session) => {
-                    let _ = ui_tx.send(UiEvent::SessionLoaded {
-                        agent_index,
-                        session,
-                    });
+                    event_types::send(
+                        &ui_tx,
+                        ChatEvent::SessionLoaded {
+                            agent_index,
+                            session,
+                        },
+                    );
                 }
                 Err(error) => {
-                    let _ = ui_tx.send(UiEvent::SubmissionFailed {
-                        agent_index,
-                        message: format!("Failed to load the latest workspace session: {error}"),
-                    });
+                    event_types::send(
+                        &ui_tx,
+                        ChatEvent::SubmissionFailed {
+                            agent_index,
+                            message: format!(
+                                "Failed to load the latest workspace session: {error}"
+                            ),
+                        },
+                    );
                 }
             }
         });

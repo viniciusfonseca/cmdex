@@ -43,7 +43,7 @@ impl AppUi {
 
         match app.current_tab {
             AppTab::Chat => AddAgentDialogComponent::draw(frame, app, area),
-            AppTab::Workspace => WorkspaceComponent::draw(frame, app, area),
+            AppTab::Workspace => WorkspaceScreen::draw(frame, app, area),
             AppTab::Shell => ShellComponent::draw(frame, app, area),
             AppTab::GitDiff => GitDiffComponent::draw(frame, app, area),
         }
